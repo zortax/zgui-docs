@@ -15,6 +15,7 @@ export const gitConfig: {
 } | null = {
     user: "zortax",
     repo: "zgui",
+    branch: "main",
   };
 
 export function githubUrl(): string | undefined {
