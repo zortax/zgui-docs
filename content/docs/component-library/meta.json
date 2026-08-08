@@ -1,0 +1,4 @@
+{
+  "title": "Component library",
+  "pages": ["index", "tokens-and-theming", "components", "primitives", "icons", "devtools"]
+}

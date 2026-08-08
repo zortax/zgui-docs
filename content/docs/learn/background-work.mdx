@@ -1,0 +1,184 @@
+---
+title: Background work
+description: Run futures and blocking functions on workers, post results to the UI thread, and consume streams.
+---
+
+Do not run slow work on the UI thread. zgui provides explicit operations to move work to a worker
+and to return to the UI thread. This page assumes [UI tasks and
+timers](/docs/learn/async-and-timers).
+
+## Select the execution place
+
+| Operation | Runs on | Can use reactive or view state | Cancellation |
+|---|---|---|---|
+| `spawn` or `spawn_local` | UI thread | yes | the current scope or `Task::cancel` |
+| `background(future)` | background executor | no | work continues; a cancelled caller discards the result |
+| `blocking(closure)` | blocking worker | no | work continues; a cancelled caller discards the result |
+| `ui().post(closure)` | UI thread, at the next flush | yes | none |
+
+`spawn`, `background`, `blocking`, and `ui` are in the prelude.
+
+## Run an async operation on a worker
+
+Use `background` for work that is already asynchronous. Await it from a UI task. Only the future
+passed to `background` moves to the worker. Execution resumes on the UI thread after the await.
+
+```rust
+view! {
+    control(on:click = move |_| {
+        spawn(async move {
+            loading.set(true);
+            let rows = background(async { fetch_rows().await }).await;
+            items.set(rows);
+            loading.set(false);
+        });
+    }) {"Reload"}
+}
+```
+
+The background future and its output must be `Send + 'static`. The future must not read a signal,
+use a node handle, or access the document. Read the required values on the UI thread and move plain
+data to the worker.
+
+```rust
+let id = selected.get();
+let detail = background(async move { load_detail(id).await }).await;
+```
+
+This order is required inside `AsyncDerived` and `Action`. A signal read on a worker does not
+register a dependency on the UI thread.
+
+## Run a blocking operation
+
+Use `blocking` for synchronous work. Examples include file parsing, image decoding, and a call to
+a synchronous database driver.
+
+```rust
+spawn(async move {
+    let report = blocking(move || parse_report(bytes)).await;
+    parsed.set(Some(report));
+});
+```
+
+Do not put a blocking call in `background(async { ... })`. A runtime can schedule many async tasks
+on a small set of worker threads. `blocking` tells the executor to use a thread where blocking is
+permitted.
+
+Without the Tokio feature, zgui starts a small background pool on first use. The pool has at most
+four threads and has no I/O reactor. For Tokio timers, networking, file APIs, or libraries that
+require a Tokio runtime, see [Tokio integration](/docs/learn/tokio-integration).
+
+## Post to the UI thread
+
+Use `ui()` on the UI thread to obtain a `Ui` handle. The handle is `Send + Clone`. Move it to a
+worker thread or a foreign callback.
+
+```rust
+let ui = ui();
+
+std::thread::spawn(move || {
+    for step in 0..=100 {
+        do_one_step(step);
+        ui.post(move || progress.set(step));
+    }
+});
+```
+
+`post` returns immediately. The closure runs at the start of the next reactive flush. A post asks
+the platform for that frame.
+
+Use `Ui::run` when background code needs a value from the UI thread before it continues.
+
+```rust
+let ui = ui();
+
+background(async move {
+    let selected_id = ui.run(move || selected.get_untracked()).await;
+    fetch_detail(selected_id).await
+})
+.await;
+```
+
+```rust
+impl Ui {
+    pub fn post(&self, f: impl FnOnce() + Send + 'static);
+    pub fn run<T: Send + 'static>(
+        &self,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> impl Future<Output = T> + Send;
+}
+```
+
+A signal with synchronized storage can move to another thread. Do not use that as the normal
+communication method. Owners and observers are thread-local. A later change can also introduce a
+local-storage value and cause a panic. Post a closure through `Ui` instead.
+
+## Cancel and reject stale results
+
+When a component is unmounted, its UI task is cancelled. Work already running on a worker is not
+cancelled. zgui discards its result because the UI task no longer waits for it.
+
+Scope cancellation does not reject an old result while the component remains mounted. Check that
+the request is still current after the await.
+
+```rust
+let wanted = page.get_untracked();
+let loaded = background(async move { fetch_page(wanted).await }).await;
+
+if page.get_untracked() == wanted {
+    rows.set(loaded);
+}
+```
+
+Use the same check for search input, route parameters, selection, and any value that can change
+while work is pending.
+
+## Consume a stream
+
+Use `zgui::reactive::spawn_stream` to handle each stream item on the UI thread.
+
+```rust
+use zgui::reactive::spawn_stream;
+
+spawn_stream(events, move |event| {
+    latest.set(Some(event));
+});
+```
+
+Use `signal_from_stream` when the view only needs the latest item.
+
+```rust
+use zgui::reactive::signal_from_stream;
+
+let status = signal_from_stream(Status::Offline, status_updates);
+```
+
+Both helpers run the stream as a scoped UI task. The task stops when the stream ends or its scope
+is disposed.
+
+`futures` channels do not need an external runtime. Tokio synchronization channels also do not
+need a Tokio runtime. The `zgui::tokio` module provides helpers for Tokio `mpsc`, `watch`, and
+`broadcast` receivers.
+
+## Wake and frame cost
+
+When a worker result becomes ready, it wakes the UI task and requests a frame. The event loop does
+not poll while it waits. Multiple wakes before the frame are combined.
+
+At the start of the flush, zgui first runs closures posted through `Ui`. It then polls ready tasks.
+Signal writes from both operations can settle in the same frame.
+
+## Next
+
+<Cards>
+  <Card
+    title="Tokio integration"
+    href="/docs/learn/tokio-integration"
+    description="Use Tokio as the background executor and runtime context."
+  />
+  <Card
+    title="Error handling"
+    href="/docs/learn/error-handling"
+    description="Represent task failures as view state or report them to a boundary."
+  />
+</Cards>

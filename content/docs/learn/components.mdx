@@ -1,0 +1,265 @@
+---
+title: Components
+description: Writing reusable pieces of interface — the component macro, props, defaults, conversions, and what a component costs.
+---
+
+A component is a Rust function that builds a piece of interface. `#[component]` turns the function
+into something a view can call, with named arguments and compile-time checks on them. This page
+assumes [Views](/docs/learn/views) and [Signals](/docs/learn/signals).
+
+## The smallest one
+
+```rust
+use zgui::prelude::*;
+
+/// A labelled value.
+#[component]
+fn Stat(
+    /// What the value is called.
+    #[prop(into)]
+    label: String,
+    /// The value, which follows whatever produced it.
+    value: Signal<i32>,
+) -> impl IntoView {
+    view! {
+        row(class = "stat") {
+            label(class = "stat__label") {{label}}
+            text(class = "stat__value") {{move || value.get().to_string()}}
+        }
+    }
+}
+```
+
+Call it like any other node, with its arguments written as attributes:
+
+```rust
+view! {
+    column {
+        Stat(label = "Used", value = used.into())
+        Stat(label = "Free", value = free.into())
+    }
+}
+```
+
+## The rules on the function
+
+`#[component]` refuses a function it cannot turn into a component. Each error names the rule.
+
+| Rule | Why |
+|---|---|
+| The name is upper camel case. | A lower-case name in a view is an element. `thing()` is an element; `Thing()` is a component. |
+| It has a return type, normally `-> impl IntoView`. | A component returns a view. |
+| It is a free function and takes no `self`. | Props are named arguments, not fields. |
+| It has no lifetime parameters. | Props outlive the call that built them. |
+| Each argument is one identifier. | A prop is named, so it cannot be a pattern. |
+| No argument has an `impl Trait` type. | The prop is stored in a struct, and `impl Trait` cannot be. Name a type parameter instead. |
+
+Type and const generic parameters are fine, `where` clauses included:
+
+```rust
+#[component]
+fn Twice<F>(
+    /// Called once per repetition, with the index.
+    children: F,
+) -> impl IntoView
+where
+    F: Fn(usize) -> AnyView + 'static,
+{
+    view! { {children(0)}{children(1)} }
+}
+```
+
+## Props
+
+Every argument is a prop, and every prop is written by name at the call site. Order does not matter.
+
+### Required by default
+
+A prop with no attribute is required. Leaving it out is a compile error that names it:
+
+```text
+error[E0277]: `Thing` is missing the required prop `label`
+  --> src/main.rs:21:21
+21 |     let _ = view! { Thing(times = 2) };
+   |                     ^^^^^ `label` was never given
+```
+
+The check is a typestate on the generated builder, so it happens at compile time and never at run
+time.
+
+### The five prop attributes
+
+<TypeTable
+  type={{
+    'into': {
+      description: 'The setter takes impl Into<T>, so a caller can pass a &str where the prop is a String.',
+      type: '#[prop(into)]',
+    },
+    'optional': {
+      description: 'May be left out. Falls back to T::default(), so T must implement Default.',
+      type: '#[prop(optional)]',
+    },
+    'default': {
+      description: 'May be left out. Falls back to the expression given.',
+      type: '#[prop(default = expr)]',
+    },
+    'name': {
+      description: 'The prop is written under another name at the call site. For reserved words.',
+      type: '#[prop(name = "type")]',
+    },
+    'attrs': {
+      description: 'Receives whatever the caller forwarded with a {..bundle} spread. At most one per component.',
+      type: '#[prop(attrs)]',
+    },
+  }}
+/>
+
+They combine: `#[prop(into, optional)]`, `#[prop(into, default = 1)]`,
+`#[prop(into, name = "type")]`.
+
+```rust
+/// A labelled value.
+#[component]
+fn Field(
+    /// The label.
+    #[prop(into)]
+    label: String,
+    /// Shown after the label when there is one.
+    #[prop(into, optional)]
+    hint: Option<String>,
+    /// How many columns the field spans.
+    #[prop(default = 1)]
+    span: u8,
+) -> impl IntoView {
+    view! { {label}{hint}{span.to_string()} }
+}
+
+// `hint` and `span` may be left out; `label` may not.
+view! { Field(label = "Name") }
+view! { Field(label = "Address", hint = "optional", span = 2) }
+```
+
+<Callout type="info">
+A prop declared `Option<T>` takes a `T` at the call site. Write `hint = "optional"`, not
+`hint = Some("optional")`. It also accepts an `Option<T>`, which is what lets a wrapper component
+forward its own optional prop straight through.
+</Callout>
+
+Only `#[prop(...)]` and doc comments are allowed on an argument. Doc comments are re-emitted on both
+the generated struct field and the builder setter, so they appear in rustdoc where a caller looks.
+
+### What a setter accepts
+
+The declared type decides what the caller may write:
+
+| Declared type | The call site accepts |
+|---|---|
+| `T` | a `T` |
+| `T` with `#[prop(into)]` | anything `Into<T>` |
+| `Option<T>`, optional | a `T` or an `Option<T>` |
+| `Children` | a children block, taken once. See [Children and slots](/docs/learn/children-and-slots) |
+| `ChildrenFn` | a children block, buildable more than once |
+| `ReactiveValue<T>` with `#[prop(into)]` | a constant, a signal, a memo or a closure |
+
+The last row is how a component takes "anything readable as a `T`" without caring which. See
+[Derived state](/docs/learn/derived-state).
+
+## What a component costs
+
+**The function body runs once.** When the view is built, `Stat(...)` is called, it builds its part
+of the document, and it returns. Changing `value` afterwards does not call `Stat` again. It re-runs
+only the closure inside it that read `value`.
+
+There is no diffing, no virtual tree and no reconciliation pass. A component is not a render
+function; it is a constructor.
+
+This has one consequence worth stating outright: **a prop is a value, taken once**. If a prop is
+`i32`, the component sees the number that was passed at build time and will never see another. To
+give a component something that changes, pass a signal, a memo or a closure — and read it inside a
+reactive hole.
+
+```rust
+#[component]
+fn Bad(count: i32) -> impl IntoView {
+    // `count` was read once. This text never changes.
+    view! { text {{count.to_string()}} }
+}
+
+#[component]
+fn Good(count: Signal<i32>) -> impl IntoView {
+    // Read inside a closure, so it follows whatever produced it.
+    view! { text {{move || count.get().to_string()}} }
+}
+```
+
+## Scope and cleanup
+
+Every component gets its own reactive scope. Signals, contexts, stored values and effects created
+in the body belong to it.
+
+When the component is removed from the interface — a branch flipped, a row deleted — that scope is
+disposed of **synchronously, in the same frame**. Its effects stop, its stored values are dropped,
+and its cleanup closures run. Nothing is left behind and nothing waits for a later collection pass.
+
+This is why a signal has to be created inside a component body and not in a `static`: the body is
+inside an owner, and the owner is what makes the disposal happen. See
+[Context](/docs/learn/context).
+
+## Forwarding attributes
+
+A component that wraps an element often wants to let its caller add classes, listeners or
+accessibility attributes to that element. `#[prop(attrs)]` collects them, and the spread replays
+them:
+
+```rust
+#[component]
+fn Button(
+    /// Whatever the caller forwarded.
+    #[prop(attrs)]
+    attrs: Attrs,
+    children: Children,
+) -> impl IntoView {
+    view! {
+        control(class = "button", {..attrs}) {
+            {children.into_view_once()}
+        }
+    }
+}
+```
+
+```rust
+view! {
+    Button(class = "button--primary", on:click = save) {"Save"}
+}
+```
+
+Attributes written before the spread apply first and attributes after it apply last, so position
+decides who wins. At most one prop per component may be `#[prop(attrs)]`; the setter is always
+called `attrs`.
+
+## Naming and files
+
+A component is a normal Rust item. Put one per file, or several in a module — whatever suits. The
+generated props struct and builder take the component's own visibility, so `pub fn Card` gives a
+`pub` component and `fn Card` keeps it private to the module.
+
+<Callout type="info">
+`App` is a natural name for a root component, which is why the entry point is the function `app()`
+and not a type called `App`. Nothing a component declares can be spelled `app`, because
+`#[component]` requires a capital.
+</Callout>
+
+## Next
+
+<Cards>
+  <Card
+    title="Children and slots"
+    href="/docs/learn/children-and-slots"
+    description="Taking content from the caller: Children, ChildrenFn, and named slots."
+  />
+  <Card
+    title="Control flow"
+    href="/docs/learn/control-flow"
+    description="Conditionals and keyed lists inside a view."
+  />
+</Cards>

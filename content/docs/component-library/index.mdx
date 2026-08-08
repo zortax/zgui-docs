@@ -1,0 +1,424 @@
+---
+title: The component library
+description: The four optional crates that ship beside zgui, how they relate, what an application gives up by leaving them out, and the whole component inventory.
+---
+
+zgui ships a component library: buttons, fields, menus, dialogs, tables and the rest. No page of
+this documentation before this one uses it, and no application has to. This page says what the four
+crates are, shows that they are ordinary consumers of the public API, and writes the same small
+interface twice — once with the library and once from the element vocabulary — so that what the
+library buys is visible.
+
+It assumes [the guide](/docs/learn/views).
+
+## The four crates
+
+| Crate | Depends on | What it adds |
+|---|---|---|
+| `zgui-ui-tokens` | `zgui` | design tokens as CSS custom properties, and `ThemeProvider` |
+| `zgui-ui-icons` | `zgui` | 22 icon constants and one `Icon` component |
+| `zgui-ui-primitives` | `zgui` | eight interaction behaviours that draw nothing |
+| `zgui-ui` | `zgui`, and the three above | the styled components |
+
+The first three know nothing about each other. `zgui-ui` is the only crate that joins them: a
+component of its own is a primitive composition, plus a sheet written in tokens, plus an icon where
+one is wanted.
+
+None of the four is reachable through `zgui`. Each is a separate line in a `Cargo.toml`, and a
+program that names none of them compiles none of them.
+
+## Layer L8, and no privileged access
+
+[Architecture overview](/docs/architecture/overview) puts these crates on **L8, the product layer**:
+crates that consume the public API and are consumed by nothing. For these four the claim is checked
+rather than asserted. Here are the whole dependency sections of the four manifests:
+
+```toml title="crates/zgui-ui-tokens/Cargo.toml, -icons, -primitives"
+[dependencies]
+zgui = { path = "../zgui", version = "0.1.0" }
+```
+
+```toml title="crates/zgui-ui/Cargo.toml"
+[dependencies]
+zgui = { path = "../zgui", version = "0.1.0" }
+zgui-ui-icons = { path = "../zgui-ui-icons", version = "0.1.0" }
+zgui-ui-primitives = { path = "../zgui-ui-primitives", version = "0.1.0" }
+zgui-ui-tokens = { path = "../zgui-ui-tokens", version = "0.1.0" }
+```
+
+Three tests hold that shape in place:
+
+| Test | What it reads | What it refuses |
+|---|---|---|
+| `zgui-ui/tests/downstream.rs::the_library_depends_on_the_umbrella_and_on_its_own_siblings_and_on_nothing_else` | its own `Cargo.toml` | a dependency outside the four names above |
+| `zgui-ui/tests/downstream.rs::no_component_names_a_crate_below_the_public_api` | every `.rs` file under `src` | the text `zgui_dom::`, `zgui_style::`, `zgui_layout::`, `zgui_paint::` and eleven more |
+| `zgui-ui-primitives/tests/downstream.rs::the_sources_name_no_crate_below_the_public_api` | the same, for the primitives | the same list |
+
+`zgui-ui-tokens` carries the second test too. `zgui-ui-icons` is covered by its manifest alone; its
+sources name no internal crate either.
+
+The crate documentation of `zgui-ui` gives the reason, and calls it a constraint rather than a
+boast:
+
+> if a component needed something the framework does not expose, an application would need it too,
+> so the hole gets fixed rather than reached past.
+
+<Callout type="info">
+This is why the guide could be written without the library. Every mechanism a component here uses —
+`css!`, `style!`, `variants!`, `install_stylesheet`, `#[prop(attrs)]`, `a11y:`, `state:`, `Portal`,
+`NodeRef` — has a page above, because a component that needed anything else would be a component
+you could not have written.
+</Callout>
+
+The dependency rule covers `[dependencies]` only. The dev-dependencies of `zgui-ui` do reach lower —
+`zgui-platform-headless`, `zgui-render-wgpu` and a vector rasteriser — because the library's own
+tests read pixels back off a real graphics device. Nothing an application links carries them.
+
+## What you give up by leaving it out
+
+Work, not capability. There is no behaviour in the library that the public API does not also give
+an application, because the library has nothing else to build from.
+
+| The library wrote | Without it you write |
+|---|---|
+| a sheet per component, in design tokens | a `css!` or `style!` sheet of your own |
+| a `variants!` table per visual axis | your own table, or class strings |
+| the keyboard map for every composite control | your own `on:key_down` handlers |
+| roles, labels and relations on every element | your own `a11y:` attributes |
+| overlay composition: portal, exit animation, dismissal, focus containment, placement | the same four primitives, in the same order |
+| one protocol for who owns a value | your own signal-or-callback prop pair |
+
+The evidence that this is a real choice is in the repository. `crates/zgui-examples` depends on
+`zgui` and nothing else, and its manifest says why:
+
+> These are ordinary applications, and an application depends on the umbrella crate and nothing
+> else: if a view, a component, a style sheet or an entry point needed anything further, the
+> examples here would not compile, which is the point.
+
+Six worked applications sit under `examples/` — `counter.rs`, `todo.rs`, `styled.rs`, `tally.rs`,
+`resize.rs` and `vector.rs` — and none of them names `zgui-ui`.
+
+## How to depend on it
+
+<Steps>
+
+<Step>
+
+**Add the crates you will name.** `zgui-ui` pulls its three siblings in for its own use, but a
+crate you write `use` for is a crate you declare.
+
+```toml title="Cargo.toml"
+[dependencies]
+zgui = { path = "../zgui/crates/zgui" }
+zgui-ui = { path = "../zgui/crates/zgui-ui" }
+zgui-ui-tokens = { path = "../zgui/crates/zgui-ui-tokens" }
+zgui-ui-icons = { path = "../zgui/crates/zgui-ui-icons" }   # only if you name an icon yourself
+```
+
+</Step>
+
+<Step>
+
+**Import the preludes.** Each crate has one, and each holds every component together with the props
+type its `#[component]` attribute generated.
+
+```rust
+use zgui::prelude::*;
+use zgui_ui::prelude::*;
+use zgui_ui_tokens::prelude::*;
+```
+
+`zgui_ui::prelude` re-exports one name from the headless half: `Binding`, which is what a `value`,
+`checked` or `open` prop takes. The `*Style` types are deliberately absent, and so are the
+`*Variants` structs; name them at their own path when you override one.
+
+</Step>
+
+<Step>
+
+**Render a `ThemeProvider` around the interface.** `zgui-ui` never installs the token sheet itself.
+Every rule it ships is written in `var(--zui-…)`, so without a provider — or without custom
+properties you define yourself — those declarations resolve to nothing.
+
+```rust
+view! {
+    ThemeProvider(scheme = ColorScheme::System) {
+        Card {
+            CardHeader {CardTitle {"Settings"}}
+            CardContent {Button {"Save"}}
+        }
+    }
+}
+```
+
+</Step>
+
+</Steps>
+
+The icon constants are not in `zgui_ui_icons::prelude`. Name the ones you draw:
+`use zgui_ui_icons::set::{chevron::CHEVRON_RIGHT, mark::CHECK};`
+
+## Three ways to use the stack
+
+| Way | Dependencies | You write | You get |
+|---|---|---|---|
+| everything | `zgui`, `zgui-ui`, `zgui-ui-tokens` | component calls | appearance, keyboard and accessibility, decided |
+| behaviour only | `zgui`, `zgui-ui-primitives` | every style sheet, every element | placement, focus containment, dismissal, exit timing, roving focus, value ownership |
+| none | `zgui` | all of it | the sixteen element names and the whole public API |
+
+The middle row is a real position, not a compromise. `zgui-ui-primitives` depends on `zgui` alone,
+ships its own prelude, and carries a complete popover composition as a doctest.
+[Primitives](/docs/component-library/primitives) works through it.
+
+Tokens and icons are separable in the same way. `zgui-ui-tokens` plus `css!` is a design system with
+no `zgui-ui` in the dependency graph, and `Icon` is one component over the `vector` element.
+
+## Three rules every styled component obeys
+
+**Appearance is a `variants!` table and a `style!` sheet.** The table lowers to a class list and one
+`data-` attribute per axis; the sheet selects on the attributes. Nothing computes a class name at
+run time, and nothing branches on a variant in Rust.
+
+**Interaction state belongs to the engine.** There is no `hovered`, `focused` or `pressed` signal
+anywhere in `zgui-ui`. A test refuses one by name. `:hover`, `:focus-visible`, `:active`,
+`:disabled`, `:checked`, `:indeterminate`, `:placeholder-shown` and `:invalid` are states the style
+engine already knows, and a second copy would be a second answer that disagrees on the frame the
+pointer leaves.
+
+**A caller can always add to an element.** Every component that renders an element takes
+`class: Classes` and `#[prop(attrs)] attrs: Attrs`, and merges both **after** its own, so the caller
+wins. A test walks the sources and fails any component that renders an element and forwards no
+bundle.
+
+## The inventory
+
+Every public component of `zgui-ui`, by module. Props are on
+[Components](/docs/component-library/components).
+
+| Module | What it is | Components |
+|---|---|---|
+| `button` | a control that does something when pressed | `Button` |
+| `button_group` | buttons that belong together, drawn as one strip | `ButtonGroup`, `ButtonGroupSeparator`, `ButtonGroupText` |
+| `badge` | a small piece of status text | `Badge` |
+| `label` | text that names a control | `Label` |
+| `kbd` | the name of a key, set as a key | `Kbd`, `KbdGroup` |
+| `separator` | a rule between two runs of content | `Separator` |
+| `skeleton` | the shape of content that has not arrived | `Skeleton` |
+| `spinner` | a mark that turns while something is happening | `Spinner` |
+| `avatar` | a picture of a person, with a fallback | `Avatar` |
+| `aspect_ratio` | a box that keeps its width and height in proportion | `AspectRatio` |
+| `alert` | a message about the whole view | `Alert`, `AlertTitle`, `AlertDescription` |
+| `card` | a surface holding one subject | `Card`, `CardHeader`, `CardTitle`, `CardDescription`, `CardContent`, `CardFooter` |
+| `empty` | what a region says when there is nothing in it yet | `Empty`, `EmptyHeader`, `EmptyMedia`, `EmptyTitle`, `EmptyDescription`, `EmptyContent` |
+| `item` | one row of a list: a mark, some words, the controls | `Item`, `ItemGroup`, `ItemMedia`, `ItemHeader`, `ItemContent`, `ItemTitle`, `ItemDescription`, `ItemActions`, `ItemFooter`, `ItemSeparator` |
+| `progress` | how far along something is | `Progress` |
+| `input` | one line the user types | `Input` |
+| `textarea` | several lines the user types | `Textarea` |
+| `input_group` | a text field with marks, words or controls attached | `InputGroup`, `InputGroupAddon`, `InputGroupButton`, `InputGroupInput`, `InputGroupText`, `InputGroupTextarea` |
+| `input_otp` | a code entered one character per box | `InputOtp` |
+| `field` | one thing being asked for, with everything needed to answer it | `Field`, `FieldSet`, `FieldLegend`, `FieldGroup`, `FieldLabel`, `FieldTitle`, `FieldContent`, `FieldDescription`, `FieldError`, `FieldSeparator` |
+| `checkbox` | yes, no, or mixed | `Checkbox` |
+| `radio_group` | one of several | `RadioGroup`, `RadioGroupItem` |
+| `switch` | on or off, applied at once | `Switch` |
+| `toggle` | a control that stays pressed | `Toggle` |
+| `toggle_group` | several toggles, one or many pressed | `ToggleGroup`, `ToggleGroupItem` |
+| `slider` | a number chosen along a track | `Slider` |
+| `collapsible` | one region that opens | `Collapsible`, `CollapsibleTrigger`, `CollapsibleContent` |
+| `accordion` | several regions, one or many open | `Accordion`, `AccordionItem`, `AccordionTrigger`, `AccordionContent` |
+| `tabs` | one panel of several | `Tabs`, `TabsList`, `TabsTrigger`, `TabsContent` |
+| `menubar` | a bar of menus along the top | `Menubar`, `MenubarMenu`, `MenubarTrigger`, `MenubarContent`, `MenubarItem`, `MenubarLabel`, `MenubarSeparator`, `MenubarArrows` |
+| `navigation_menu` | sections that open a panel | `NavigationMenu`, `NavigationMenuList`, `NavigationMenuItem`, `NavigationMenuTrigger`, `NavigationMenuContent`, `NavigationMenuLink` |
+| `breadcrumb` | where you are, and the way back | `Breadcrumb`, `BreadcrumbList`, `BreadcrumbItem`, `BreadcrumbLink`, `BreadcrumbPage`, `BreadcrumbSeparator`, `BreadcrumbEllipsis` |
+| `pagination` | one page of many | `Pagination`, `PaginationContent`, `PaginationItem`, `PaginationLink`, `PaginationPrevious`, `PaginationNext`, `PaginationEllipsis` |
+| `sidebar` | a collapsing side panel | `SidebarProvider`, `Sidebar`, `SidebarHeader`, `SidebarContent`, `SidebarFooter`, `SidebarGroup`, `SidebarGroupLabel`, `SidebarInset`, `SidebarMenu`, `SidebarMenuItem`, `SidebarMenuButton`, `SidebarTrigger` |
+| `scroll_area` | a scrolling region with its own bars | `ScrollArea`, `ScrollBar` |
+| `resizable` | panels the user drags apart | `ResizablePanelGroup`, `ResizablePanel`, `ResizableHandle` |
+| `carousel` | slides, one at a time | `Carousel`, `CarouselContent`, `CarouselItem`, `CarouselPrevious`, `CarouselNext` |
+| `toast` | what the application says after the fact | `Toaster`, `ToastItem` |
+| `form` | fields, what is wrong with them, and sending them | `Form`, `FormField`, `FormItem`, `FormLabel`, `FormDescription`, `FormMessage`, `FormSubmit` |
+| `dialog` | a modal surface over the window | `Dialog`, `DialogTrigger`, `DialogContent`, `DialogHeader`, `DialogTitle`, `DialogDescription`, `DialogFooter`, `DialogClose`, `DialogDismiss` |
+| `alert_dialog` | a dialog that demands an answer | `AlertDialog`, `AlertDialogTrigger`, `AlertDialogContent`, `AlertDialogAction`, `AlertDialogCancel`; title, description, header and footer are the dialog's, aliased |
+| `sheet` | a modal panel from one edge | `Sheet`, `SheetContent`; the rest are the dialog's, aliased |
+| `drawer` | a sheet with a drag handle | `Drawer`, `DrawerContent`, `DrawerHandle`; the rest are the dialog's, aliased |
+| `popover` | a surface anchored to a control | `Popover`, `PopoverContent`; trigger and close are the dialog's, aliased |
+| `tooltip` | a short note on hover or focus | `Tooltip`, `TooltipTrigger`, `TooltipContent` |
+| `hover_card` | a richer note, on hover | `HoverCard`, `HoverCardTrigger`, `HoverCardContent` |
+| `menu` | the parts every menu is made of | `MenuContent`, `MenuItem`, `MenuGroup`, `MenuLabel`, `MenuSeparator`, `MenuShortcut`, `MenuCheckboxItem`, `MenuRadioGroup`, `MenuRadioItem`, `MenuSub`, `MenuSubTrigger`, `MenuSubContent`, `MenuTypeahead` |
+| `dropdown_menu` | a menu under a button | `DropdownMenu`, `DropdownMenuTrigger`, `DropdownMenuContent`, then the `Menu…` parts |
+| `context_menu` | a menu at the pointer | `ContextMenu`, `ContextMenuTrigger`, `ContextMenuContent`, then the `Menu…` parts |
+| `select` | one option chosen from a list | `Select`, `SelectTrigger`, `SelectValue`, `SelectContent`, `SelectItem`; group, label and separator are the menu's, aliased |
+| `combobox` | the same, with typing to narrow it | `Combobox`, `ComboboxInput`, `ComboboxContent`, `ComboboxItem`, `ComboboxEmpty` |
+| `native_select` | a chooser with no surface of its own | `NativeSelect`, `NativeSelectOptGroup`, `NativeSelectOption` |
+| `command` | a command palette over the combobox | `Command`, `CommandList`, `CommandGroup`, `CommandDialog`; input, item and empty are the combobox's, aliased |
+| `table` | rows and columns, presentational | `Table`, `TableCaption`, `TableHeader`, `TableBody`, `TableFooter`, `TableRow`, `TableHead`, `TableCell` |
+| `data_table` | a table driven by a model: sort, filter, page, select | `DataTable`, `ColumnResizer` |
+| `virtualize` | only the rows in the viewport | `VirtualList` |
+| `chart` | bars, lines and areas | `Chart` |
+| `calendar` | a month of days | `Calendar`, `CalendarDay` |
+| `date_picker` | a calendar in a popover | `DatePicker` |
+| `overlay` | what the twelve floating and modal components are built from | `ModalSurface`, `AnchoredSurface`, `OverlaySurface`, `Scrim`, `Confined`, `Elevated` |
+| `listbox` | the registry `Select`, `Combobox` and `Command` share | `ListboxCatalogueOf` |
+| `support` | what a component of your own needs too | `variant_attrs` and the numeric and editing helpers |
+
+`overlay`, `listbox` and `support` are absent from the prelude. Name them at their module path —
+`zgui_ui::overlay`, `zgui_ui::listbox`, `zgui_ui::support`. They are published because a surface of
+your own needs them.
+
+## The same interface, twice
+
+Two buttons in a row. One is outlined, the other goes disabled while a save is in flight.
+
+<Tabs items={['With the library', 'From the vocabulary']}>
+<Tab value="With the library">
+
+```rust
+use zgui::prelude::*;
+use zgui::reactive::RwSignal;
+use zgui::{component, view};
+use zgui_ui::prelude::*;
+use zgui_ui_tokens::prelude::*;
+
+#[component]
+fn SaveBar() -> impl IntoView {
+    let saving = RwSignal::new_local(false);
+
+    view! {
+        ThemeProvider(scheme = ColorScheme::System) {
+            row {
+                Button(variant = ButtonVariant::Outline) {"Cancel"}
+                Button(disabled = saving, on:click = move |_| saving.set(true)) {"Save"}
+            }
+        }
+    }
+}
+```
+
+</Tab>
+<Tab value="From the vocabulary">
+
+```rust
+use zgui::prelude::*;
+use zgui::reactive::{LocalStorage, RwSignal};
+use zgui::{component, css, view};
+
+const SHEET: &str = css!(
+    ".button { display: inline-flex; align-items: center; justify-content: center;
+               height: 36px; padding: 0 16px; border: 1px solid transparent;
+               border-radius: 6px; background-color: #0090ff; color: #ffffff }
+     .button:hover { background-color: #0588f0 }
+     .button:active { transform: translateY(1px) }
+     .button:focus-visible { outline: 2px solid #8ec8f6; outline-offset: 2px }
+     .button:disabled { opacity: 0.5; pointer-events: none }
+     .button--outline { background-color: transparent; border-color: #d9d9e0; color: #1c2024 }"
+);
+
+#[component]
+fn Button(
+    /// Whether it can be pressed.
+    #[prop(into, default = Signal::stored_local(false))]
+    disabled: Signal<bool, LocalStorage>,
+    /// Classes merged after the button's own.
+    #[prop(into, optional)]
+    class: Classes,
+    /// Anything else the caller forwarded.
+    #[prop(attrs)]
+    attrs: Attrs,
+    children: Children,
+) -> impl IntoView {
+    view! {
+        control(
+            class = "button",
+            tabindex = Focus::Sequential,
+            // One state, read by the selector, by focus order, by hit testing and by a reader.
+            state:disabled = move || disabled.get(),
+            a11y:role = Role::Button,
+            a11y:disabled = move || disabled.get(),
+            {..attrs},
+            class = class,
+        ) {
+            {children.into_view_once()}
+        }
+    }
+}
+
+#[component]
+fn SaveBar() -> impl IntoView {
+    let saving = RwSignal::new_local(false);
+
+    view! {
+        row {
+            Button(class = "button--outline") {"Cancel"}
+            Button(disabled = saving, on:click = move |_| saving.set(true)) {"Save"}
+        }
+    }
+}
+```
+
+The application installs `SHEET` with `app().with_stylesheet(SHEET)`.
+
+</Tab>
+</Tabs>
+
+The second version is a working button. <kbd>Enter</kbd> and <kbd>Space</kbd> press it, because
+activating what has focus is the framework's behaviour and arrives as an ordinary click. `disabled`
+takes it out of the focus order, out of pointer reach, and tells a reader — one write, four
+consumers. `zgui-ui`'s own `Button` handles none of those things either, for the same reasons.
+
+What the library's `Button` adds to it:
+
+| `Button` also has | Which is |
+|---|---|
+| six variants and four sizes | a `variants!` table, plus rules keyed on `data-variant` and `data-size` |
+| colours that follow the colour scheme | `var(--zui-color-primary)` and its neighbours instead of the literals above |
+| a sheet installed under a name | `install_stylesheet("zui-button", ButtonStyle::CSS)` in the body, so the sheet arrives with the first button and keeps its place in the cascade |
+
+That is the whole difference for a button. For a dialog or a select the difference is larger — a
+portal, an exit animation, a dismissal layer, a focus trap and a placement solver, in that order —
+but it is the same kind of difference. [Components](/docs/component-library/components) takes three
+of them apart.
+
+## What it costs
+
+Nothing structural. A component is a function that installs a sheet and returns elements, so a
+frame that touches one costs what [the cost model](/docs/performance/cost-model) says the change
+costs, and no more.
+
+Two consequences worth stating:
+
+- **One sheet per component type, however many instances.** Each component calls
+  `install_stylesheet` with a stable name in its body. Installing a name that is already installed
+  replaces the text and keeps its place in the cascade, so a hundred buttons install one sheet.
+  Asserted by `crates/zgui-ui-tokens/tests/theme.rs::a_second_instance_of_a_component_does_not_install_a_second_sheet`.
+- **A pointer crossing a component is a restyle, not a rebuild.** Because no component keeps an
+  interaction state in a signal, hovering one is the two-element restyle the cost model measures,
+  and nothing in Rust runs at all.
+
+## Next
+
+<Cards>
+  <Card
+    title="Tokens and theming"
+    href="/docs/component-library/tokens-and-theming"
+    description="The seven token groups, the theme model, light and dark, and switching a theme at run time."
+  />
+  <Card
+    title="Components"
+    href="/docs/component-library/components"
+    description="The inventory with props, then a button, an overlay and a list taken apart."
+  />
+  <Card
+    title="Primitives"
+    href="/docs/component-library/primitives"
+    description="The eight headless behaviours, and using them with no styled layer at all."
+  />
+  <Card
+    title="Icons"
+    href="/docs/component-library/icons"
+    description="The 22 icons, how one is written in a view, sizing, colouring, and adding your own."
+  />
+  <Card
+    title="Devtools"
+    href="/docs/component-library/devtools"
+    description="The inspector: a separate crate that does reach below the public API, and what each panel shows."
+  />
+</Cards>

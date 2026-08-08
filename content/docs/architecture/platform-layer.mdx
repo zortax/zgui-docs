@@ -1,0 +1,940 @@
+---
+title: The platform layer
+description: The Surface, AppHandler, Clock, Waker and Clipboard contract, the winit and headless backends, scale changes, and how the accessibility tree is published.
+---
+
+Everything the framework needs from the machine it runs on arrives through five traits in
+`zgui-platform`: a thing to draw into, the callbacks a loop makes, the time, a way for another
+thread to interrupt the loop, and the desktop's clipboards. This page is the contract, the two
+backends that implement it, and the rules a third one has to obey.
+
+It assumes [the frame](/docs/architecture/the-frame) and [the renderer](/docs/architecture/renderer).
+
+## The shape of the seam
+
+<ExchangeDiagram
+  label="The platform contract between the runtime and the winit backend"
+  left={{
+    title: 'zgui-runtime',
+    description: 'Implements AppHandler.',
+  }}
+  right={{
+    title: 'zgui-platform-winit',
+    description: 'Implements PlatformCx, Surface, Clock, Waker, and Clipboard.',
+  }}
+  messages={[
+    {
+      direction: 'left',
+      label: 'surfaces_available · surfaces_lost · surface_event · wake · idle · deadline_reached · shutting_down',
+    },
+    {
+      direction: 'right',
+      label: 'create_surface · destroy_surface · clipboard · clock · request_redraw · push_a11y_update',
+    },
+  ]}
+  foundation="zgui-platform · the traits, and nothing else"
+/>
+
+`crates/zgui-platform` names no windowing library and no graphics API. A unit test,
+`no_source_names_a_windowing_library_or_a_graphics_api` in `crates/zgui-platform/src/api.rs`, reads
+every source file in the crate and rejects an import whose root is `winit`, `wgpu`, `glutin`,
+`vulkano`, `web_sys`, `sdl2`, `gtk` or `softbuffer`. A second test,
+`every_public_enumeration_is_extensible`, rejects a `pub enum` without `#[non_exhaustive]` above it.
+
+The crate is `#![forbid(unsafe_code)]`. `crates/zgui-platform/src/backends/` is `#[cfg(test)]` only:
+it is a compile proof that two implementations fit, not a shipped backend.
+
+An application reaches all of this as `zgui::platform`.
+
+## AppHandler
+
+What a backend calls, in the order it calls it (`crates/zgui-platform/src/app/mod.rs`).
+
+```rust
+pub trait AppHandler: 'static {
+    fn surfaces_available(&mut self, cx: &dyn PlatformCx);
+    fn surfaces_lost(&mut self, cx: &dyn PlatformCx) { let _ = cx; }
+    fn surface_event(&mut self, cx: &dyn PlatformCx, surface: SurfaceId, event: SurfaceEvent);
+    fn wake(&mut self, cx: &dyn PlatformCx, reason: WakeReason);
+    fn idle(&mut self, cx: &dyn PlatformCx) -> IdlePolicy { let _ = cx; IdlePolicy::Block }
+    fn deadline_reached(&mut self, cx: &dyn PlatformCx) { let _ = cx; }
+    fn shutting_down(&mut self, cx: &dyn PlatformCx) { let _ = cx; }
+}
+```
+
+Three are required. `impl<T: AppHandler + ?Sized> AppHandler for Box<T>` is provided, which is what
+makes `Box<dyn AppHandler>` the argument a driver takes.
+
+| Rule | Consequence |
+|---|---|
+| `surfaces_available` comes first, and may come again | A surface cannot be created before it. |
+| A surface must not outlive `surfaces_lost` | One still held at that point is a crash. |
+| `surfaces_lost` is suspension, not a close request | The runtime keeps requested window specifications and rebuilds them when surfaces become available again. |
+| `idle` runs once per turn | It runs on every pointer movement, so it has to be cheap. |
+| `deadline_reached` draws nothing by itself | Whatever was waiting must call `Surface::request_redraw`. |
+
+`zgui_runtime::Runtime` is the one implementation in the tree. Its `idle` returns the earliest
+deadline any window owes, and never installs one that is not strictly in the future; its
+`deadline_reached` reads what was parked on rather than recomputing it. Both are covered in
+[the frame](/docs/architecture/the-frame).
+
+## PlatformCx
+
+What the backend offers, for the length of one callback (`crates/zgui-platform/src/cx.rs`).
+
+```rust
+pub trait PlatformCx {
+    fn create_surface(&self, attributes: &SurfaceAttributes)
+        -> Result<Arc<dyn Surface>, PlatformError>;
+    fn destroy_surface(&self, id: SurfaceId);
+    fn surface(&self, id: SurfaceId) -> Option<Arc<dyn Surface>>;
+    fn surfaces(&self) -> Vec<Arc<dyn Surface>>;
+    fn monitors(&self) -> Vec<MonitorInfo>;
+    fn primary_monitor(&self) -> Option<MonitorInfo>;
+    fn color_scheme(&self) -> Option<ColorScheme>;
+    fn clipboard(&self) -> &dyn Clipboard;
+    fn capabilities(&self) -> &PlatformCapabilities;
+    fn scroll_settings(&self) -> ScrollSettings { ScrollSettings::default() }
+    fn clock(&self) -> Arc<dyn Clock>;
+    fn waker(&self) -> Arc<dyn Waker>;
+    fn request_exit(&self);
+    fn is_exiting(&self) -> bool;
+}
+```
+
+**The context is handed in and never stored.** The object that can create windows is valid only
+while the loop is inside a callback, and on most platforms it is neither `Send` nor `Sync`. Exactly
+three things outlive a callback, and each says so in its type: `Arc<dyn Surface>`,
+`Arc<dyn Clock>`, `Arc<dyn Waker>`.
+
+`color_scheme` answers `Option<ColorScheme>` because **absent means unknown, never light**. Guessing
+light on a desktop that cannot be asked shows a white flash to every user who chose dark.
+
+## Surface
+
+A thing that can be drawn into and interacted with (`crates/zgui-platform/src/surface/mod.rs`). It
+is called a surface and not a window because one implementation has no window.
+
+```rust
+pub trait Surface: Send + Sync + 'static {
+    fn id(&self) -> SurfaceId;
+    fn size(&self) -> Size<DevicePx, Device>;
+    fn scale_factor(&self) -> f64;
+    fn refresh_rate_millihertz(&self) -> Option<u32> { None }
+    fn request_size(&self, size: Size<CssPx, Css>) -> Option<Size<DevicePx, Device>>;
+    fn set_min_size(&self, size: Option<Size<CssPx, Css>>);
+    fn set_max_size(&self, size: Option<Size<CssPx, Css>>);
+    fn request_redraw(&self);
+    fn pre_present_notify(&self);
+    fn set_title(&self, title: &str);
+    fn set_visible(&self, visible: bool);
+    fn set_decorated(&self, decorated: bool);
+    fn set_resizable(&self, resizable: bool);
+    fn set_maximized(&self, maximized: bool);
+    fn set_minimized(&self, minimized: bool);
+    fn set_fullscreen(&self, mode: Option<FullscreenMode>);
+    fn set_position(&self, position: Point<CssPx, Css>) { }
+    fn position(&self) -> Option<Point<CssPx, Css>> { None }
+    fn is_maximized(&self) -> bool { false }
+    fn is_minimized(&self) -> Option<bool> { None }
+    fn fullscreen(&self) -> Option<FullscreenMode> { None }
+    fn set_window_level(&self, level: WindowLevel) { }
+    fn set_icon(&self, icon: Option<&WindowIcon>) { }
+    fn set_theme(&self, theme: Option<ColorScheme>) { }
+    fn focus(&self) { }
+    fn request_attention(&self, urgent: bool) { }
+    fn begin_move_drag(&self) -> Result<(), Unsupported> { Err(Unsupported) }
+    fn begin_resize_drag(&self, edge: ResizeEdge) -> Result<(), Unsupported> { /* Err */ }
+    fn set_cursor(&self, cursor: CursorStyle);
+    fn set_pointer_passthrough(&self, on: bool) -> Result<(), Unsupported> { /* Err */ }
+    fn set_text_input(&self, state: Option<TextInput>);
+    fn reset_dead_keys(&self) {}
+    fn push_a11y_update(&self, build: &mut dyn FnMut() -> TreeUpdate);
+    fn gpu(&self) -> Option<&dyn GpuSurface> { None }
+    fn gpu_shared(self: Arc<Self>) -> Option<Arc<dyn GpuSurface>> { None }
+}
+```
+
+Four facts carry the rest of the design.
+
+- **`size` is physical pixels. Every caller-supplied size is CSS pixels.** A swap chain is allocated
+  in physical pixels and a rounding error there is a visibly stretched frame; a style sheet is
+  written in CSS pixels. `scale_factor` is the bridge, and it is **the surface's own, never the
+  monitor's**.
+- **`request_redraw` is safe from any thread and coalescing.** A hundred requests before the next
+  frame produce one frame. That is what lets everything that might want a frame ask for one, without
+  any of them having to know about the others.
+- **`push_a11y_update` takes a closure, not a value.** Building the accessibility tree costs a walk
+  of what changed, and on a machine with nothing listening that walk is waste. The argument is
+  `&mut dyn FnMut()` so the trait stays object safe.
+- **`gpu` and `gpu_shared` cannot be derived from one another.** Nothing turns a shared handle to
+  one trait into a shared handle to another, so a backend states both, and both are `None` together.
+
+`GpuSurface` is a blanket:
+
+```rust
+pub trait GpuSurface: Surface + HasWindowHandle + HasDisplayHandle {}
+impl<T> GpuSurface for T where T: Surface + HasWindowHandle + HasDisplayHandle {}
+```
+
+### A surface is created hidden
+
+`SurfaceAttributes` has the title; size constraints; resizability; decorations; transparency;
+application identifier; requested position, maximized state, fullscreen mode, and stacking level;
+and an optional icon and color-scheme override. It has **no `visible` field**, and that is a rule
+rather than an omission. The accessibility adapter refuses a window that has already been shown,
+and there is no second chance to attach it. The only order that works is:
+
+<Steps>
+
+<Step>
+
+Create the window hidden.
+
+</Step>
+
+<Step>
+
+Attach the accessibility adapter.
+
+</Step>
+
+<Step>
+
+Draw one frame.
+
+</Step>
+
+<Step>
+
+Call `set_visible(true)`.
+
+</Step>
+
+</Steps>
+
+The runtime performs the last step at the end of the first frame that presented
+(`crates/zgui-runtime/src/window/frame.rs`). That ordering is also what prevents a flash of empty
+window at launch.
+
+`SurfaceAttributes::new(title)` sets `resizable: true, decorated: true`, while the derived
+`SurfaceAttributes::default()` leaves both `false`.
+
+### SurfaceEvent
+
+One `#[non_exhaustive]` enum carries everything that happens to a surface
+(`crates/zgui-platform/src/surface/event.rs`).
+
+| Variant | Payload |
+|---|---|
+| `Resized(Size<DevicePx, Device>)` | the new physical extent |
+| `ScaleFactorChanged { scale_factor, size }` | the ratio **and** the resulting extent, as one event |
+| `RedrawRequested` | arrives only in answer to a redraw request |
+| `CloseRequested` | nothing has closed yet |
+| `Destroyed` | |
+| `Focused(bool)` | keyboard focus, as a level |
+| `Occluded(bool)` | entirely hidden |
+| `ColorSchemeChanged(ColorScheme)` | |
+| `Pointer { action, event, modifiers, timestamp }` | mouse, finger and stylus, one stream |
+| `Wheel { event, modifiers, timestamp }` | |
+| `Key { state, event, modifiers, timestamp }` | |
+| `ModifiersChanged(Modifiers)` | |
+| `Ime(ImeEvent)` | |
+| `Drag(DragEvent)` | |
+
+`to_dispatch() -> Option<(EventKind, Payload)>` turns an event into something the input system can
+route. It answers `None` for `ModifiersChanged` and for `Drag(Entered | Moved | Left)`: those change
+state without being an occurrence.
+
+A mouse, a finger and a stylus produce one `Pointer` stream told apart by a field. A drag carries
+its **whole** set of paths at every stage rather than one path per event.
+
+## Clock, Waker and Clipboard
+
+```rust
+pub trait Clock: Send + Sync + 'static {
+    fn now(&self) -> Instant;
+    fn origin(&self) -> Instant;
+    fn timestamp(&self) -> Timestamp {
+        Timestamp::from_origin(self.now().saturating_duration_since(self.origin()))
+    }
+}
+
+pub trait Waker: Send + Sync + 'static {
+    fn wake(&self, reason: WakeReason);
+}
+```
+
+**Nothing above this seam reads the system clock.** `VirtualClock`
+(`crates/zgui-platform/src/clock/manual.rs`) parks at its own origin and moves only when
+`advance(&self, by: Duration)` is called, forward only. It is the one manual implementation, and
+both the headless backend and `zgui-testkit-scene` re-export it, so the two cannot drift apart.
+
+`Waker` is the **only object in the contract that crosses threads**. `wake` never blocks and never
+fails; a wake sent to a finished loop is discarded.
+
+```rust
+#[non_exhaustive]
+pub enum WakeReason {
+    ReactiveWork { surfaces: Box<[SurfaceId]> },
+    AppWork,
+    A11yAction(accesskit::ActionRequest),
+    A11yTreeRequested(SurfaceId),
+    ClipboardRead { serial: ClipboardSerial, result: Result<ClipboardData, ClipboardError> },
+    DeviceLost,
+    ColorSchemeChanged,
+}
+impl WakeReason { pub fn surfaces(&self) -> &[SurfaceId]; }
+```
+
+`surfaces()` returns an empty slice for the genuinely global reasons, which means "all of them". A
+non-empty answer is a restriction, and a caller must honour it: an image finishing its decode for
+one window is not a reason to redraw another.
+
+`AppWork` is the control-plane wake. It tells the handler to drain deferred open, close, and quit
+commands on a turn that has a `PlatformCx`. It does not by itself mean that an existing window needs
+a frame.
+
+The contract does depend on `accesskit`. AccessKit is the interchange vocabulary for accessibility
+and is deliberately not abstracted behind a trait of the framework's own.
+
+```rust
+pub trait Clipboard {
+    fn read(&self, kind: ClipboardKind, format: ClipboardFormat) -> ClipboardSerial;
+    fn read_blocking(&self, kind: ClipboardKind, format: ClipboardFormat)
+        -> Result<ClipboardData, ClipboardError>;
+    fn write(&self, kind: ClipboardKind, data: ClipboardData, options: ClipboardWriteOptions)
+        -> Result<(), ClipboardError>;
+    fn clear(&self, kind: ClipboardKind) -> Result<(), ClipboardError>;
+}
+```
+
+A read is a **request**, not a return value. The content belongs to another process, which has to be
+asked and may never answer. `read` hands back a `ClipboardSerial` and the answer arrives later as
+`WakeReason::ClipboardRead { serial, result }`. `read_blocking` exists because a desktop usually can
+answer at once, and it is allowed to refuse.
+
+`ClipboardKind` is `Standard` or `Primary`. The primary selection is the X11 and Wayland convention
+where selecting text with the pointer makes it pasteable with the middle button; it is a second,
+independent clipboard.
+
+## IdlePolicy and the two failure modes
+
+```rust
+#[non_exhaustive]
+pub enum IdlePolicy { Block, BlockUntil(Instant), Spin }
+
+impl IdlePolicy {
+    pub fn until(deadline: Instant, now: Instant) -> Self;  // collapses to Block when not > now
+    pub fn merge(self, other: Self) -> Self;                // Spin wins; else the earliest deadline
+    pub const fn deadline(self) -> Option<Instant>;
+}
+```
+
+Two things go wrong at this seam, and both look like nothing happening.
+
+| Failure | Cause | What closes it |
+|---|---|---|
+| The stall | A deadline is installed and reached, and nothing turns that into a request to draw. | `AppHandler::deadline_reached` calls `Surface::request_redraw`. |
+| The spin | A deadline that has already passed is installed anyway. The platform reports it reached on every turn for ever, and the loop runs no frames while burning a core. | `IdlePolicy::until` collapses to `Block`, and `Runtime::idle` asks for a frame instead. |
+
+The ratio of resumes to frames is the only portable thing that separates a spin from a correct park,
+which is why the headless backend asserts `resumes <= frames + 1` after every turn.
+
+A turn of the loop over a still document is measured at **0.07 µs** on the maintainer's machine, and
+a still document runs **zero** frames (`idle.turn` and `idle.frames`, `docs/performance.md`).
+
+## The winit backend
+
+`crates/zgui-platform-winit` is the only crate in the tree that names a windowing library. It is
+`#![allow(unsafe_code)]` and contains exactly one `unsafe` block: constructing the Wayland clipboard
+from a raw `wl_display` pointer. Its dependencies are `winit`, `accesskit`, `accesskit_winit`,
+`arboard`, `smithay-clipboard`, `raw-window-handle`, `tracing` and four zgui crates.
+
+```rust
+pub fn event_loop() -> Result<EventLoop<UserEvent>, PlatformError>;
+pub fn run(handler: Box<dyn AppHandler>) -> Result<(), PlatformError>;
+```
+
+`run` builds the loop, wraps the handler in `WinitApp`, calls
+`zgui_profile::latency::start_epoch()`, and blocks until the runtime's exit policy stops the
+application. `WinitApp<A>` is
+generic over the handler rather than boxing it, so a caller who owns both can read the application
+back after the loop finishes. It exposes `handler()`, `park()` and `turns()`.
+
+### Creating a window
+
+`WinitCx::create_surface` (`crates/zgui-platform-winit/src/cx.rs`) does four things in order.
+
+<Steps>
+
+<Step>
+
+`event_loop.create_window(window_attributes(attributes, scheme))`. A failure becomes
+`PlatformError::SurfaceCreation`. The request always carries `.with_visible(false)`, whatever was
+asked for, and every size crosses as a **logical** size.
+
+</Step>
+
+<Step>
+
+Numbers the surface `SurfaceId::new(next)`, starting at 1 and never reused.
+
+</Step>
+
+<Step>
+
+Attaches the accessibility adapter,
+`accesskit_winit::Adapter::with_event_loop_proxy(event_loop, &window, proxy.clone())`. Here and
+nowhere else.
+
+</Step>
+
+<Step>
+
+Pushes the surface into the loop's shared state.
+
+</Step>
+
+</Steps>
+
+The application identifier is set through **both** display-server extensions unconditionally
+(`crates/zgui-platform-winit/src/surface/attributes.rs`): `WindowAttributesExtWayland::with_name`
+and then `WindowAttributesExtX11::with_name`. Which display server the binary ends up on is not
+known when the attributes are built. On Wayland the identifier becomes the toplevel `app_id`; on X11
+it becomes the general class and the instance name of `WM_CLASS`. The instance name is the
+identifier again, not `argv[0]`, because a name taken from the executable path changes with how the
+program was started.
+
+### The event translation table
+
+`translate(surface, state, timestamp, event) -> Option<SurfaceEvent>`
+(`crates/zgui-platform-winit/src/app/events.rs`).
+
+| winit `WindowEvent` | becomes |
+|---|---|
+| `Resized` | `SurfaceEvent::Resized` |
+| `ScaleFactorChanged` | `ScaleFactorChanged { scale_factor, size: Surface::size(surface) }` |
+| `CloseRequested`, `Destroyed`, `Focused`, `Occluded`, `RedrawRequested` | the same variant |
+| `ThemeChanged` | `ColorSchemeChanged` |
+| `CursorMoved` | `Pointer { action: Moved }`, and the position is remembered |
+| `CursorEntered` / `CursorLeft` | `Pointer { action: Entered / Left }` |
+| `MouseInput` | `Pointer { action: Pressed / Released }` |
+| `MouseWheel` | `Wheel`, at the pointer's last known place |
+| `Touch` | `Pointer`, on the same stream as the mouse |
+| `KeyboardInput` | `Key`, unless it is synthetic |
+| `ModifiersChanged` | `ModifiersChanged`, and the set is remembered |
+| `Ime` | `Ime` |
+| `HoveredFile`, `DroppedFile`, `HoveredFileCancelled` | nothing yet; gathered |
+| anything else | `None` |
+
+Four of those are not straight crossings, and each is handled at the boundary rather than above it.
+
+1. **`ModifiersChanged`.** The platform reports a change; the contract carries a state. The new set
+   is stored on `WindowState::modifiers` and attached to every later event.
+2. **`CursorMoved`.** The position is stored on `WindowState::pointer`, because a wheel turn and a
+   file drop carry no position on any desktop protocol in use, and both have to be routed to
+   whatever is under the pointer.
+3. **File drags.** The platform reports one path at a time and never says it has finished, so paths
+   are gathered on `WindowState::drag` and flushed as whole `DragEvent` values in `about_to_wait` —
+   the earliest moment the set is known to be complete.
+4. **`KeyboardInput { is_synthetic: true }` is dropped.** It is the platform's report of keys already
+   held when a window gained focus. Dispatching it would type a character nobody pressed.
+
+Window-position events and native gestures return `None`: nothing above asks for the first, and the
+framework synthesises the second from the pointer stream.
+
+### The sign of a wheel
+
+`crates/zgui-platform-winit/src/input/wheel.rs` performs the one sign conversion in the framework.
+winit's `MouseScrollDelta` is positive in the direction the **content** should move. A scroll offset
+grows in the opposite direction, and that is the convention `zgui_platform::scroll` fixes for
+everything above the seam.
+
+```rust
+MouseScrollDelta::LineDelta(x, y) => ScrollDelta::Lines { x: -x, y: -y },
+MouseScrollDelta::PixelDelta(pixels) => ScrollDelta::Pixels(Size::new(
+    CssPx(-(pixels.x / scale) as f32),
+    CssPx(-(pixels.y / scale) as f32),
+)),
+```
+
+Lines stay lines: converting a detent to pixels needs a used line height only the scrolled element
+knows. `ScrollPhase` is derived from the **delta kind and not from the touch phase**, because a
+wheel notch reports `TouchPhase::Moved` on X11, Wayland and Win32 alike.
+
+`desktop_scroll_settings()` states three answers once: `lines_per_notch = 3.0`,
+`direction = ScrollDirection::AsReported` on every target, and `wheel = WheelMotion::Discrete`
+except `Continuous` on macOS. The direction is never flipped here, because natural scrolling already
+lives in the input stack; applying it twice would override a desktop setting for every program.
+
+### One turn of the loop
+
+| winit callback | What happens |
+|---|---|
+| `new_events` | Counts the turn. On the first call, `Shared::attach` discovers the system theme, settles the capabilities and hands the clipboard its connection and waker. `ResumeTimeReached` calls `park.resumed()` and then `handler.deadline_reached`. `WaitCancelled` calls `park.cancel()`. |
+| `resumed` | `handler.surfaces_available(cx)` |
+| `suspended` | `handler.surfaces_lost(cx)`, then the backend drops every native window |
+| `user_event` | `UserEvent::Wake(reason)` reaches `handler.wake`; `UserEvent::A11y(event)` is translated first |
+| `window_event` | The accessibility adapter observes the raw event **first**, then `translate`, then `handler.surface_event` |
+| `about_to_wait` | `flush_drags`, `handler.idle(cx)`, `park.install(policy, now)`, `install.park(...)`, `set_control_flow` |
+| `exiting` | `handler.shutting_down(cx)` |
+
+`Parked::Indefinitely` maps to `ControlFlow::Wait`, `Parked::Until(d)` to
+`ControlFlow::WaitUntil(d)`, and `Parked::Never` to `ControlFlow::Poll`.
+
+### The park state machine
+
+The application names a deadline against one reading of the clock. The loop installs it against a
+later reading. A moment a few microseconds ahead can pass in between.
+
+```rust
+#[must_use = "an install that is dropped may be dropping a deadline the application is waiting for"]
+#[non_exhaustive]
+pub enum Install { Ready(Parked), Overdue(Instant) }
+
+impl Install {
+    pub const fn overdue(self) -> Option<Instant>;
+    pub fn park(self, deliver: impl FnOnce(Instant)) -> Parked;
+}
+```
+
+The invariant is one sentence: **a moment the application named is either waited for or handed over,
+never dropped.** `Park::install` never installs a moment that is not strictly in the future, and
+never discards one. `Install::park` is the only route from `Overdue` to a `Parked`, and it demands
+the delivery as an argument, so the obligation cannot be lost to an early return or to a `match` arm
+added later.
+
+A turn that answered an overdue moment then parks `Parked::Never` rather than on the answer the
+application gave before it was told, because that answer is now stale.
+
+### Capabilities this backend declares
+
+`PlatformCapabilities` is built up from `PlatformCapabilities::none()` rather than down from
+everything, so a capability nobody filled in reads as absent. An interface that degrades because it
+was told something is missing works; one that offers a command the desktop cannot run does not.
+
+| Field | winit backend | Note |
+|---|---|---|
+| `clipboard_formats` | `[Text]` | On every platform. |
+| `clipboard_primary_selection` | Linux and BSD only | |
+| `drop_mime_types` | `["text/uri-list"]` | A drop is always paths. |
+| `ime` | `true` | |
+| `ime_purpose_hints` | `true` | |
+| `absolute_window_position` | `false` under Wayland | Read from the display handle. |
+| `window_levels` | `false` under Wayland | Answers with the line above. |
+| `decorations` | `DecorationSource::Platform` | |
+| `system_color_scheme` | `true` only when a theme was discovered | Normally `false` on Linux. |
+| `native_popup_surfaces` | `false` | <Status kind="planned">A menu or a tooltip as a real window of its own. Today every overlay is drawn inside the window that owns it.</Status> |
+| `drag_source`, `pointer_confine`, `pointer_lock`, `native_gestures` | `false` | Declared by the contract, never set true by either shipped backend. |
+
+The set is settled once, in a `OnceCell`, on the first callback, which is what lets
+`PlatformCx::capabilities` return a borrow rather than a clone on every question a component asks.
+
+## Scale factor
+
+A scale factor is the number of physical pixels the display puts to one CSS pixel. It is a property
+of the **surface**, not of the monitor: on Wayland a window's scale is per window through
+`wp-fractional-scale`, and X11 has no per-window scale at all. `MonitorInfo::scale_factor` exists and
+is the output's; it is not a substitute for `Surface::scale_factor`.
+
+The ratio is not a constant. It moves when a window is dragged to another monitor, when the desktop
+scaling is changed while the application runs, and on the very first configure a Wayland compositor
+sends.
+
+The path is `winit::ScaleFactorChanged` → `SurfaceEvent::ScaleFactorChanged { scale_factor, size }`
+→ `Window::queue` → `Window::resized` → `Window::rescale`
+(`crates/zgui-runtime/src/window/scale.rs`).
+
+| State | Unit | What the change does to it |
+|---|---|---|
+| computed styles | CSS px | Nothing. `font-size: 12px` is twelve CSS pixels at every ratio. |
+| the layout cache | device px | Invalidated in full, `zgui_layout::tree::dirty::mark_all_dirty`. |
+| shaped paragraphs | device px | Keyed by the ratio, so a new ratio misses and re-shapes. |
+| rasterised glyphs | device px | Keyed by size in device px, so a new ratio misses and re-rasterises. |
+| scroll offsets | device px | Multiplied by `scale / from`. |
+| the media device | ratio | Rebuilt, because `resolution` and `dppx` queries read it. |
+
+`rescale` also runs unconditionally, whether or not the ratio moved: it stores the new scale, calls
+`host.set_scale(scale)` so a component relating a pointer position to a box has the right number, and
+rebuilds the viewport as
+`Viewport::new(CssPx(width / scale), CssPx(height / scale)).at_scale(scale).in_scheme(...)`. The
+colour scheme is **carried across, not defaulted**: it is a property of the desktop and not of the
+surface's extent.
+
+<Callout type="warn">
+The layout cache is the one entry in the table that has to be emptied by hand. Shaped paragraphs and
+rasterised glyphs are looked up under keys that carry the ratio, so they miss and are made afresh.
+The layout cache is keyed by the *question* layout asked — a run mode, an available space, a known
+size — all in device pixels. A box with an explicit `width` asks a differently sized question at a
+new ratio and misses correctly. A box sized by its own text, or one asking for a min-content width,
+asks an **identical** question at every ratio and would be answered from a slot computed at the old
+one. The symptom is a document that half rescales.
+</Callout>
+
+On the accessibility side a scale change rewrites exactly **one** node: the root carries
+`Affine::scale(scale)` and every other node's rectangle is in CSS pixels.
+
+## Wayland versus X11
+
+Both run through the same backend and the same binary. The differences that reach the framework:
+
+| Question | Wayland | X11 |
+|---|---|---|
+| Per-window scale | Yes, through `wp-fractional-scale` | No; the output's scale is all there is |
+| `system_theme()` | Unsupported | Unsupported |
+| `ThemeChanged` | Never fires | Never fires |
+| Window may place itself | No | Yes |
+| `primary_monitor()` | Always `None` | Answers |
+| `WindowEvent::Moved` | Never fires | Fires |
+| `outer_position()` | Refused | Answers |
+| Clipboard route | `smithay-clipboard` over the application's own connection | `arboard` |
+
+Two consequences are worth stating plainly. On Linux, `capabilities.system_color_scheme` is normally
+`false` and `PlatformCx::color_scheme()` is `None`, so a light or dark preference has to come from
+the application. The XDG-portal reader that would answer it is not built; `zbus` appears in
+`[workspace.dependencies]` but no crate in the tree names it. And because `Moved` never fires under
+Wayland, the accessibility adapter's root window bounds stay at the origin, so screen-coordinate
+features of an assistive technology — a magnifier that follows focus — are degraded there.
+
+### The clipboard split
+
+`DesktopClipboard` (`crates/zgui-platform-winit/src/clipboard/mod.rs`) holds two implementations and
+chooses once, at start-up, from the running loop's display handle.
+
+- **Wayland → `smithay_clipboard::Clipboard`**, over the application's own connection, using the
+  ordinary `wl_data_device` protocol that a window is supposed to use. `arboard`'s Wayland support
+  speaks *data-control* instead, which is the protocol clipboard managers and screen recorders use:
+  it needs a privileged interface, several compositors do not offer it, and where it is missing every
+  copy fails silently. It is compiled out with `default-features = false`.
+- **Everything else, including X11 → `arboard`**, opened lazily on first use. An application that
+  never copies pays for neither a connection nor a thread, and does not fail to start on a machine
+  with no clipboard.
+
+Only `ClipboardFormat::Text` crosses this boundary. `Html`, `FileList` and `Image` are refused with
+`ClipboardError::UnsupportedFormat` on both read and write, because a refusal and an empty value mean
+opposite things to a caller deciding whether to offer a paste command. An empty string read is
+reported as `Empty(kind)`, not as `Ok("")`.
+
+<Status kind="partial">The runtime writes to the clipboard and does not read from it. Cut and copy
+are bound in `crates/zgui-edit/src/editor/keys.rs` and reach `cx.clipboard().write(...)` from
+`Runtime::surface_event`. `Command::Paste(String)` exists in the editing model, but nothing calls
+`Clipboard::read`, and `WakeReason::ClipboardRead` falls into the runtime's catch-all arm.</Status>
+
+## The headless backend
+
+`crates/zgui-platform-headless` implements the same contract with no windowing system behind it. It
+is `#![forbid(unsafe_code)]` and names no window system. It is a dev-dependency of `zgui` and is
+**not** re-exported, so a test adds it to its own `[dev-dependencies]`.
+
+| Type | What it is |
+|---|---|
+| `Headless` | `impl PlatformCx`, with a `VirtualClock`, declared capabilities, declared monitors and a stated colour scheme |
+| `OffscreenSurface` | `impl Surface` that records instead of acting |
+| `MemoryClipboard` | two independent slots, `standard` and `primary` |
+| `RecordingWaker` | queues wake reasons instead of interrupting anything |
+| `Harness<A: AppHandler>` | the loop, with everything a real one does about parking and nothing it does about blocking |
+
+**What it fakes.** `Headless::with_capabilities` declares capabilities the headless platform cannot
+perform. That is the point: a component whose behaviour depends on the desktop can be exercised under
+each answer, which is the only way to find out that it degrades rather than disappears. The same
+holds for `with_monitors`, `with_scroll_settings`, `set_color_scheme` and
+`OffscreenSurface::set_refresh_rate_millihertz` — a test can drag a window from a 75 Hz panel onto a
+240 Hz one.
+
+**What it records.** `redraws_requested`, `has_pending_redraw`, `take_pending_redraw` (coalescing
+lives here), `a11y_updates`, `last_a11y_update`, `a11y_log`, `text_input_log`, `last_text_input`,
+`is_visible`, `title`. The **whole** accessibility sequence is kept, not only the last update,
+because an update is a difference: what it names resolves against everything sent before it.
+`push_a11y_update` always calls the closure, because whatever is driving a headless surface is the
+listener.
+
+**What it proves.** `Harness` runs turns by hand: `deliver`, `deliver_all`, `pump`, `settle`,
+`advance`, `run_for`. Three behaviours make it a proof rather than a stub.
+
+- `deliver` applies the event **to the surface first**, then delivers it — the order a window system
+  uses, because a window's reported extent has already changed when the notification arrives.
+- `advance` clears the parked deadline **before** telling the application, so a handler that installs
+  a fresh deadline inside its own callback is not undone, and then asserts the park invariant.
+- `assert_park_invariant` panics when `resumes > frames + 1`.
+
+`redraws_requested` is a difference from a baseline rather than a tally kept by hand, so it counts
+every call that reached `Surface::request_redraw`. A tally counts only the places somebody remembered
+to increment, which is how a request that is never made and a request nobody counted come to look
+alike.
+
+<Callout type="warn">
+The headless backend is **never a silent fallback for a real window**. An application that asked for
+a window and got a buffer is worse off than one that was told no: it appears in no task bar, nothing
+is presented, and the failure is invisible. A windowing backend that cannot open a device reports
+that.
+</Callout>
+
+## AccessKit
+
+An accessibility tree is a second, much smaller description of the interface, published for a screen
+reader or another assistive technology. It says what each control **is** — a button, a checkbox, a
+text field — what it is called, what value it holds, and where it was drawn. AccessKit is the library
+that carries that description to each operating system's own accessibility service.
+
+### Publication, once per frame
+
+`Window::publish_a11y` (`crates/zgui-runtime/src/window/a11y.rs`) is the last phase of the frame
+that has anything to say to a consumer, and it runs **after** the renderer: what a consumer is told
+about a node's position must be what was drawn, not what was about to be.
+
+<Steps>
+
+<Step>
+
+Drain `a11y_moves` into `A11yBuilder::note_move(node)`. These are the nodes the fragment pass carried
+somewhere else.
+
+</Step>
+
+<Step>
+
+Drain `moved_spaces` into `A11yBuilder::note_space_moved(space)`. A node whose coordinate system was
+rewritten was never touched at all, so it needs a second obligation.
+
+</Step>
+
+<Step>
+
+`A11yBuilder::collect(&mut document)` — **always**, listener or not. Invalidation is a union: a bit
+left set on a node keeps every ancestor's subtree union set, so a phase that never retires its marks
+makes every other stage descend everywhere for the life of the window.
+
+</Step>
+
+<Step>
+
+Dispatch on `(is_owed, focus_moved_since_publish)`. `(false, false)` publishes nothing.
+`(false, true)` publishes an update with no nodes at all. `(true, _)` builds a difference.
+
+</Step>
+
+</Steps>
+
+The build happens **inside** the closure handed to `Surface::push_a11y_update`. With no assistive
+technology running, `accesskit_winit::Adapter::update_if_active` never calls it, and the whole phase
+costs one match.
+
+### What is diffed
+
+`A11yBuilder::build` (`crates/zgui-a11y/src/build/mod.rs`):
+
+1. If nothing has been published yet, or more than `BEFORE_A_FULL_REBUILD_IS_CHEAPER = 4096` nodes
+   are owed, build the whole tree instead.
+2. For each owed node, add **it and its parent** to the targets. A child list belongs to the parent,
+   so an appearance, a disappearance or an identity change is only visible once the parent is sent
+   again.
+3. For a node that only moved and that the consumer already holds, remember it for a re-measure
+   rather than a re-projection.
+4. Retire departures **before** projecting anything. A node that leaves invalidates every node that
+   names it, and those nodes are usually not in this frame's marks at all, so the whole departure set
+   has to be known first.
+5. Project each target. Put it in the update **only if the snapshot differs** from the one last sent.
+6. Re-measure the moved-only nodes not already covered: bounds only, measured afresh rather than
+   translated by an accumulated offset.
+
+A projection is a pure function of the frame — nothing cached, nothing incremental — which is what
+makes "compare this frame's node with the last one" a valid change test. Identity needs no table:
+`zgui_a11y::to_a11y(key)` is `NodeId(key.as_u64())`, the same sixty-four bits the document arena
+uses.
+
+**Focus rides on every update.** It is a field of `TreeUpdate` rather than an event, and a focus
+identifier that is not projectable falls back to the root — a consumer resolves identifiers with an
+unchecked lookup on a thread this process does not own, so a dangling one is a crash nothing here can
+catch. `zgui_a11y::dangling` checks exactly that, and the runtime runs it in a `debug_assert!` around
+every published update.
+
+### The route back in
+
+| From the adapter | `WakeReason` | What the runtime does |
+|---|---|---|
+| `InitialTreeRequested` | `A11yTreeRequested(surface)` | `Window::publish_full_a11y_tree()`. Nothing is dirty, because nothing changed — what is missing is the consumer's copy. |
+| `ActionRequested(request)` | `A11yAction(request)` | Offered to each window in turn until one answers `true`. An action names a node, not a window. |
+| `AccessibilityDeactivated` | none | Nothing has to be built any more, which is not something to wake for. |
+
+`Window::apply_a11y_action` resolves the request to a `zgui_a11y::Intent`, checks the node belongs to
+this document, and carries it out inside the window's reactive scope. An inbound `Action::Click`
+becomes an ordinary `click`, dispatched down the same capture, target and bubble path a pointer
+takes. No component contains separate accessibility activation logic, because there is no separate
+path to write it against.
+
+[Accessibility](/docs/building/accessibility) covers the `a11y:` attributes and the projection rules.
+
+## IME and text input
+
+An input method (an IME) is the software that turns keystrokes into text for a script that has more
+characters than the keyboard has keys. It shows provisional text and a candidate list while the user
+composes, and commits the result.
+
+Two things have to be right, and neither is about the text: the window has to be told that text input
+is wanted at all, and it has to be told where the caret is, because that is where the candidate
+window goes.
+
+```rust
+pub struct TextInput {
+    pub caret_origin: Point<CssPx, Css>,   // from the surface's top-left
+    pub caret_size: Size<CssPx, Css>,
+    pub purpose: TextInputPurpose,
+}
+```
+
+`Surface::set_text_input(Some(state))` sets all three parts in one call, and the winit backend
+performs them in a load-bearing order: `set_ime_cursor_area` first, then `set_ime_purpose`, then
+`set_ime_allowed(true)`. Setting the flag before the area lets the candidate window land over the
+text being composed.
+
+Inbound, `winit::event::Ime` maps one to one onto `zgui_vocab::ImeEvent`:
+`Enabled`, `Preedit { text, cursor: Option<Range<usize>> }`, `Commit(text)`, `Disabled`. The preedit
+cursor is a **byte range and not a caret**, because an input method selects a span as often as it
+places a point, and a selection collapsed to a point is expressible while the reverse is not.
+
+Above the seam, `zgui_input::ime::Ime` keeps what the surface was last told and answers `Told::Enabled`
+or `Told::Disabled` only when the answer really moved — a surface told the caret is where it already
+is wakes the input method for nothing, once per frame, for as long as the field has focus. The
+runtime calls it from two places: `report_text_input` when focus moves, and `report_caret` after an
+edit. Focus leaving an editable element abandons any composition, because provisional text belonged
+to the field that no longer has focus.
+
+<Status kind="partial">`TextInputPurpose` has eight values and `Surface::set_text_input` carries all
+of them, but `Window::caret_area` (`crates/zgui-runtime/src/window/input.rs`) always passes
+`TextInputPurpose::Normal`. The winit backend declares `ime_purpose_hints = true` and maps
+`Password | Pin` to the platform's password purpose, so the wiring is complete on both sides and only
+the middle is missing: a password field does not yet report itself as secret.</Status>
+
+## Writing a second backend
+
+The traps below are each a real defence in the shipped code, and each of them fails quietly.
+
+| Do not | Because |
+|---|---|
+| Store the `PlatformCx` | It is valid for one callback and on most platforms is neither `Send` nor `Sync`. |
+| Create a visible window | The accessibility adapter refuses a window that has already been shown, and there is no second chance. |
+| Guess `ColorScheme::Light` when the desktop cannot be asked | Every dark-mode user gets a white flash at launch. Answer `None`. |
+| Install a deadline that is not strictly in the future | The platform reports it reached on every turn for ever: the spin. |
+| Drop a deadline the application named | The loop blocks with nothing left to ask for the frame: the stall. |
+| Dispatch synthetic key events | They report keys already held at focus-gain, and typing one is a character nobody pressed. |
+| Invent a refresh rate when the platform declines | Zero means "no rate". The one stated fallback is `zgui_platform::refresh_interval(None)`, which is 60 000 mHz. |
+| Answer `gpu()` and `gpu_shared()` differently | Both are `Some` together or `None` together. |
+| Share one slot between `Standard` and `Primary` | Every copy would destroy the user's selection, and every clipboard test would still pass. |
+| Report a wheel delta in the platform's own sign | The framework is positive in the direction the offset moves. The backend negates. |
+| Name a wake as global when it belongs to one surface | An image decoding for one window is not a reason to redraw another. |
+| Let a surface outlive `surfaces_lost` | That is a crash, not a leak. |
+| Fall back to a buffer when a device cannot be opened | Report the failure. A window nobody can see is worse than an error. |
+
+The mechanical checks are in `crates/zgui-platform/src/api.rs` and the shared property tests are in
+`crates/zgui-platform-winit/tests/both_backends.rs`, which holds both drivers in one
+`const DRIVERS: [(&str, Driver); 2]` array and picks by index — so no compile-time branch on which
+backend is in use is possible. Each test against a real loop is its own binary with
+`harness = false`, because a process may create exactly one event loop and on most desktops only on
+its first thread. On a machine with no display server they print `SKIPPED:` and pass.
+
+## Driver and App::run_on
+
+The application does not choose where it runs. A caller does, and the whole of that choice is one
+function pointer (`crates/zgui/src/app/mod.rs`).
+
+```rust
+pub type Driver = fn(Box<dyn AppHandler>) -> Result<(), PlatformError>;
+
+pub fn desktop() -> Driver;   // returns zgui_platform_winit::run
+
+impl App {
+    pub fn run<F, V>(self, view: F) -> Result<(), AppError>;
+
+    pub fn run_on<F, V, D>(self, driver: D, view: F) -> Result<(), AppError>
+    where
+        F: FnMut() -> V + 'static,
+        V: IntoView,
+        D: FnOnce(Box<dyn AppHandler>) -> Result<(), PlatformError>;
+
+    pub fn into_handler<F, V>(self, view: F) -> Result<Handler, AppError>;
+}
+
+pub struct Handler { /* the runtime */ }
+impl Handler {
+    pub fn drive<D>(self, driver: D) -> Result<(), AppError>;
+}
+```
+
+`App::run` is exactly `self.run_on(zgui_platform_winit::run, view)`. `run_on` takes the **driver
+first and the view second**.
+
+<Callout type="warn">
+`zgui_runtime::App::run(view, driver)` takes them the other way round. The umbrella crate and the
+runtime crate disagree on argument order, and both compile against a closure.
+</Callout>
+
+Two things a caller does with a driver. The first is to run somewhere other than a screen: a test
+drives the same application over buffers and a virtual clock, and nothing above that line changes.
+The second is to sit **between** the desktop and the application while keeping the real window, the
+real graphics device and the real compositor:
+
+```rust
+use zgui::prelude::*;
+
+fn main() -> Result<(), zgui::Error> {
+    app().run_on(
+        // A handler of your own may wrap the one it is given, watch every event it takes,
+        // and produce events of its own, before handing it to the real desktop driver.
+        |handler| zgui::app::desktop()(handler),
+        || view! { column() },
+    )
+}
+```
+
+`Handler::drive` takes the failure cell **before** boxing the runtime and handing it over. Without
+that, a machine with no graphics adapter would run a loop that opens nothing, draws nothing, and
+exits reporting success.
+
+Everything the runtime builds is decided in `into_handler`: the renderer factory, the metrics source,
+the text engine and the glyph rasteriser. `App` does not expose the last three, because they come
+from `Fonts`.
+
+## What is not here
+
+State it plainly: several things an application on a desktop might want do not exist anywhere in the
+tree.
+
+| Capability | Status |
+|---|---|
+| Native file dialogs (open, save, pick a folder) | Absent. No crate in the tree names a file-dialog or portal library. |
+| Native menus and a menu bar | Absent from the platform layer. |
+| System tray or status-area icons | Absent. |
+| Desktop notifications | Absent. |
+| Native pop-up surfaces for menus, tooltips and dropdowns | `PlatformCapabilities::native_popup_surfaces` exists and is `false` in both backends. Every overlay is drawn inside the window that owns it and is clipped by it. |
+| Reading the desktop's colour-scheme preference on Linux | Not built. `capabilities.system_color_scheme` is `false` and `color_scheme()` is `None`. |
+| Starting a drag towards another application | `drag_source` is `false` in both backends. Drops **into** the application work. |
+| Confining or locking the pointer | `pointer_confine` and `pointer_lock` are `false` in both backends. |
+
+An application that needs one of these today writes it against the operating system itself. Nothing
+in the framework stands in the way, and nothing in the framework helps.
+
+## Next
+
+<Cards>
+  <Card
+    title="The crate map"
+    href="/docs/architecture/crate-map"
+    description="Every crate, its layer, and the rule that keeps the dependency arrows pointing one way."
+  />
+  <Card
+    title="The frame"
+    href="/docs/architecture/the-frame"
+    description="What the loop does between a redraw request and a presented frame, and exactly what wakes it."
+  />
+  <Card
+    title="Accessibility"
+    href="/docs/building/accessibility"
+    description="The a11y: attributes, the roles, and what the projection derives without being told."
+  />
+  <Card
+    title="Testing"
+    href="/docs/building/testing"
+    description="Driving an application over the headless backend, and asserting on what it drew."
+  />
+</Cards>

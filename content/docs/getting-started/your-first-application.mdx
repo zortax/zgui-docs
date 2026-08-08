@@ -1,0 +1,374 @@
+---
+title: Your first application
+description: A counter, taken apart line by line — the component, the signal, the view, the style sheet and the entry point.
+---
+
+This page builds one small application and explains every line of it. It introduces terms the rest
+of the guide uses. Nothing here needs the [previous page](/docs/getting-started/what-zgui-is), but
+it helps.
+
+## The finished thing
+
+```rust title="src/main.rs"
+use zgui::prelude::*;
+
+#[component]
+fn Counter() -> impl IntoView {
+    let (count, set_count) = signal(0);
+
+    view! {
+        column(class = "counter") {
+            label(class = "counter__caption") {"Count"}
+            text(class = "counter__value") {{move || count.get().to_string()}}
+            row(class = "counter__buttons") {
+                control(
+                    class = "button",
+                    on:click = move |_| set_count.update(|n| *n -= 1)
+                ) {
+                    "-"
+                }
+                control(
+                    class = "button button--primary",
+                    on:click = move |_| set_count.update(|n| *n += 1)
+                ) {
+                    "+"
+                }
+            }
+        }
+    }
+}
+
+const SHEET: &str = css!(
+    ":root {
+        background-color: #12141a;
+        color: #e8ecf4;
+        font-family: sans-serif;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+
+    .counter {
+        align-items: center;
+        gap: 12px;
+        padding: 32px 48px;
+        border-radius: 16px;
+        border: 1px solid #262b36;
+        background-color: #191d26;
+    }
+
+    .counter__caption {
+        font-size: 13px;
+        letter-spacing: 2px;
+        color: #7d879b;
+    }
+
+    .counter__value {
+        font-size: 64px;
+        font-weight: 700;
+        line-height: 1.1;
+    }
+
+    .counter__buttons { gap: 12px; }
+
+    .button {
+        padding: 10px 22px;
+        border-radius: 10px;
+        border: 1px solid #2f3646;
+        background-color: #232936;
+        color: #e8ecf4;
+        font-size: 20px;
+        line-height: 1;
+        text-align: center;
+    }
+
+    .button:hover { background-color: #2b3243; }
+
+    .button--primary {
+        background-color: #3b6cf6;
+        border-color: #3b6cf6;
+    }"
+);
+
+fn main() -> Result<(), zgui::Error> {
+    app()
+        .with_title("Counter")
+        .with_size(360.0, 300.0)
+        .with_stylesheet(SHEET)
+        .run(|| view! { Counter() })
+}
+```
+
+`cargo run` opens a window with a number and two buttons. Now take it apart.
+
+## The import
+
+```rust
+use zgui::prelude::*;
+```
+
+One import brings in everything an interface is written with: the reactive primitives, the
+authoring macros, the element attribute types, the event vocabulary, the control flow and the
+application entry point.
+
+Reading and writing a signal are **trait** methods, not inherent ones, so those traits have to be
+in scope. That is the main reason the prelude exists. Every name in it is also reachable at its own
+path if you prefer to import what you use.
+
+## The component
+
+```rust
+#[component]
+fn Counter() -> impl IntoView {
+```
+
+`#[component]` turns a function into a component. A component is a plain Rust function that builds
+a piece of the interface and returns it. The name must start with a capital letter.
+
+`impl IntoView` is what every view already satisfies — a string, a number, a tuple, an `Option`, a
+closure, an element, or the result of a `view!` block.
+
+**The function runs once.** This is the single most important rule in the framework. `Counter()` is
+called one time, when the interface is built. It is never called again, no matter how many times
+the count changes. Everything that has to change later changes through a signal.
+
+## The state
+
+```rust
+let (count, set_count) = signal(0);
+```
+
+`signal(0)` creates a piece of state and hands back two halves: a reader and a writer.
+
+A **signal** is a value that remembers what read it. When you read `count` inside a closure that
+the framework is watching, the framework records that this closure depends on `count`. When you
+write a new value through `set_count`, every closure that read `count` runs again. Nothing else in
+the window is touched.
+
+This is why a component can run once. The component builds the structure; the signals update the
+parts that vary.
+
+<Callout type="info">
+`RwSignal::new(0)` is the same thing with the reader and the writer in one handle. Use whichever
+reads better. A split pair is useful when you hand the writer to one place and the reader to
+another.
+</Callout>
+
+## The view
+
+```rust
+view! {
+    column(class = "counter") {
+        label(class = "counter__caption") {"Count"}
+        ...
+    }
+}
+```
+
+`view!` describes part of the document. The grammar is a **call and a block**:
+
+- a name — `column`, `text`, `control` — which is an element or a component;
+- an attribute list in parentheses, comma-separated, each attribute written `name = value`;
+- a block of children in braces.
+
+Either the parentheses or the block may be left out, but not both.
+
+Children are written one after another with no separator. A child is a string literal, a braced
+expression, or another call.
+
+```rust
+column(class = "a") {          // attributes and children
+    text {"hello"}             // children only
+    spacer()                   // attributes only (here, none)
+}
+```
+
+### The elements
+
+`column`, `row`, `text`, `label` and `control` are four of the sixteen element names zgui defines.
+They mean what they say, and each has its layout before you write a single CSS rule:
+
+| Name | What it is | Laid out as |
+|---|---|---|
+| `column` | children stacked top to bottom | a vertical flex container |
+| `row` | children in a line, left to right | a horizontal flex container |
+| `text` | a run of text | inline |
+| `label` | text that names something else | inline |
+| `control` | something the user operates | a block |
+
+There is no `div`. A container that means nothing in particular is called `box`. The full list is
+in [The element vocabulary](/docs/learn/elements).
+
+### The reactive part
+
+```rust
+text(class = "counter__value") {{move || count.get().to_string()}}
+```
+
+The doubled braces are not a typo. The outer pair is the children block. The inner pair is a braced
+expression child. The expression is a closure.
+
+**A closure child is a reactive hole.** The framework runs it once to get the first text, and runs
+it again whenever anything it read has changed — writing only the text node, not the element and
+not its siblings.
+
+Compare:
+
+```rust
+text {{move || count.get().to_string()}}   // updates for ever
+text {{count.get().to_string()}}           // written once, never again
+```
+
+Both compile. The difference is the type of the expression: a closure is reactive, a `String` is
+not. There is no keyword and no attribute that marks one as dynamic — it is decided by what you
+pass.
+
+<Callout type="warn">
+Forgetting `move ||` is the most common mistake in the framework. The interface renders correctly
+once and then never changes, with nothing to see in a debugger.
+</Callout>
+
+### The listener
+
+```rust
+control(on:click = move |_| set_count.update(|n| *n += 1)) { "+" }
+```
+
+`on:click` attaches a listener. The `on:` prefix is a namespace: everything after it is an event
+name. The closure's argument type is inferred from that name, so a click handler receives a click
+payload with no downcast anywhere.
+
+`set_count.update(|n| *n += 1)` mutates the value in place. `set_count.set(5)` replaces it.
+
+The write does not take effect immediately. Writing a signal **marks** the closures that read it;
+the framework runs them once, later in the same frame. This means a listener can write five signals
+and cost one update pass rather than five.
+
+## The style sheet
+
+```rust
+const SHEET: &str = css!(":root { ... } .counter { ... }");
+```
+
+`css!` is a macro that takes CSS and checks its structure at compile time: an unclosed block, an
+unclosed string, a rule with no selector, a declaration with no colon. Each is a compile error that
+points at the line and column inside the sheet. It does not check property names. The macro returns
+the sheet as a `&'static str`, so it works in a `const`.
+
+The CSS is ordinary CSS: selectors, the cascade, inheritance, class selectors, `:hover`, flexbox,
+grid, gradients, borders, radii and shadows.
+
+Three details matter now:
+
+- `:root` selects the document root. It is where you put the window background, the base text
+  colour and the font family, all of which inherit down.
+- Element names are selectors. `control { ... }` styles every `control`. The framework's own sheet
+  already gave each element name its layout, and your rules sit above it — so
+  `column { flex-direction: row }` works and means what it says.
+- `.button:hover` works because the framework tracks the pointer and applies the state itself.
+
+[Styling](/docs/learn/styling) covers the whole model.
+
+## The entry point
+
+```rust
+fn main() -> Result<(), zgui::Error> {
+    app()
+        .with_title("Counter")
+        .with_size(360.0, 300.0)
+        .with_stylesheet(SHEET)
+        .run(|| view! { Counter() })
+}
+```
+
+`app()` starts a builder. Each `with_*` call decides one thing about the window or the application.
+`run` opens the primary window and drives the event loop until the selected exit policy stops the
+application.
+
+The closure passed to `run` builds the primary window's root view. It runs once during an ordinary
+desktop session. A platform suspension removes the window scope, and resume runs the closure again.
+
+| Call | What it sets |
+|---|---|
+| `with_title` | the window title |
+| `with_size` | the starting size, in CSS pixels |
+| `with_min_size`, `with_max_size`, `with_resizable` | the primary window's size constraints |
+| `with_decorations`, `with_transparent` | whether the desktop or the application draws the frame |
+| `with_position`, `with_maximized`, `with_fullscreen` | the primary window's requested starting state |
+| `with_level`, `with_icon`, `with_theme` | primary-window desktop integration |
+| `with_stylesheet` | the application's own sheet, at the author origin |
+| `with_application_id` | the identifier the desktop matches window rules and icons against |
+| `with_context` | state provided above every window |
+| `with_exit_policy` | when a multi-window application stops |
+| `with_fonts` | the faces to draw with, instead of the system's |
+| `with_renderer` | a drawing device of your own |
+| `run_on` | a platform other than this machine's desktop |
+
+Open more windows with `use_windows()`. See
+[Multiple windows](/docs/building/windows).
+
+## What happens when you click
+
+Worth following once, because it explains the rules you have just met.
+
+<Steps>
+
+<Step>
+
+**The platform reports a click.** The window backend hands the runtime a pointer event at a pixel.
+
+</Step>
+
+<Step>
+
+**The framework finds what is under it.** It uses the geometry the last frame produced, and builds
+the path of elements from the root down to the target and back out.
+
+</Step>
+
+<Step>
+
+**Your listener runs.** `set_count.update(...)` writes the signal. Writing marks the closures that
+read `count`. It does not run them yet.
+
+</Step>
+
+<Step>
+
+**The frame settles the reactive graph.** The marked closure runs once and writes the new string
+into the text node.
+
+</Step>
+
+<Step>
+
+**The stages below service what changed.** The text node's content changed, so its paragraph is
+re-shaped and its box is re-measured. Nothing else in the document owes anything.
+
+</Step>
+
+<Step>
+
+**The renderer redraws the damage.** The rectangle covering the number is redrawn. Every other
+pixel in the window is still correct from the last frame and is not touched.
+
+</Step>
+
+</Steps>
+
+## Next
+
+Start the guide. It covers the same ground properly, beginning with the view.
+
+<Cards>
+  <Card
+    title="Views"
+    href="/docs/learn/views"
+    description="The view! grammar in full: elements, children, attributes, and what a view is as a value."
+  />
+  <Card
+    title="Signals"
+    href="/docs/learn/signals"
+    description="Reactive state from first principles: reads, writes, tracking, and when work happens."
+  />
+</Cards>

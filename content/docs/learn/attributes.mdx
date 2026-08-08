@@ -1,0 +1,632 @@
+---
+title: Attributes
+description: Every form that can be written inside a call's parentheses — the ten namespaces, the plain names, the spread, and which of them follow a signal.
+---
+
+An attribute list is everything between a call's parentheses. This page is the reference for every
+form one can hold. It assumes [Views](/docs/learn/views), [Elements](/docs/learn/elements),
+[Events](/docs/learn/events) and [Reactivity in views](/docs/learn/reactivity-in-views).
+
+## Every form, at a glance
+
+An attribute is **reactive** when its value may be a closure or a signal. The framework decides
+static from dynamic by the value's type, never by how it was written: a constant is written once
+and creates nothing, a closure or a signal creates one binding.
+
+| Written | What it sets | Reactive |
+|---|---|---|
+| `name = value` | a typed attribute on an element, or a prop on a component | depends on the attribute |
+| `name` | shorthand for `name = name` | same |
+| `class = value` | the class list, merged into whatever is there | no |
+| `class:name = value` | one class, on or off | yes |
+| `style = value` | the whole inline style text | yes |
+| `style:property = value` | one inline declaration | yes |
+| `var:--name = value` | one custom property | yes |
+| `attr:name = value` | one attribute, which selectors can match | yes |
+| `prop:name = value` | one typed property, which selectors cannot see | yes |
+| `state:name = value` | one of the eight interaction states a view may assert | yes |
+| `custom_state:name = value` | one state of your own, matched by `:state(name)` | yes |
+| `on:event = handler` | a listener | no, it is attached once |
+| `a11y:name = value` | one accessibility property | yes |
+| `let:name` | names the argument a component passes to its children | — |
+| `node_ref = handle` | a handle filled in with the node once it exists | no |
+| `tabindex = focus` | whether the element takes focus, and how it is reached | yes |
+| `slot`, `slot = "name"` | this component fills a slot of its parent | — |
+| `{..bundle}` | replays a forwarded bundle of attributes here | each entry keeps its own |
+
+The ten namespaces are `class`, `style`, `var`, `attr`, `prop`, `state`, `custom_state`, `on`,
+`a11y` and `let`. Any other prefix before a colon is a compile error that prints the list.
+
+## Values
+
+An attribute value is one Rust expression. Four rules govern how the macro reads it.
+
+```rust
+row(state:open = count.get() > 0)          // any expression Rust admits
+row(prop:mask = bits >> 2)
+row(n = value as Wrapping<u8>)
+row(x = if a > b { p } else { q })
+
+row(class = {class})                       // braces are optional and are unwrapped
+row(at = {Point { x, y }})                 // except on a struct literal, which needs them
+
+For(key = |a: &Todo, b: &Todo| a.id > b.id, each = items) { "x" }   // a comma inside is its own
+```
+
+1. **Any expression.** The value ends at the `,` or `)` that closes it. Comparisons, shifts, `as`,
+   turbofish and typed closure parameters all parse.
+2. **Braces are optional and are unwrapped.** `class = {class}` and `class = class` produce the
+   same code.
+3. **A struct literal must be braced.** A `{` after a value would otherwise open a children block.
+   Write `at = {Point { x, y }}`.
+4. **A comma inside a value belongs to the value.** A closure with two parameters is one attribute,
+   not two.
+
+<Callout type="warn">
+Rule 3 is also what turns a forgotten comma into a clear error. `row(class = "a" hidden)` reports
+`attributes are separated by commas` instead of reading `hidden` as a functional update of the
+string before it.
+</Callout>
+
+## A plain name
+
+A name with no namespace calls the method of that name on the element builder, or the prop setter
+of that name on a component. The legal set is therefore whatever that element or that component
+declares — see [Elements](/docs/learn/elements) for the typed-attribute matrix.
+
+```rust
+use zgui::prelude::*;
+
+view! {
+    column {
+        image(src = "logo.png", alt = "The logo")
+        control(disabled = move || busy.get()) {"Save"}
+        box(hidden = true)
+    }
+}
+```
+
+| Written | Lowers to |
+|---|---|
+| `hidden = true` | `.hidden(true)` on the element builder |
+| `label = "Name"` on a component | the `label` prop setter |
+
+The name must be a Rust identifier. A hyphenated one is refused, and the message names `attr:` as
+the form that takes an arbitrary name.
+
+### The shorthand
+
+A name written with no value means `name = name`, taking the variable of that name from the
+surrounding scope.
+
+```rust
+let alt = "The logo";
+let hidden = false;
+
+view! {
+    image(src = "logo.png", alt)     // alt = alt
+    box(hidden)                      // hidden = hidden
+}
+```
+
+The shorthand works in every namespace whose name is an identifier — `attr:role`, `style:gap` and
+`a11y:label` all take it. A hyphenated name cannot, because there is no variable of that name.
+Two exceptions:
+
+- `class:`, `state:` and `custom_state:` read a bare name as `= true`, not as `name = name`.
+- `on:` refuses a bare name: `on:click` with no handler is a compile error.
+
+## `class` and `class:name`
+
+`class` sets the whole list at once. It **merges** rather than replaces, in the order the parts
+were added and without duplicates, so writing it twice is legal and a component's own classes and a
+caller's end up in one list with the caller's last.
+
+```rust
+vector(class = "mark__art", class = size)   // both, in that order
+```
+
+A `&str` is split on whitespace. `String` works, and so does any iterator of `ClassName`.
+
+**`class` is not reactive.** A class that comes and goes is `class:name`, which toggles one name
+and leaves the rest of the list alone.
+
+```rust
+row(
+    class = "todo",
+    class:done = move || item.done.get(),
+    class:selected = selected,              // a signal reads as one too
+)
+```
+
+| Written | Lowers to |
+|---|---|
+| `class = "a b"` | `.class("a b")` |
+| `class:done = f` | `.class_toggle(ClassName::new("done"), f)` |
+| `class:done` | the same, with the value `true` |
+
+## `style` and `style:property`
+
+`style` is the inline style text an author writes by hand. It replaces every inline declaration the
+element carries, **including anything `style:` set before it**, which is why the two are not mixed
+on one element.
+
+```rust
+box(style = "gap: 1rem; padding: 4px")
+```
+
+`style:property` sets or removes one declaration and leaves the others alone.
+
+```rust
+box(
+    style:position = "fixed",
+    style:left = move || Some(format!("{}px", x.get())),
+    style:top = move || Some(format!("{}px", y.get())),
+)
+```
+
+Both are reactive. Both take an `Option<String>`, and `None` removes the declaration.
+
+<Callout type="warn">
+The `Option` is the one thing to get right. A literal is wrapped for you, so `style:gap = "1rem"`
+is enough. A **closure must return `Option<String>`** — write
+`move || Some(format!("{}px", x.get()))`, not `move || format!("{}px", x.get())`. The same holds
+for `var:` and `attr:`, which take the same type.
+</Callout>
+
+An unknown property, or a value that does not parse for it, is dropped with a diagnostic — the same
+treatment it would get in a style sheet. [Styling](/docs/learn/styling) covers where an inline
+declaration sits in the cascade.
+
+<Callout type="error">
+A whole `style` on a **component** call is a compile error: it would replace whatever the component
+itself set. Forward one declaration at a time with `style:`.
+</Callout>
+
+## `var:--name`
+
+A custom property is a name a style sheet can read back with `var(--name)`. Setting one from a view
+is how a computed number reaches CSS without the view knowing which properties use it.
+
+```rust
+const SHEET: &str = css!("
+    .meter__bar { width: var(--fill); background: var(--tone); }
+");
+
+view! {
+    box(class = "meter") {
+        box(
+            class = "meter__bar",
+            var:--fill = move || Some(format!("{}%", percent.get())),
+            var:--tone = "royalblue",
+        )
+    }
+}
+```
+
+The name **must** start with `--`. Writing `var:brand` is a compile error that tells you to write
+`var:--brand`. The `--` is stripped when the name is stored, so a sheet saying `var(--brand)` finds
+what the view wrote. Reactive, and takes `Option<String>`.
+
+Custom properties inherit, so setting one on a container reaches every descendant. That makes them
+the mechanism behind themes — see [Theming](/docs/building/theming).
+
+## `attr:name`
+
+An arbitrary attribute: text on the element that **selector matching can see**. Use it for anything
+a sheet or a test needs to match on.
+
+```rust
+row(
+    attr:id = "row-1",
+    attr:data-testid = "summary-row",
+    attr:data-side = move || Some(side.get().to_owned()),
+)
+```
+
+```css
+[data-side="top"] { margin-bottom: 4px; }
+```
+
+The name may be hyphenated, which is the whole reason the namespace exists. Reactive, and takes
+`Option<String>`; `None` removes the attribute.
+
+There is no `id` builder method. `attr:id = "x"` is how an `#id` selector gets something to match.
+
+## `prop:name`
+
+A property is a typed value the element's own behaviour reads: a field's current text, a drawing's
+outlines. It is **neither an attribute nor visible to selectors**.
+
+```rust
+vector(class = "mark", prop:d = paths, prop:viewBox = "0 0 24 24")
+field(prop:value = move || PropValue::from(text.get().as_str()))
+```
+
+That invisibility is the point. A value that changes on every keystroke would, as an attribute,
+invalidate selector matching for the whole subtree on every keystroke.
+
+The value is a `PropValue`, which is `Unset`, `Bool`, `Integer`, `Number` or `Text`. Anything
+`Into<PropValue>` may be written directly — `&str`, `String`, `bool`, `i64`, `f64`. A reactive
+value is a closure returning a `PropValue`. Writing `PropValue::Unset` removes the property.
+
+| Property | Read by | Element |
+|---|---|---|
+| `d` | the paint stage, as one outline per line | `vector` |
+| `viewBox` | the paint stage, as `min-x min-y width height` | `vector` |
+| `svg` | the paint stage, as a whole SVG document | `vector` |
+| `value` | the editing model | `field`, `editor` |
+
+## `state:name`
+
+An interaction state is one bit on the element that a selector can match: `:checked`, `:disabled`.
+A view may assert exactly **eight** of them. Every other state is computed by the input system from
+what the pointer and the keyboard did, and a view that could assert one would be lying to the
+system that maintains it.
+
+```rust
+control(
+    state:disabled = move || busy.get(),
+    state:checked = move || item.done.get(),
+) {"Save"}
+```
+
+| Written | Sets | Matched by |
+|---|---|---|
+| `state:checked` | `UiState::CHECKED` | `:checked` |
+| `state:disabled` | `UiState::DISABLED` | `:disabled` |
+| `state:indeterminate` | `UiState::INDETERMINATE` | `:indeterminate` |
+| `state:invalid` | `UiState::INVALID` | `:invalid` |
+| `state:open` | `UiState::OPEN` | `:open` |
+| `state:placeholder_shown` | `UiState::PLACEHOLDER_SHOWN` | `:placeholder-shown` |
+| `state:read_only` | `UiState::READ_ONLY` | `:read-only` |
+| `state:required` | `UiState::REQUIRED` | `:required` |
+
+A bare `state:disabled` means `= true`. Reactive.
+
+Anything else is a compile error naming the eight. Two cases get an extra note:
+
+- `hover`, `active`, `focus`, `focus_visible` and `focus_within` are computed from input.
+- `selected` has no selector of its own and belongs in `custom_state:`.
+
+<Callout type="info">
+`control`, `field` and `editor` also take `disabled` as a plain named attribute, which lowers to
+this same state. `control(disabled = f)` and `control(state:disabled = f)` do the same thing.
+</Callout>
+
+## `custom_state:name`
+
+A state of your own, matched by `:state(name)`. Use it for a condition the closed set does not name:
+a step is complete, a row is the drop target, a panel is peeking.
+
+```rust
+const SHEET: &str = css!("
+    .step:state(complete) { color: seagreen; }
+");
+
+view! {
+    row(class = "step", custom_state:complete = move || step.done.get())
+}
+```
+
+A bare `custom_state:complete` means `= true`. Reactive. The name is arbitrary and is checked
+against nothing, because it is your vocabulary rather than the framework's.
+
+## `on:event`
+
+A listener. The handler's argument type is fixed by the event name, so a pointer listener reads
+pointer fields with no annotation and no downcast.
+
+```rust
+control(
+    on:click = move |_| count.update(|n| *n += 1),
+    on:key_down = move |ev| if ev.key == Key::Named(NamedKey::Enter) { save() },
+) {"Add"}
+```
+
+Thirty-one event names exist. [Events](/docs/learn/events) has the table, the payload types and the
+dispatch rules; this page covers the spelling only.
+
+```text
+on : <event> [ : <modifier> ]* = <handler>
+```
+
+| Modifier | Effect |
+|---|---|
+| `:capture` | register on the way down instead of the way up |
+| `:once` | remove the listener after it runs |
+| `:passive` | promise never to suppress the default behaviour |
+| `:prevent` | suppress the default behaviour, before the handler runs |
+| `:stop` | stop the event travelling, before the handler runs |
+
+Modifiers combine and their order does not matter: `on:click:capture:once` is valid.
+`:passive` with `:prevent` is a compile error, because the two say opposite things.
+
+<Status kind="partial">`:capture`, `:prevent` and `:stop` act today. `:once` and `:passive` are
+recorded on the registration and nothing reads them yet, so a `:once` listener keeps running.</Status>
+
+A listener is **not** reactive. It is attached when the element is built. When a closure rebuilds an
+element, the previous registration is removed and the new one added, so a handler is never attached
+twice.
+
+<Callout type="warn">
+A closure bound to a name **before** it reaches the attribute is rejected with `implementation of
+Fn is not general enough`. Its argument type was settled with nothing to infer it from. Build it
+with `handler`, which supplies the event at the binding:
+
+```rust
+let save = handler(events::CLICK, move |_| store.save());
+
+view! { control(on:click = save) {"Save"} }
+```
+</Callout>
+
+<Callout type="info">
+A component's callback prop is an ordinary prop, not a listener. `on_select = f` is written with an
+underscore and does not capture or bubble; `on:click = f` is written with a colon and does.
+</Callout>
+
+## `a11y:name`
+
+One accessibility property: what the element means to something reading the interface rather than
+looking at it. Every `a11y:` on one node is collected into a single description.
+
+```rust
+control(
+    a11y:role = Role::Button,
+    a11y:label = "Delete",
+    a11y:disabled = move || busy.get(),
+) {"x"}
+```
+
+| Group | Names |
+|---|---|
+| naming | `label`, `description`, `placeholder`, `role_description`, `state_description`, `tooltip`, `keyboard_shortcut` |
+| value | `value`, `numeric_value`, `auto_complete` |
+| condition | `disabled`, `read_only`, `required`, `busy`, `hidden`, `expanded`, `selected`, `modal`, `invalid`, `toggled`, `toggled_on` |
+| structure | `level`, `orientation`, `has_popup`, `current`, `sort_direction`, `row_index`, `column_index`, `row_span`, `column_span` |
+| announcement | `live` |
+| relation | `labelled_by`, `described_by`, `controls`, `owns`, `active_descendant`, `popup_for`, `error_message` |
+
+Four rules:
+
+- `a11y:role` may be written **once** on a node.
+- With no role, the description says nothing about what the element is. That is deliberate: on a
+  component call it merges over the component's own role instead of replacing it.
+- A relation names another node. Pass a `NodeRef` directly, or a closure returning
+  `Option<NodeRef>` when the target moves.
+- Every property may be reactive.
+
+```rust
+let hint = NodeRef::new();
+
+view! {
+    column {
+        field(a11y:described_by = hint)
+        text(node_ref = hint) {"Between 8 and 64 characters."}
+    }
+}
+```
+
+[Accessibility](/docs/building/accessibility) has the full list with types, the role vocabulary, and
+what the framework derives on its own.
+
+## `let:name`
+
+Names the argument a component passes to its children block. It takes no value and belongs only on
+a component call.
+
+```rust
+view! {
+    Repeat(times = 3, let:index) {
+        text {{index.to_string()}}
+    }
+}
+```
+
+`for` uses it under the covers: `for item in …` desugars to `For(each = …, key = …, let:item)`. See
+[Children and slots](/docs/learn/children-and-slots) and
+[Control flow](/docs/learn/control-flow).
+
+On an element it is a compile error — an element passes its children no argument.
+
+## `node_ref`
+
+Records the node this element becomes, in a handle you can read afterwards. A `NodeRef` is `Copy`,
+so it can be stored in any number of closures.
+
+```rust
+let field_node = NodeRef::new();
+
+view! {
+    column {
+        field(node_ref = field_node)
+        control(on:click = move |_| field_node.focus()) {"Edit"}
+    }
+}
+```
+
+The handle is empty until the element is built, and empty again after the view goes away, so every
+read answers with an `Option` rather than panicking. It carries the imperative escape hatches:
+`focus`, `bounds`, `scroll_to`, `text_content`, `contains`, and the observations that turn geometry
+into a signal. [Effects and lifecycle](/docs/learn/effects-and-lifecycle) covers reading one safely.
+
+The attribute itself is not reactive: the handle is written once, when the element is built. The
+handle holds a signal, so reading it inside a closure follows it and re-runs when it is filled in.
+
+<Callout type="info">
+On a **component** call, `node_ref` is an ordinary prop of that component, not the element
+attribute. A component renders whatever it likes, and only it knows which of its elements a caller
+means. A component that takes no such prop gives you an error naming the prop.
+</Callout>
+
+## `tabindex`
+
+Whether the element can take keyboard focus, and how it is reached. It is a plain named attribute,
+listed here because it is the one every interactive element needs.
+
+```rust
+control(tabindex = Focus::Sequential) {"Save"}
+
+control(tabindex = move || {
+    if disabled.get() { Focus::Programmatic } else { Focus::Sequential }
+})
+```
+
+| Value | Meaning |
+|---|---|
+| `Focus::Sequential` | reached by tabbing, in the order the element appears |
+| `Focus::Programmatic` | focusable, but only when something focuses it deliberately |
+
+Two values and not an integer, for the reason [Elements](/docs/learn/elements) gives. It is
+reactive, which is what lets a control leave the sequential order while it is disabled.
+
+`control`, `field` and `editor` are focusable without declaring anything. Every other element needs
+`tabindex` to be reachable at all. See [Keyboard and focus](/docs/building/keyboard-and-focus).
+
+## The spread `{..bundle}`
+
+`{..expr}` replays a prepared bundle of attributes at the position it is written. It is how a
+component lets its caller add classes, listeners and accessibility properties to an element the
+caller never sees.
+
+```rust
+#[component]
+fn Button(
+    /// Whatever the caller forwarded.
+    #[prop(attrs)]
+    attrs: Attrs,
+    children: Children,
+) -> impl IntoView {
+    view! {
+        control(class = "button", tabindex = Focus::Sequential, {..attrs}) {
+            {children.into_view_once()}
+        }
+    }
+}
+```
+
+```rust
+view! {
+    Button(class = "button--primary", on:click = save, attr:data-testid = "save") {"Save"}
+}
+```
+
+`#[prop(attrs)]` marks the prop that receives the bundle. At most one prop per component may carry
+it, and the setter is always named `attrs`. It defaults to an empty bundle, so a caller who
+forwards nothing writes nothing.
+
+### The ordering rule
+
+**Position decides who wins.** Entries apply in written order, and a later entry beats an earlier
+one.
+
+```rust
+control(class:mine = true, {..attrs}, attr:data-x = "1")
+```
+
+Here the component's own toggle applies first, then everything the caller forwarded, then
+`data-x` — which the caller cannot override, because it is written after the spread. Move the
+spread to the end to let the caller win everything.
+
+Two parts of an element stand outside that ordering, because they merge instead of overwriting:
+
+| Part | How the bundle combines |
+|---|---|
+| the class list | merged after the element's own, deduplicated, caller's names last |
+| the accessibility description | merged over the element's own, caller's properties winning |
+| everything else | applied in written order, last write wins |
+| listeners | accumulated, never replaced; both run, the element's own first |
+
+A spread goes in the attribute list. Written among the children it is a compile error that says so,
+and names the right spelling.
+
+### Building a bundle by hand
+
+`Attrs` is an ordinary value with a builder, so a bundle can be assembled outside a view and
+forwarded on:
+
+```rust
+use zgui::view::{AttrName, ClassName};
+
+let attrs = Attrs::new()
+    .class_toggle(ClassName::new("mine"), true)
+    .attribute(AttrName::new("data-role"), "row");
+
+view! { Button({..attrs}) {"Save"} }
+```
+
+## On an element and on a component
+
+The same list is read differently depending on what it is attached to. This is the whole routing
+table.
+
+| Written | On an element | On a component |
+|---|---|---|
+| `name = value` | the builder method of that name | the prop setter of that name |
+| `class = value` | the class list | the `class` prop |
+| `node_ref = handle` | records the node | the `node_ref` prop |
+| `style = value` | the inline style text | compile error |
+| `let:name` | compile error | names the children closure's argument |
+| `slot` | compile error | fills a slot of the parent |
+| every other namespace | applied to the element | collected into the forwarded bundle |
+
+That last row is the reason the namespaces exist. A component call cannot write on an element
+directly, because it does not know which element the component renders, or how many.
+
+## What an attribute costs
+
+| Kind | Cost |
+|---|---|
+| a constant value | one write at build time, and no reactive node at all |
+| a closure or signal value | one binding, which is one effect |
+| a binding whose value did not change | nothing; it compares against what it last wrote |
+| a `state:` bit no selector names | nothing enters the style engine, and no repaint is raised |
+
+A signal has no equality gate of its own. The comparison inside the binding is what turns "a signal
+was written" into "a value actually changed". Reach for a memo when a value feeds two or more
+bindings or is expensive to compute, and rely on that comparison when it feeds one.
+See [Derived state](/docs/learn/derived-state).
+
+Two rules follow from that, both stated in the repository's own styling guide
+(`docs/guide/styling.md`):
+
+- **Prefer `class:` and `custom_state:` to `style:`.** A class or state toggle is a write the
+  invalidation machinery can filter cheaply against the selectors that exist. An inline declaration
+  changes a computed value directly and cannot be filtered.
+- **Prefer `var:` on a container to swapping a style sheet.** Changing one custom property is
+  cheap. Replacing a whole sheet makes one frame assume everything matters.
+
+## What the macro refuses
+
+| You write | The message |
+|---|---|
+| `row(x-y = 1)` | `` `x-y` is a name, not an identifier `` — with `attr:x-y = …` as the fix |
+| `row(var:brand = "red")` | a custom property's name starts with `--` |
+| `row(state:hover = true)` | not one of the states a view may set, and it is computed from input |
+| `row(on:click)` | `` `on:click` needs a handler `` |
+| `row(on:clik = f)` | `` `on:clik` is not an event `` — with the nearest real name |
+| `row(on:click:passive:prevent = f)` | `:passive` promises never to suppress the default behaviour |
+| `row(on:click:onc = f)` | `` `:onc` is not a listener modifier `` — with the five |
+| `row(let:item)` | an element passes its children no argument |
+| `row(slot)` | an element cannot fill a slot |
+| `Button(style = "gap: 1rem")` | it would replace what the component set; forward `style:` instead |
+| `Card({attrs})` | names the spread spelling, `{..attrs}` |
+| `Card({..attrs} {..more})` | attributes are separated by commas |
+| `row(at = Point { x, y })` | brace the struct literal |
+| `if move \|\| open.get() (class = "x") { … }` | control flow takes no attributes |
+
+## Next
+
+<Cards>
+  <Card
+    title="Styling"
+    href="/docs/learn/styling"
+    description="css!, the cascade, selectors, custom properties, and what a style change costs."
+  />
+  <Card
+    title="Accessibility"
+    href="/docs/building/accessibility"
+    description="Every a11y: property, the role vocabulary, and what the framework derives on its own."
+  />
+</Cards>

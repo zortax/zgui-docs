@@ -1,0 +1,1037 @@
+---
+title: Styling
+description: Style sheets in zgui — the cascade from first principles, the css!, style! and variants! macros, selectors, properties, and what a style change costs.
+---
+
+A view says what an element **is**. A style sheet says what it **looks like**. This page covers the
+whole styling surface: how a value is decided, the three macros that carry CSS in Rust, which
+selectors and properties this build supports, and what a change costs per frame. It assumes
+[Views](/docs/learn/views), [Elements](/docs/learn/elements) and
+[Attributes](/docs/learn/attributes).
+
+## A style sheet, from nothing
+
+A **style sheet** is text. It holds **rules**. A rule is a **selector**, then a block of
+**declarations**. A declaration is a **property**, a colon, a **value**, and a semicolon.
+
+<AnatomyDiagram
+  label="The parts of a CSS rule"
+  parts={[
+    { value: '.card', label: 'The selector: which elements this rule reaches.' },
+    { value: '{ padding: 16px;', label: 'A declaration: one property and its value.' },
+    { value: 'background-color: #1b1e24 }', label: 'A second declaration, followed by the closing brace.' },
+  ]}
+/>
+
+The selector says **which** elements. The declarations say **what** about them. Nothing else is in
+a sheet.
+
+```rust
+use zgui::prelude::*;
+
+const SHEET: &str = css!(
+    ".card { padding: 16px; border-radius: 8px; background-color: #1b1e24 }
+     .card__title { font-size: 18px; font-weight: 700; color: #f2f4f8 }
+     .card__note { color: #8b93a3 }"
+);
+
+#[component]
+fn Card() -> impl IntoView {
+    view! {
+        column(class = "card") {
+            label(class = "card__title") {"Storage"}
+            text(class = "card__note") {"41 GB used"}
+        }
+    }
+}
+
+fn main() -> Result<(), zgui::Error> {
+    app().with_stylesheet(SHEET).run(|| view! { Card() })
+}
+```
+
+The view holds no colours and no sizes. The class name is the whole join between the two halves.
+
+## Origins
+
+Every rule belongs to one **origin**: who wrote it. There are three, and the origin is the first
+thing the cascade asks about.
+
+| Origin | Written by | How it arrives |
+|---|---|---|
+| user agent | the framework | installed automatically, before your program runs |
+| user | the person using the program | no path to it from `App` |
+| author | you | `App::with_stylesheet`, `install_stylesheet`, `Stylesheet` |
+
+At equal specificity a **later origin wins**: author beats user, user beats the user agent. This is
+the reason the framework's own sheet never fights you. Every rule you write outranks it.
+
+## The cascade
+
+For one element and one property, many declarations may apply at once. The **cascade** is the
+procedure that picks exactly one. It asks three questions, in this order, and stops at the first
+one that separates the candidates.
+
+<Steps>
+
+<Step>
+
+**Origin and importance.** Normal declarations rank user agent, then user, then author, last one
+winning. A declaration marked `!important` moves into a separate, higher band — and inside that
+band the origin order **reverses**, so a user-agent `!important` beats an author `!important`.
+
+</Step>
+
+<Step>
+
+**Specificity.** A number computed from the selector alone. Higher wins.
+
+</Step>
+
+<Step>
+
+**Source order.** The declaration written later wins. Across sheets of the same origin, the sheet
+installed later is "later".
+
+</Step>
+
+</Steps>
+
+### Specificity
+
+Specificity is a triple, compared left to right. Count over the whole selector:
+
+| Position | Counts | Example |
+|---|---|---|
+| first | id selectors | `#main` |
+| second | classes, attribute selectors, pseudo-classes | `.card`, `[data-tone]`, `:hover` |
+| third | element names, pseudo-elements | `column`, `::before` |
+
+| Selector | Specificity |
+|---|---|
+| `text` | 0, 0, 1 |
+| `.title` | 0, 1, 0 |
+| `column .title` | 0, 1, 1 |
+| `.card .title` | 0, 2, 0 |
+| `control:hover` | 0, 1, 1 |
+| `[data-tone="accent"]` | 0, 1, 0 |
+| `#main` | 1, 0, 0 |
+
+`0, 2, 0` beats `0, 1, 1`, which beats `0, 1, 0`. A single id outranks any number of classes,
+which is the reason ids are worth avoiding in a sheet you intend to override later.
+
+### Inheritance
+
+An element that has no winning declaration for a property does not go without a value. Some
+properties **inherit**: the element takes its parent's computed value. The rest fall back to the
+property's **initial** value.
+
+| Inherits | Does not inherit |
+|---|---|
+| `color`, every `font-*`, `line-height`, `letter-spacing`, `word-spacing` | `padding-*`, `margin-*`, `border-*`, `background-*` |
+| `text-align`, `text-indent`, `word-break`, `overflow-wrap` | `width`, `height`, `display`, `position`, `flex-*`, `grid-*` |
+| `direction`, `visibility`, `pointer-events` | `opacity`, `transform`, `filter`, `box-shadow`, `z-index` |
+| every custom property | |
+
+Inheritance is why setting `color` on a container colours the whole subtree, and why setting
+`padding` on it does not.
+
+Four keywords override the answer explicitly:
+
+| Keyword | Result |
+|---|---|
+| `inherit` | take the parent's computed value, whether or not the property inherits |
+| `initial` | take the property's initial value |
+| `unset` | `inherit` for an inheriting property, `initial` for the rest |
+| `revert` | roll back to what the previous origin decided |
+
+<Callout type="info">
+Specificity, inheritance, `!important` and these four keywords are the style engine's own. zgui
+reimplements none of them and restricts none of them. Quirks mode is never on, so there is one set
+of rules and no legacy mode to fall into.
+</Callout>
+
+## The framework's own sheet
+
+zgui installs one user-agent sheet at start-up, and it is what gives the sixteen element names
+their meaning. It is short enough to read in full:
+
+```css
+* { box-sizing: border-box; }
+
+:root {
+    display: block;
+    width: 100%;
+    height: 100%;
+    font-family: system-ui, sans-serif;
+    font-size: 16px;
+    line-height: 1.5;
+    color: var(--zgui-foreground);
+}
+
+box, field, control, editor { display: block; }
+row                          { display: flex; flex-direction: row; }
+column, stack                { display: flex; flex-direction: column; }
+text, label                  { display: inline; }
+image, canvas, vector, surface { display: inline-block; }
+canvas                       { width: 300px; height: 150px; }
+scroll                       { display: block; overflow: auto; }
+spacer                       { display: block; flex: 1 1 auto; }
+
+overlay_root                        { display: block; position: fixed; inset: 0;
+                                      pointer-events: none; }
+overlay_root > [data-layer]         { position: absolute; inset: 0; pointer-events: none; }
+overlay_root > [data-layer] > *     { pointer-events: auto; }
+overlay_root > [data-layer=content] { z-index: 10; }
+overlay_root > [data-layer=popover] { z-index: 20; }
+overlay_root > [data-layer=modal]   { z-index: 30; }
+overlay_root > [data-layer=toast]   { z-index: 40; }
+
+:focus-visible { outline: 2px solid var(--zgui-ring); outline-offset: 2px; }
+:disabled      { pointer-events: none; }
+::selection    { background-color: var(--zgui-selection); color: var(--zgui-selection-text); }
+[hidden]       { display: none; }
+```
+
+Three consequences worth stating:
+
+- **Your rules sit above it.** `column { flex-direction: row }` in your own sheet works, at the
+  same specificity, because the author origin beats the user-agent origin.
+- **No markup language's defaults are inherited.** A `row` is a horizontal flex container because
+  this sheet says so, and for no other reason.
+- **`--zgui-foreground`, `--zgui-ring`, `--zgui-selection` and `--zgui-selection-text` are
+  referenced and not defined.** A theme defines them. A document with no theme has no ring colour
+  rather than a wrong one.
+
+## `css!`
+
+`css!` takes one or more string literals and gives back their joined text as a `&'static str`. It
+checks the text where it is written, so a broken sheet is a compile error against your source
+rather than a warning at start-up.
+
+```rust
+const SHEET: &str = css!(
+    ":root { background: #14161a; color: #f2f4f8; font-family: sans-serif }
+     .counter { gap: 16px; padding: 24px; align-items: center }
+     .counter__value { font-size: 48px; font-weight: 700 }
+     .button { padding: 8px 20px; border-radius: 8px; background: #2b6cff }"
+);
+```
+
+```text
+css! ( <string-literal> ( ','? <string-literal> )* )
+```
+
+Several literals are joined with a newline between them. Commas between them are optional. The
+result is a plain string constant, so it is usable in a `const`, in a `static`, in a `format!`, and
+anywhere else a `&'static str` goes.
+
+### What it checks
+
+The check is **structural only**. It is a character scanner. It does not know property names, does
+not know selectors, and does not parse values.
+
+| Condition | Message |
+|---|---|
+| `/*` with no `*/` | `this comment is never closed` |
+| `//` not preceded by `:` | `` `//` is not a comment in CSS `` |
+| a string with no closing quote, or a newline inside it | `this string is never closed` |
+| `)` or `]` with no opener | `` `)` closes something that was never opened `` |
+| `(` or `[` never closed | `this is never closed` |
+| `{` whose prelude is blank | `this block has no selector` |
+| `}` with no opener | `` `}` closes a block that was never opened `` |
+| `{` never closed | `this block is never closed` |
+| a segment inside a block that holds no colon | `` `<segment>` is not a declaration `` |
+
+Every message ends with the position inside the CSS, counted from one:
+
+```text
+error: this block is never closed
+
+note: in the CSS at line 3, column 41
+```
+
+The `//` rule is the one that catches real bugs. CSS has one comment form. A `//` in the text is
+not a comment, and a parser recovering from it swallows the declaration on the next line — so a
+sheet written that way installs, matches, and quietly lacks a declaration. The macro adds the fix
+to the message: write `/* … */`, or put the remark between the rules as a Rust comment.
+
+<Callout type="warn">
+A declaration passes the check if it contains a colon **anywhere**. `zzz: 1` compiles, installs,
+and is then dropped by the CSS parser at start-up with a warning. `css!` is a bracket and quote
+checker, not a validator. It also scopes nothing: text in, checked text out.
+
+One consequence of the `//` rule: `@import url(//cdn/a.css)` is rejected. `https://…` is fine,
+because of the colon before the slashes.
+</Callout>
+
+## `style!`
+
+`style!` declares a sheet that belongs to one component, with a class name derived from the sheet
+itself.
+
+```rust
+style! { pub MeterStyle =>
+    ":scope {
+        position: relative;
+        overflow: hidden;
+        height: 8px;
+        border-radius: 4px;
+        background-color: #2a2f3a;
+    }"
+    ":scope > .fill {
+        height: 100%;
+        border-radius: inherit;
+        background-color: #2b6cff;
+    }"
+}
+```
+
+```text
+style! { <visibility>? <Ident> => <string-literal> ( ','? <string-literal> )* }
+```
+
+It generates a type of that name with two constants:
+
+```rust
+pub struct MeterStyle {}
+
+impl MeterStyle {
+    pub const CLASS: &'static str = "zs-3f1c90ab";  // derived from the name and the text
+    pub const CSS: &'static str = /* the rules, with :scope already replaced by .zs-3f1c90ab */;
+}
+```
+
+### The scoping mechanics
+
+- The class is `zs-` followed by eight hexadecimal digits: an FNV-1a hash of the name, the arrow
+  and the CSS text. It is stable across builds and across platforms.
+- Changing the name **or** one character of the text changes the class.
+- Every literal `:scope` in the text is replaced by `.zs-xxxxxxxx`. Occurrences inside a `/* … */`
+  comment or inside a quoted string are left alone.
+- There is no `:scope` at run time. It exists only as this compile-time rewrite.
+
+So `":scope:hover :scope > * { color: red }"` becomes
+`".zs-1:hover .zs-1 > * { color: red }"`.
+
+<Callout type="error">
+**`style!` installs nothing by itself.** It declares text and a class name and stops there. A
+component that uses one has to do **both** of these, or it renders unstyled with no error anywhere:
+
+1. call `install_stylesheet(name, MeterStyle::CSS)` in its body, and
+2. put `MeterStyle::CLASS` on its root element.
+</Callout>
+
+```rust
+#[component]
+fn Meter(
+    /// How full the bar is, from 0.0 to 1.0.
+    fraction: Signal<f32>,
+) -> impl IntoView {
+    install_stylesheet("meter", MeterStyle::CSS);
+
+    view! {
+        box(class = MeterStyle::CLASS) {
+            box(
+                class = "fill",
+                style:width = move || Some(format!("{}%", fraction.get() * 100.0)),
+            )
+        }
+    }
+}
+```
+
+Installing the same name twice does nothing, so the call belongs in the body unconditionally: a
+hundred meters install one sheet.
+
+<Callout type="info">
+`style!` declares a **type**, so it shadows a glob-imported item of the same name. That is why the
+prelude exports the function `app()` and no type called `App` — a `style! { App => … }` beside a
+root component would otherwise stop the prelude resolving.
+</Callout>
+
+## `variants!`
+
+A component with two or three visual axes ends up concatenating class strings at run time.
+`variants!` replaces that with a table: one enumeration per axis, a stable class list, and a set of
+`data-*` attributes a sheet can select on.
+
+```rust
+variants! {
+    /// Visual variants of a button.
+    pub ButtonVariants {
+        base: "btn",
+        tone: { Neutral => "btn--neutral", Accent => "btn--accent" } = Neutral,
+        size: { Sm => "btn--sm", Md => "" } = Md,
+    }
+}
+```
+
+```text
+variants! {
+    <doc-attrs>* <visibility>? <Name> {
+        base: "<class>",                                    // optional, at most once
+        <field>: { <Choice> => "<class>", … } = <Default>,  // one or more axes
+    }
+}
+```
+
+It generates:
+
+```rust
+pub struct ButtonVariants { pub tone: ButtonTone, pub size: ButtonSize }
+
+pub enum ButtonTone { Neutral, Accent }
+impl ButtonTone {
+    pub const fn class(self) -> &'static str;   // "btn--accent", or "" for a choice with no class
+    pub const fn name(self) -> &'static str;    // "accent" — kebab case, for the data attribute
+}
+
+impl ButtonVariants {
+    pub const BASE: &'static str = "btn";
+    pub fn class_list(&self) -> String;
+    pub fn classes(&self) -> Classes;
+    pub fn data_attributes(&self) -> [(&'static str, &'static str); 2];
+}
+```
+
+| Rule | Result |
+|---|---|
+| Enumeration naming | a trailing `Variants` is stripped, then the axis name is upper-camelised: `ButtonVariants` + `tone` gives `ButtonTone` |
+| Class order | `BASE` first, then each axis **in declaration order**, space separated, empty classes skipped |
+| Attribute names | `data-` plus the field name in kebab case |
+| Attribute values | the choice name in kebab case: `SubOptimum` becomes `sub-optimum` |
+
+The class order being fixed is what makes a class list diffable and a test transcript
+deterministic.
+
+```rust
+let outline = ButtonVariants { tone: ButtonTone::Accent, ..ButtonVariants::default() };
+
+assert_eq!(outline.class_list(), "btn btn--accent");
+assert_eq!(outline.data_attributes(), [("data-tone", "accent"), ("data-size", "md")]);
+```
+
+Worked in full:
+
+```rust
+const SHEET: &str = css!(
+    ".btn { padding: 8px 16px; border-radius: 8px; border: 1px solid transparent }
+     .btn[data-tone=\"neutral\"] { background-color: #2a2f3a; color: #e6e9ef }
+     .btn[data-tone=\"accent\"] { background-color: #2b6cff; color: #ffffff }
+     .btn[data-size=\"sm\"] { padding: 4px 10px; font-size: 13px }"
+);
+
+#[component]
+fn Button(
+    /// Which of the visual choices this button makes.
+    #[prop(optional)]
+    variants: ButtonVariants,
+    children: Children,
+) -> impl IntoView {
+    let [(_, tone), (_, size)] = variants.data_attributes();
+
+    view! {
+        control(
+            class = variants.classes(),
+            attr:data-tone = tone,
+            attr:data-size = size,
+        ) {
+            {children.into_view_once()}
+        }
+    }
+}
+
+view! {
+    Button {"Cancel"}
+    Button(variants = ButtonVariants { tone: ButtonTone::Accent, size: ButtonSize::Sm }) {"Save"}
+}
+```
+
+Matching the `data-*` attributes rather than the concatenated classes is the point: a sheet selects
+for a choice instead of naming a string built at run time. Both are available; the classes are
+there for the cases where a class is what you want.
+
+<Callout type="info">
+`classes()` names a type through the `zgui` umbrella crate, exactly as `view!` does. The crate has
+to be reachable under the name `zgui` where the macro is used.
+</Callout>
+
+## Installing a sheet
+
+### One sheet for the application
+
+```rust
+app()
+    .with_title("Storage")
+    .with_stylesheet(SHEET)
+    .run(|| view! { Card() })
+```
+
+The text lands at the author origin of every window when it opens.
+
+<Callout type="warn">
+`with_stylesheet` installs **exactly one** sheet, and calling it twice **replaces** rather than
+appends. There is no `with_stylesheets`. To ship more than one piece of text from an application,
+concatenate it — `format!("{SHEET}\n{OTHER}")` — or install the rest from a view.
+</Callout>
+
+`WindowOptions::with_stylesheet` adds a sheet to one newly opened window. It is cascaded after the
+application sheet, so it can override shared rules without changing the other windows.
+
+### Sheets from a view, at run time
+
+Three items, all in the prelude.
+
+<TypeTable
+  type={{
+    'install_stylesheet(name, css)': {
+      description: 'Installs css under name at the author origin. Installing a name that is already installed replaces that sheet’s text without moving it in the cascade. Installing text that is already there does nothing.',
+      type: 'fn(&str, &str)',
+    },
+    'remove_stylesheet(name)': {
+      description: 'Removes the sheet installed under name. Removing a name that is not installed does nothing.',
+      type: 'fn(&str)',
+    },
+    'Stylesheet::install(name, css)': {
+      description: 'The same install, as a guard. Dropping the guard removes the sheet. None outside a window’s scope.',
+      type: 'fn(impl Into<String>, &str) -> Option<Stylesheet>',
+    },
+    'Stylesheet::replace(css)': {
+      description: 'Replaces the guarded sheet’s text, keeping its place in the cascade.',
+      type: 'fn(&self, &str)',
+    },
+  }}
+/>
+
+Which one to reach for:
+
+| The sheet belongs to | Use |
+|---|---|
+| a **component type** — a button's rules, which the next button would only put back | `install_stylesheet` |
+| **state** — a theme, rules generated from data, anything that stops being true when a view goes away | `Stylesheet` |
+
+```rust
+// A theme whose text is state: the guard removes it when this view is dropped.
+let theme = Stylesheet::install("theme", ":root { --accent: #2b6cff }");
+
+// Later, from anywhere that still holds the guard:
+theme.expect("inside a window").replace(":root { --accent: #e0554b }");
+```
+
+Names are global to the document, so a library gives its own a prefix. Called outside a window's
+scope, `install_stylesheet` does nothing and fails a debug assertion.
+
+Queued installs are applied **after the reactive flush and before the restyle**, so a component
+that mounted this frame is styled by its own sheet in the frame it appeared in.
+
+### Replacing keeps the position
+
+Installing under an existing name replaces the text in place. Removing and re-adding would move the
+sheet to the end of its origin, where it would start winning against sheets that used to beat it.
+Replacement never fails, even when the new text has errors — there is no state in which the old
+sheet survives.
+
+### Installation never fails
+
+A sheet installs whole. What the parser cannot use is dropped at three granularities, and each drop
+is reported through `tracing::warn!` under the target `zgui::css`, in release as well as in debug:
+
+| What is wrong | What is dropped |
+|---|---|
+| an unrecognised **declaration** | that declaration; the rule keeps everything else |
+| a rejected **selector** | the **whole rule**. It does not exist; it is not merely unmatched |
+| an at-rule this build does not implement | that block |
+
+So this sheet installs, and `color` still computes to `rgb(1, 2, 3)`:
+
+```css
+root { not-a-property: 3 }                                  /* declaration dropped */
+.card:has(.title) { color: rgb(9, 0, 0) }                   /* whole rule dropped */
+@container (min-width: 10px) { root { color: rgb(8, 0, 0) } } /* at-rule dropped */
+root { color: rgb(1, 2, 3) }                                /* applies */
+```
+
+<Callout type="info">
+`@import` parses, but resolving a name to text needs a loader, and an `App` installs none. In an
+application built on `zgui::App`, every `@import` is dropped as an at-rule. Concatenate the text or
+use `install_stylesheet` instead.
+</Callout>
+
+## Selectors
+
+### Supported
+
+| Form | Example |
+|---|---|
+| element name | `column`, `text`, `control` — the sixteen names, plus `root` |
+| universal | `*` |
+| class | `.card` |
+| id | `#main` — write the attribute with `attr:id = "main"` |
+| attribute, every operator | `[data-tone]`, `[data-tone="accent"]`, `^=`, `$=`, `*=`, `\|=`, `~=`, with the `i` and `s` case flags |
+| descendant | `.card .title` |
+| child | `.card > label` |
+| adjacent and general sibling | `label + text`, `label ~ text` |
+| structural | `:root`, `:empty`, `:first-child`, `:last-child`, `:only-child`, `:nth-child()`, `:nth-of-type()` and the rest of the family |
+| logical | `:not()`, `:is()`, `:where()` |
+| state | `:hover`, `:focus-visible`, `:disabled` and the rest — see below |
+| author state | `:state(name)` |
+
+`:root` matches the element whose parent is the document node. In an application that is the root
+element the runtime creates, which is also selectable by its name, `root`.
+
+<Callout type="info">
+`:not()`, `:is()` and `:where()` come from the selector library and nothing in zgui disables them.
+They are the one group in this table with no test of their own in the repository.
+</Callout>
+
+### Not supported
+
+| Form | What happens | What to write instead |
+|---|---|---|
+| `:has()` | the rule is **dropped whole** at parse | put the condition where the view already knows it |
+| `:nth-child(An+B of S)` | the rule is **dropped whole** at parse | count in the view and set a class; plain `:nth-child()` is available |
+| `::first-line` | not a variant in this engine build; the rule is dropped | write the lead-in as its own element with an ordinary class |
+| `::first-letter` | parses, but no style is ever resolved for it and no box is generated | one element, floated and sized |
+| `:host`, `::slotted` | there are no shadow trees | — |
+| `:lang()` | **always false**, for every value | — |
+| SVG paint properties (`fill`, `stroke`, and 19 more) | generated for another engine only; declarations using them are dropped at parse | `--zgui-fill`, `--zgui-stroke`, `--zgui-stroke-width` |
+
+The sanctioned workaround for the first two is the same shape, and it is the one the repository
+records: **a view that renders something conditionally already knows it is doing so**, so say it in
+the same expression.
+
+```rust
+// Instead of `.field:has(.error) { … }`
+column(class = "field", class:has-error = move || error.get().is_some()) {
+    field()
+    if move || error.get().is_some() {
+        label(class = "error") {{move || error.get().unwrap_or_default()}}
+    }
+}
+```
+
+```css
+.field.has-error { border-color: #e0554b }
+```
+
+For `:nth-child(… of .visible)`, the list that renders the rows knows each row's index, so it can
+set the class on the rows the rule is meant to reach.
+
+## Pseudo-classes: state selectors
+
+A **state** is a fact about an element that is true right now and was not true a moment ago: the
+pointer is over it, it holds keyboard focus, it is disabled. Every state lives in one 64-bit word
+per element. Input routing writes bits into that word; selector matching reads them; the style
+engine invalidates by comparing the word across a change. There is no second hover set anywhere.
+
+### The eight a view may assert
+
+```text
+state:checked   state:disabled   state:indeterminate   state:invalid
+state:open      state:placeholder_shown   state:read_only   state:required
+```
+
+```rust
+control(state:disabled = move || saving.get()) {"Save"}
+box(state:open = open) {"panel"}
+```
+
+Anything else in the `state:` namespace is a compile error that names the eight. For
+`hover`, `active`, `focus`, `focus_visible` and `focus_within` the message adds why: they are
+computed by the input system from what the pointer and the keyboard did, so a view asserting one
+would be lying to the system that maintains it.
+
+### The rest, which the framework computes
+
+| Selector | Set by |
+|---|---|
+| `:hover` | the pointer is over the element |
+| `:active` | the pointer is pressed on the element |
+| `:focus` | the element holds keyboard focus |
+| `:focus-visible` | it holds focus and the focus ought to be drawn |
+| `:focus-within` | it or a descendant holds focus |
+| `:enabled`, `:read-write`, `:valid`, `:optional` | the complement of a state the view asserted |
+| `:link`, `:visited` | folded into the word when the element's attributes are written |
+| `:dir(ltr)`, `:dir(rtl)` | the computed `direction` |
+| `:modal`, `:popover-open`, `:target`, `:in-range`, `:out-of-range` | the framework, from what it is doing |
+
+Four pairs are complementary: `:enabled`/`:disabled`, `:read-write`/`:read-only`,
+`:valid`/`:invalid`, `:optional`/`:required`. Setting one half clears the other, and **clearing one
+half asserts the other**. `state:disabled = false` is therefore `:enabled`, not "neither".
+
+### States of your own
+
+`custom_state:` declares a state the framework has no bit for, and it matches `:state(name)`.
+
+```rust
+control(custom_state:picked = move || chosen.get() == index) {"swatch"}
+```
+
+```css
+control:state(picked) { outline: 2px solid #2b6cff }
+```
+
+Selection is the canonical case: no CSS selector expresses "this item is selected", which is why it
+is a custom state and not one of the eight.
+
+## Pseudo-elements
+
+A **pseudo-element** is a box a rule brings into existence, or a part of an element a rule can
+address, without a node existing for it.
+
+| Pseudo-element | Resolves | Notes |
+|---|---|---|
+| `::before` | yes | a box built from the originating element's style. `content` is read |
+| `::after` | yes | the same |
+| `::selection` | yes, and nothing reads the result | see below |
+| `::first-letter` | no | inline layout generates no first-letter box |
+| `::first-line` | no | the selector does not parse; the rule is dropped |
+
+There is **no pseudo-element node**. `::before` and `::after` are boxes derived from the
+originating element's own style data, which is why they do not shift `:nth-child()` or `+` for
+their siblings.
+
+<Callout type="warn">
+**`::selection` is inert in this build.** The user-agent sheet declares it, the engine resolves a
+style for it, and nothing in the framework reads that style. The selection band and the caret are
+drawn from the **element's own computed `color`**: the band is that colour at 30 % alpha, the caret
+is that colour at full alpha. `--zgui-selection` and `--zgui-selection-text` are referenced by the
+user-agent sheet and read by nothing. To change how a selection looks, change the element's `color`.
+</Callout>
+
+## Properties
+
+### The numbers
+
+From `docs/parity.md`, which is generated by the conformance harness and regenerated as part of the
+test suite:
+
+| | Count |
+|---|---:|
+| Property names the engine generates | 322 |
+| Distinct longhands behind them | 250 |
+| Implemented | 128 |
+| Parsed and cascaded, not yet implemented | 122 |
+| Shown by probe to change what layout produces | 111 |
+| Out of reach: register rows | 6 |
+| Not yet implemented: register rows | 0 |
+
+A property counts as **implemented** there only when some module declares that it reads the value
+*and* setting it on a fixture visibly changes the fragment tree or the answer hit testing gives.
+
+<Callout type="warn">
+`docs/parity.md` **under-reports painting**. The conformance harness collects parity declarations
+from `zgui-style`, `zgui-text-style`, `zgui-layout` and `zgui-css`'s own backlog. It does not link
+`zgui-paint`. So every row in that file reading "nothing paints yet, so nothing reads it" is wrong:
+`zgui-paint` declares those properties implemented. The same applies to the `animation-*` and
+`transition-*` rows, which the probe cannot settle because an animation by construction produces no
+immediate change. Read the tables below rather than that file for what paints.
+
+It under-reports two flex properties for a related reason. `flex-shrink` and `align-content` are
+both read by the layout adapter (`crates/zgui-layout/src/style/flex.rs`), but the one fixture the
+probes share cannot move either: nothing in it overflows, so `flex-shrink: 0` changes no edge, and
+its wrapped lines already fill the cross axis, so `align-content` has no free space to hand out.
+A probe that shows nothing is recorded as a property nothing reads. The tables below say what the
+engine reads.
+</Callout>
+
+### Implemented, by area
+
+| Area | Properties |
+|---|---|
+| box | `display`, `position`, `top`/`right`/`bottom`/`left` and every `inset-*`, `width`/`height` and every `min-`/`max-` form, `margin-*`, `padding-*`, `border-*-width`, `border-*-style`, `box-sizing`, `aspect-ratio`, `overflow-x`/`-y`, `float`, `clear`, `content` |
+| flex | `flex-direction`, `flex-wrap`, `flex-basis`, `flex-grow`, `flex-shrink`, `align-items`, `align-self`, `align-content`, `justify-content`, `justify-items`, `justify-self`, `row-gap`, `column-gap`, `order` |
+| grid | `grid-auto-flow`, `grid-auto-rows`, `grid-template-columns`, `grid-template-rows`, `grid-column-start`/`-end`, `grid-row-start`/`-end` |
+| painting | `color`, `visibility`, `background-color`, `background-image`, all four `border-*-color`, all four `border-*-style`, all four `border-*-radius`, `outline-color`/`-style`/`-width`/`-offset`, `box-shadow`, `text-shadow` |
+| compositing | `opacity`, `filter`, `backdrop-filter`, `mix-blend-mode`, `isolation`, `z-index`, `pointer-events`, `clip-path` |
+| transforms | `transform`, `translate`, `rotate`, `scale`, `transform-origin`, `perspective`, `transform-style`, `backface-visibility` |
+| text | `font-size`, `font-family`, `font-weight`, `font-style`, `font-stretch`, `font-variation-settings`, `font-feature-settings`, `font-kerning`, `font-optical-sizing`, every `font-variant-*`, `letter-spacing`, `word-spacing`, `line-height`, `text-align`, `text-indent`, `text-wrap-mode`, `word-break`, `overflow-wrap`, `text-decoration-line`/`-color`/`-style`, `direction` |
+
+`linear-gradient` and `radial-gradient` work as `background-image` values. A gradient between
+colours outside sRGB is densified along the true curve rather than interpolated in a straight line.
+
+### Parsed, cascaded and read by nothing
+
+These are accepted by the parser, survive the cascade, and then change nothing. That is the
+failure mode to recognise: no warning is printed, because the declaration was valid.
+
+| Area | Not read |
+|---|---|
+| grid | `grid-auto-columns`, `grid-template-areas` |
+| backgrounds | `background-position-x`/`-y`, `background-size`, `background-repeat`, `background-origin`, `background-attachment`, `background-clip`, `background-blend-mode`, every `border-image-*` |
+| text | `text-transform`, `text-overflow`, `text-rendering`, `unicode-bidi`, `tab-size`, `caret-color`, `cursor`, `white-space-collapse`, `writing-mode`, `line-break`, `text-align-last`, `text-justify` |
+| other | `color-scheme`, `image-rendering`, `perspective-origin`, `container-type`, `container-name` |
+
+A background layer fills the box it is painted on, which is what makes the whole
+`background-position` group inert. `background-clip: text` in particular has a replacement — see
+`--zgui-text-fill` below.
+
+### Out of reach
+
+Six rows in `docs/parity.md` need a patched build of the style engine, and there is to be no fork.
+They are a boundary and not a backlog. Four are the selectors and the SVG group already listed
+above. The other two:
+
+| Missing | Write instead |
+|---|---|
+| `text-decoration-thickness`, `text-underline-offset`, `text-underline-position` | the line, its style and its colour are all read; an underline that has to sit elsewhere is a border or a box under the run |
+| `scrollbar-gutter` | keep the gutter yourself with `padding-right` on the scrolling element |
+
+## Custom properties
+
+A **custom property** is a name of your own, starting with `--`, holding arbitrary text. It
+inherits like `color`, and `var(--name)` reads it.
+
+```css
+:root { --surface: #14161a; --on-surface: #f2f4f8; --pad: 12px }
+.card { background-color: var(--surface); color: var(--on-surface); padding: var(--pad) }
+```
+
+From a view, `var:` writes one on an element. The `--` is required in the attribute name and is
+stripped before storage.
+
+```rust
+column(
+    class = "card",
+    var:--pad = move || Some(format!("{}px", density.get())),
+)
+```
+
+Because custom properties inherit, writing one on a container re-themes the subtree under it with
+one declaration and no rule matching anywhere. That is the recommended way to theme, and
+[Theming](/docs/building/theming) builds it out.
+
+<Callout type="info">
+A custom property's computed value is a token stream, so reading one back is reading text and
+parsing it as whatever you expect. Where the framework reads one as a length it accepts absolute
+units only — `px`, `in`, `cm`, `mm`, `pt`, `pc`. `em`, `rem` and `%` give no answer.
+</Callout>
+
+### `currentColor`
+
+`currentColor` means "this element's computed `color`". Every colour-valued property other than
+`color` itself may use it, and it is resolved in one place, which is what keeps a border colour, a
+shadow colour and a decoration colour agreeing.
+
+The repository's own gallery draws one SVG entirely in `currentColor` and gets two different
+colours out of it with nothing but two `color` declarations.
+
+### The framework's own custom properties
+
+| Name | Meaning |
+|---|---|
+| `--zgui-fill` | what a `vector` element's shapes are filled with. Defaults to the element's computed `color` |
+| `--zgui-stroke` | strokes a shape that named no stroke. Absent means no stroke |
+| `--zgui-stroke-width` | an absolute length. Defaults to 1 CSS pixel |
+| `--zgui-text-fill: background` | paints the text inside the box with the box's first `background-image` layer. The only accepted value is the keyword `background`. It exists because `background-clip: text` is discarded by this build |
+| `--zgui-foreground` | the root `color` in the user-agent sheet. Referenced, defined by your theme |
+| `--zgui-ring` | the `:focus-visible` outline colour. Referenced, defined by your theme |
+| `--zgui-selection`, `--zgui-selection-text` | referenced by the user-agent sheet and read by nothing |
+
+### Colour spaces
+
+Fourteen colour spaces are held: `srgb`, `srgb-linear`, `hsl`, `hwb`, `lab`, `lch`, `oklab`,
+`oklch`, `display-p3`, `a98-rgb`, `prophoto-rgb`, `rec2020`, and XYZ at D50 and D65.
+
+The cascade **keeps a colour in the space it was written in**. An `oklch()` stays Oklch until the
+renderer needs numbers, because converting early would band a gradient. Exactly one function turns
+a colour into numbers, and it produces premultiplied, gamma-encoded sRGB.
+
+## Units
+
+| Unit | Resolves against |
+|---|---|
+| `px` | one **CSS pixel**. Everything an application writes is in CSS pixels, including `with_size` |
+| `in`, `cm`, `mm`, `pt`, `pc` | 96 CSS pixels per inch |
+| `em` | the element's own `font-size` |
+| `rem`, `rlh`, `rex`, `rch`, `ric` | the root element's metrics |
+| `%` | whatever the property says a percentage is of |
+| `vw`, `vh` | the viewport, at computed-value time |
+| `calc()` | anything above, mixed, including `var()` |
+
+Two of these have costs worth knowing:
+
+- **A root-relative unit may need a second pass.** The root's computed metrics are pushed into the
+  device at the tail of a restyle. If a metric moved and something had already resolved a unit
+  against the old value, the traversal runs once more. A document whose root font size stands still
+  converges in one pass.
+- **A viewport unit is resolved at computed-value time**, so no amount of relaying out fixes a
+  stale `50vw`. The elements that read one have to cascade again, and which elements those are is
+  recorded per element by the cascade itself — a document with no viewport units marks nothing.
+
+A CSS pixel is not a device pixel. The ratio between them is the scale factor, which
+[Layout](/docs/learn/layout) covers.
+
+## Media queries
+
+A **media query** makes a block of rules conditional on a fact about the surface.
+
+```css
+@media (min-width: 768px) {
+    .sidebar { display: block }
+}
+
+@media (prefers-color-scheme: dark) {
+    :root { --surface: #14161a; --on-surface: #f2f4f8 }
+}
+```
+
+The device is built from the window, so these have real answers:
+
+| Feature | Answer |
+|---|---|
+| `width`, `min-width`, `max-width`, `height`, and the `min`/`max` forms | the viewport, in CSS pixels |
+| `aspect-ratio` | the viewport's |
+| `resolution` | the scale factor |
+| `prefers-color-scheme` | the desktop's setting, tracked while the program runs |
+| `pointer`, `any-pointer` | `fine` |
+| `hover`, `any-hover` | `hover` |
+
+The media type is always `screen`.
+
+<Callout type="warn">
+`prefers-reduced-motion`, `prefers-contrast` and `forced-colors` are not fed by anything in zgui.
+Do not rely on them.
+</Callout>
+
+### Container queries
+
+<Status kind="planned">`@container` is dropped whole at parse in this build.</Status>
+
+Container queries resolve against boxes, and boxes are built after styling, so the element's
+container size answers "no container" every time — and the at-rule is reported as an unimplemented
+at-rule and its block discarded. `container-type` and `container-name` are among the properties
+that parse and are read by nothing.
+
+Until it lands: a media query answers about the window, and a class the view sets answers about
+anything smaller. A component that knows its own measured size can set a class from it.
+
+## What a style change costs
+
+This section is the reason the rest of the page is worth reading carefully. The cost of a change is
+decided by **which** properties moved, not by how many rules you wrote.
+
+### Most mutations never reach the engine
+
+Before a change is allowed to schedule any style work, three questions are asked, and each is
+answered from an index built from the installed sheets:
+
+1. Does any selector mention **this class name**?
+2. Does any selector mention **this attribute name**?
+3. Which **state bits** could any selector matching **this element** depend on?
+
+The third is answered per element rather than per document. Any real sheet styles `:hover`
+somewhere, so a document-wide answer would put every hover on the slow path.
+
+A change no selector depends on needs no record of the previous value, no ancestor marking, and no
+traversal at all.
+
+<Callout type="warn">
+**Replacing a sheet is the expensive operation.** The frame in which the installed set of sheets
+changes **disables these filters**, so every mutation in that one frame takes the full path; the
+tail of the same frame rebuilds them. Prefer a class toggle or a custom property to swapping a
+sheet.
+</Callout>
+
+### Damage: what a changed declaration obliges
+
+**Damage** is the record of what became invalid. It is stored on nodes as obligations — restyle,
+rebuild the box, relay out, reshape the text, repaint, restack — and the traversal descends only
+where obligations live. There is no per-frame walk of the document.
+
+The style engine's own damage word is wider than this pipeline needs, so it is translated. This is
+the table that matters:
+
+| Change | Obligations | Layout moves? |
+|---|---|---|
+| first cascade of an element — an insertion, or a subtree leaving `display: none` | relayout, rebuild box | yes |
+| `width`, `height`, `padding`, `margin`, `display`, `flex-*`, `grid-*`, `font-size` | relayout, and box rebuild / reshape / rebreak as narrowed below | yes |
+| `transform`, `translate`, `rotate`, `scale`, `transform-origin`, `perspective-origin`, text decorations, corner radii, box shadows, clips, masks | refragment, rehit, repaint | **no** |
+| `z-index`, and anything that changes whether a stacking context is established | restack, rehit, repaint | **no** |
+| `color`, `background-color`, `border-*-color`, `opacity`, `visibility` | repaint | **no** |
+| a custom property declared **on this element** | repaint | **no** |
+| a `::before` or `::after` style | rebuild box | yes |
+
+Colour changes are the interesting row. They carry **no damage annotation from the engine at all**.
+What catches them is a **paint key**: the addresses of the shared computed-value groups —
+background, border, effects, outline, text, position, and the identity of the custom-property map.
+Two elements that cascaded to the same result share the same allocations, so comparing this frame's
+key with last frame's is a handful of integer tests.
+
+The custom-property part of that key over-fires and never under-fires: a fresh allocation holding
+the same properties repaints an element that did not need it. The elements that pay are exactly
+those that declare custom properties of their own.
+
+### Text: reshape against rebreak
+
+Under a relayout, text work is narrowed further by comparing two keys per element, hashed from
+exactly the properties the shaper reads and the properties the line breaker reads.
+
+| Change | Work |
+|---|---|
+| `font-size`, `font-family`, `font-weight`, `letter-spacing` | **reshape** — glyphs are chosen again |
+| `text-align`, a width change | **rebreak** — the same glyphs, new lines |
+| a colour | neither: a shaped paragraph stores an index into a paint table, so a theme change rewrites a handful of entries |
+
+Shaping costs more than breaking, which is why the narrowing exists.
+
+### Measured
+
+From `docs/performance.md`, generated by `cargo xtask perf` on the maintainer's machine:
+
+| Measurement | Value | What it is |
+|---|---|---|
+| `kitchen.click` | 11.34 µs | the measured p50 at 1 851 boxes: one class on one element |
+| `hover.crossing` | 207.78 µs | one pointer crossing in the hover-storm scenario |
+| `scroll.translation.restyles` | 0 elements | moving content changes no computed style |
+| `idle.frames` | 0 frames | a still document draws nothing |
+
+### Resize and scale
+
+| The surface changes | Cost |
+|---|---|
+| size, crossing no media-query boundary | nothing is restyled at all |
+| size, crossing a boundary | the whole origin's rules are re-collected and every element is restyled |
+| size, with viewport units in use | those elements cascade again; the root is marked for relayout |
+| **scale factor** | **every element is marked for relayout** — every box snaps to a different device-pixel grid, so no subtree can be skipped |
+| colour scheme | which rules match, and nothing else |
+
+### The rules that follow
+
+- Prefer `class:` and `custom_state:` to `style:`. A class toggle is a class-list write the filters
+  answer cheaply; an inline declaration is a new declaration block to cascade.
+- Prefer changing a custom property on a container to swapping a sheet.
+- Animate `opacity` and `transform` where you can: neither moves layout.
+- Keep declarations that change often off elements that also declare custom properties, because the
+  map identity over-fires.
+
+## Debugging a style
+
+Press <kbd>F12</kbd> to open the inspector in a program that has one wired in. It shows, for the
+element you pick, its selector, its fragment count, a nested border/padding/content diagram, the
+layout longhands, and **every property that is not at its initial value** — which is usually the
+fastest answer to "why is this element that size".
+
+Dropped declarations and dropped rules are logged at parse time under the tracing target
+`zgui::css`. A sheet that "does nothing" is worth checking there first.
+
+## Next
+
+<Cards>
+  <Card
+    title="Layout"
+    href="/docs/learn/layout"
+    description="The box model, flexbox, grid, sizing, overflow and stacking contexts."
+  />
+  <Card
+    title="Theming"
+    href="/docs/building/theming"
+    description="Custom properties as design tokens, light and dark, and switching a theme at run time."
+  />
+  <Card
+    title="Animation"
+    href="/docs/building/animation"
+    description="Transitions, keyframes, and what an animating frame costs."
+  />
+</Cards>

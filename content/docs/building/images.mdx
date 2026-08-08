@@ -1,0 +1,106 @@
+---
+title: Images
+description: Load raster images from files or memory, control their size, and understand decoding and caching.
+---
+
+The `image` element loads encoded raster data and draws it in its content box. The standard app
+wiring supports PNG, JPEG, WebP, and GIF. For GIF, zgui draws the first frame.
+
+## Load a file
+
+Set `src` to a file-system path:
+
+```rust
+use zgui::prelude::*;
+
+view! {
+    image(
+        class = "avatar",
+        src = "assets/avatar.webp",
+        a11y:label = "Ada Lovelace",
+    )
+}
+```
+
+```css
+.avatar {
+    width: 96px;
+    height: 96px;
+    border-radius: 50%;
+    overflow: hidden;
+}
+```
+
+`src` is a local path, not an HTTP URL. Decode work runs off the UI thread. The element is blank
+until decoding finishes. The completed decode wakes the frame loop and updates layout if the
+natural size changed.
+
+The source can be reactive:
+
+```rust
+image(src = move || selected_path.get())
+```
+
+Changing or removing `src` detaches the old content. A failed source stays blank. zgui writes a
+warning with the `zgui::images` tracing target and does not retry the same failed source each
+frame.
+
+## Load bytes from memory
+
+Use `zgui_image::ImageBytes` when no file path exists. Add the matching workspace crate to the
+application:
+
+```toml title="Cargo.toml"
+[dependencies]
+zgui = { git = "https://github.com/zortax/zgui" }
+zgui-image = { git = "https://github.com/zortax/zgui" }
+```
+
+```rust
+let picture = zgui_image::ImageBytes::new(include_bytes!("avatar.png"));
+let src = picture.url();
+
+let view = image(src = src);
+```
+
+Keep `picture` alive while the element can need the bytes. The URL is a registry key. Dropping the
+last `ImageBytes` clone unregisters the data. A later decode of that URL then fails.
+
+## Sizing
+
+After decode, the pixel dimensions become the natural size in CSS pixels. A 640 by 480 file has a
+natural size of 640 by 480 CSS pixels and a 4:3 natural ratio. The natural size does not change
+with the window scale factor.
+
+CSS still has final control:
+
+```css
+.preview { width: 100%; aspect-ratio: 16 / 9; }
+```
+
+The image scales to the full content box. `object-fit` and `object-position` do not change this
+placement. Use a box with a suitable aspect ratio when the source must not be distorted. Rounded
+corners and `overflow` clip the pixels with the element.
+
+Before decode, an image has no natural width or height. Give layout an explicit size when a late
+size change is not acceptable.
+
+## Decode limits and cache sharing
+
+The standard app limits each decoded dimension to 4094 pixels so that the padded tile fits the
+4096-pixel atlas limit. It scales a larger image down proportionally with a Lanczos filter. It does
+not reject the image only because it is large. Code that calls `zgui_image::decode` directly chooses
+`Limits`; its default maximum dimension is 2048 pixels.
+
+The cache key is the source string. Elements with the same source share one decode, one byte
+buffer, and one atlas tile. Visible images keep their decoded bytes. The memory budget can discard
+decoded data that no element shows. zgui decodes it again when it is needed. The known natural
+size remains, so cache eviction does not cause layout movement.
+
+Decoded texels are premultiplied, gamma-encoded sRGB RGBA. They are tightly packed, with the top
+row first. This detail matters only to code that works with `zgui-image` directly.
+
+## Accessibility
+
+`alt` is stored as an ordinary attribute, but the accessibility tree does not use it. Set
+`a11y:label` for meaningful content. Set `a11y:hidden = true` for decorative content.

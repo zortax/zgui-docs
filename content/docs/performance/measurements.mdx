@@ -1,0 +1,630 @@
+---
+title: How performance is measured
+description: The band, budget and ratchet system, the five scenarios, the standing gates, the reference workloads, and the counters an application can read itself.
+---
+
+[The cost model](/docs/performance/cost-model) states the numbers. This page states the machinery
+that produces them, the gates that keep them true, and the instruments an application can point at
+its own frames. It assumes the guide and reads better after
+[Architecture overview](/docs/architecture/overview).
+
+## Three instruments
+
+| Instrument | What it says | What a violation does |
+|---|---|---|
+| **band** | this build got slower than the build the number was recorded on | fails `cargo xtask perf`, which fails `cargo xtask ci` |
+| **budget** | this is what the design was supposed to cost | opens an escalation; it does not fail the run |
+| **ratchet** | the procedure that stores the run, regenerates the document, then fails | it is the whole of `cargo xtask perf` |
+
+### A band
+
+A band is the comparison, written down once and applied by the harness that takes the measurement.
+It has two shapes, because the numbers are of two kinds
+(`crates/zgui-bench/src/scenario/band.rs`):
+
+```rust
+// Internal to the measurement harness, not public API.
+enum Band {
+    /// Microseconds. `tolerance` is a fraction: 0.4 admits 40 % above the baseline.
+    Time { baseline: f64, tolerance: f64 },
+    /// A ceiling, with no tolerance at all.
+    Count { ceiling: u64 },
+}
+```
+
+A **time** is a property of the machine as much as of the code. It moves with the core the scheduler
+picked, with what else is running, and with the state of the caches. Its band is therefore a
+multiple of a recorded baseline, and the multiple has to clear the ordinary spread of the
+measurement on an ordinary machine.
+
+A **count** is a property of the design. "One row hovered, one row restyled" reads the same on a
+slow machine, a fast one and under a debugger. A count band is therefore a ceiling with no tolerance
+at all: the moment a frame emits a two-hundredth primitive, something stopped culling. Widening a
+count band would admit exactly the regression the count exists to catch.
+
+Three tolerances exist, and each states why it is that wide:
+
+| Constant | Value | Applies to | Reason |
+|---|---:|---|---|
+| `INTERACTION_TOLERANCE` | 0.40 | microsecond interactions | process to process on a busy machine the median moves by tens of per cent; a lost fast path costs several times, not ten per cent |
+| `STARTUP_TOLERANCE` | 0.25 | millisecond measurements | the cold-start figure spread over 216–247 ms across runs, seven per cent either side of its middle |
+| `IDLE_TURN_TOLERANCE` | 1.00 | `idle.turn` only | the measurement is mostly the timer's own resolution, so the baseline is rounded up to 1 µs and doubled |
+
+### A budget
+
+A budget is what the schedule wrote for a quantity before it was measured. It **does not move with
+the measurement**.
+
+That is the statement a band cannot make. A band is written against what was measured, so it fires
+on a change and stays quiet on a machine that is merely slower than the one the numbers came from —
+which means a number can sit inside its band for ever while never once having met the budget.
+Reporting both is the only way to tell those two states apart.
+
+<Callout type="info">
+A missed budget does not fail the run. `crates/zgui-bench/src/scenario/record.rs` returns an error
+only for a measurement outside its **band**. A missed budget is what opens an investigation.
+</Callout>
+
+### The ratchet
+
+`cargo xtask perf` has three obligations, separable on purpose, and it performs them in this order
+(`crates/zgui-bench/src/scenario/record.rs`):
+
+<Steps>
+
+<Step>
+
+**Store**, whatever the verdict, to `docs/perf/runs/<unix-seconds>.tsv`. A run that regressed is the
+run somebody most wants the numbers from. 65 runs are stored today.
+
+</Step>
+
+<Step>
+
+**Regenerate** `docs/performance.md` from the run just taken, so the document in the tree is never a
+claim about a build nobody has.
+
+</Step>
+
+<Step>
+
+**Fail** last, naming **every** measurement that left its band rather than the first. A change that
+costs one thing usually costs several.
+
+</Step>
+
+</Steps>
+
+It always runs in release. A band is an assertion about time, and one measured in an unoptimised
+build is an assertion about a program nobody runs.
+
+`perf` sits in `cargo xtask ci` after the budget gates and before the documentation gate, because it
+*writes* documentation: a build whose numbers moved leaves the change in the working tree where a
+reader will see it.
+
+## The five scenarios
+
+A scenario is one interaction driven over one document, headless, on a virtual clock, with a null
+renderer. Everything it reports carries a band.
+
+| Scenario | Document | What it exercises |
+|---|---|---|
+| `idle` | 833 rows of six elements, about 5 000 nodes; 600 turns of a 60 Hz clock with nothing touched | the loop's decision **not** to draw |
+| `hover-storm` | a 1 000-row table, 240 pointer crossings at 120 Hz | whether a two-element style change stays proportional to two |
+| `scroll` | a virtualised list of 10 000 rows, 600 ticks, one wheel notch every 40 | translation frames against recycle frames |
+| `cold-start` | the shipped gallery at size `s13`, 1 851 boxes, measured **once** | everything that has no cache to hit yet |
+| `kitchen-sink` | the same gallery, 32 repeats per interaction and 240 untouched turns | resize, click, keystroke, glide tick, and an untouched but animating window |
+
+Every band, from the source rather than from a run:
+
+| Measurement | Unit | Band | Limit | Budget |
+|---|---|---|---:|---:|
+| `idle.frames` | frames | ceiling 0 | 0 | 0 |
+| `idle.turn` | µs | 1.0 +100 % | 2.00 | — |
+| `hover.crossing` | µs | 190.0 +40 % | 266.00 | 500 |
+| `hover.primitives_emitted` | prims | ceiling 200 | 200 | 200 |
+| `scroll.translation` | µs | 44.0 +40 % | 61.60 | 1 000 |
+| `scroll.recycle` | µs | 1030.0 +40 % | 1442.00 | 1 500 |
+| `scroll.translation.restyles` | elems | ceiling 0 | 0 | 0 |
+| `scroll.translation.relayouts` | nodes | ceiling 0 | 0 | 0 |
+| `scroll.translation.hit_rebuilds` | rebuilds | ceiling 0 | 0 | 0 |
+| `cold.first_frame` | ms | 112.0 +25 % | 140.00 | 250 |
+| `kitchen.resize` | ms | 8.2 +25 % | 10.25 | — |
+| `kitchen.click` | µs | 10.8 +40 % | 15.12 | — |
+| `kitchen.keystroke` | µs | 291.0 +40 % | 407.40 | — |
+| `kitchen.untouched_turn` | µs | 22.0 +40 % | 30.80 | — |
+| `kitchen.glide_tick` | µs | 610.0 +40 % | 854.00 | — |
+
+Measured values live in `docs/performance.md`, and
+[the cost model](/docs/performance/cost-model) reads them out.
+
+### What each scenario had to get right
+
+- **Each runs in its own process.** A cold start is only cold once, and every scenario mounts an
+  application through thread-local state that a second mount adds to rather than replaces. The
+  runner spawns itself once per scenario and reads the numbers back off its own output.
+- **`quiet()` before measuring.** A document that has just opened owes a first cascade, a first
+  layout, a first shaping of every run and a first emission of every primitive. Measuring before
+  that has settled measures the opening.
+- **The median, not the mean.** One sample of an interaction is occasionally the scheduler's rather
+  than the framework's, and a mean carries that outlier into every later comparison.
+- **`idle` is not the gallery.** The gallery ships an indeterminate progress bar, and a document
+  with a running animation in it is *supposed* to draw every refresh. A ceiling that admits sixty
+  frames a second admits every regression this scenario exists to catch.
+- **`hover-storm` asserts that it hit something.** A pointer aimed at empty space costs nothing and
+  would pass every band. The scenario fails when no element was restyled by 240 crossings.
+- **`scroll` buckets its frames by one counter and asserts three others.** A frame is a translation
+  when `boxes_rebuilt` is zero. What is then claimed of it is restyles, relayouts and hit-index
+  rebuilds, so the classification and the claim do not share a number.
+- **`kitchen-sink` runs its interactions in a fixed order.** The keystroke goes first, because the
+  field it types into is found by tabbing from the top of the document. The resize goes last,
+  because every step of it leaves the window a different width.
+
+Every scenario also records three counters — primitives emitted, primitives culled, draw-order
+insertions — whether or not that scenario is about emission. A number that exists only where
+somebody expected it proves nothing about anywhere else.
+
+## The five standing gates
+
+Each is a step of `cargo xtask ci` and a subcommand of its own, so it can be run alone while the
+thing it covers is being changed (`CONTRIBUTING.md`).
+
+| Gate | What it compares | Where the list lives |
+|---|---|---|
+| `cargo xtask skips` | every counter declared `Group::Skip` names a distinct counter of work *performed* and has a non-vacuity assertion in some member's tests | `crates/zgui-profile/src/counter/table.rs`, checked by `xtask/src/ledger/check/skips/` |
+| `cargo xtask budget` | a cache over its soft limit comes back under it within a bounded number of frames without thrashing, and no replayed range names a raster its cache has freed | `xtask/src/budget/subject.rs` |
+| `cargo xtask cadence` | an animation and the overscroll spring each get exactly one frame per refresh at 60, 75 and 240 Hz | `xtask/src/cadence/subject.rs` |
+| `cargo xtask workloads` | two reference workloads, by same-run ratio; and that every criterion a workload is registered for is still *stated*, so one renamed away cannot leave the gate green | `xtask/src/workloads/subject.rs` |
+| `cargo xtask resize` | the resize slope — microseconds per box across four document sizes — as a ratio of a whole-document content change measured in the same run | `crates/zgui-bench/src/bin/resize-slope/verdict.rs` |
+
+One reference workload is deliberately absent from that list. The 42-step gallery script has a gate
+of its own — `cargo xtask verify`, which compares a running window's display list and resolved
+geometry against one rebuilt from nothing — and running it twice under two names would mean two
+places to relax it.
+
+<Callout type="info">
+`budget` and `cadence` run assertions that live beside the code they are about. What the gate adds
+is that those assertions are **named**. A target that has been emptied, or one whose assertion was
+renamed away, fails the gate instead of passing quietly as one fewer test nobody counted.
+</Callout>
+
+## The reference workloads
+
+A reference workload is a document a later claim is measured against. One rule governs every
+criterion, quoted in `docs/perf/reference-workloads.md` from `docs/COMPOSITOR-PHASES.md`:
+
+> A criterion is a slope or a same-run ratio, never an absolute microsecond count. Absolute numbers
+> are recorded as an advisory artifact keyed by machine and gate nothing. A standing gate that can
+> only pass by re-recording its baseline gates nothing.
+
+Both halves of a ratio are taken in the same process, over the same documents, minutes apart at
+most. A machine twice as fast divides both halves by the same number and leaves the ratio exactly
+where it was. That is why a duration would be the wrong criterion: it would either fail on every
+machine that is not the maintainer's, or be relaxed until it asserted nothing.
+
+| Workload | Document | Varied | Publishes | In `ci` |
+|---|---|---|---|---|
+| gallery script | the shipped 1 851-box gallery, 42 steps | four document sizes | byte identity of the display list, live against a full repaint | yes, as `verify` |
+| `static-slope` | 10 000 `control` elements | 1 250 → 10 000 controls | click ns per control; elements restyled and nodes visited per control | yes, as `workloads` |
+| `list-slope` | a virtualised list of 100 000 rows | 12 500 → 100 000 model rows; port 200 → 1 600 px | glide ns per realised box per drawn frame; damage fraction; fragments rebuilt per tick | yes, as `workloads` |
+| `resize-slope` | four documents, 135 → 1 031 boxes | four document sizes | resize µs per box | yes, as `resize` |
+| `unvirtualised-probe` | the same rows with **every one** mounted | 2 500 → 20 000 rows | glide ns per box | no, deliberately |
+| `glide-split` | the same rows in sections, and again with every row clipping | 1 250 → 10 000 rows | how the offsetting walk's cost divides between its two duties | no, deliberately |
+
+Every criterion the gates apply (`docs/perf/reference-workloads.md`; the constants live beside the
+verdict that applies them, not in that page):
+
+| Criterion | Ratio of | Allowed | Measured |
+|---|---|---|---|
+| `STATIC-locality` | a one-control update ÷ the same property changing on every control | ≤ 0.09 | 0.0679–0.0702 |
+| `STATIC-restyle-locality` | elements restyled per control in the document | ≤ 0.001 | 0.0000 |
+| `STATIC-visit-locality` | nodes visited per control in the document | ≤ 1.10 | 1.0000 |
+| `LIST-virtualisation-wheel` | a wheel over 100 000 rows ÷ over 12 500 | ≤ 1.05 | 0.9991–1.0123 |
+| `LIST-virtualisation-touchpad` | the same, touchpad | ≤ 1.05 | 0.9970–1.0042 |
+| `LIST-damage-wheel` | share of the surface one drawn glide frame damaged | ≤ 0.97 | 0.9460 |
+| `LIST-damage-touchpad` | the same, under a held gesture | ≤ 0.55 | 0.4830 |
+| `LIST-full-frames` | frames of a scroll declaring the whole surface damaged | ≤ 0 | 0 |
+| `LIST-rebuilds-wheel` | fragments rebuilt per drawn glide frame | ≤ 12 | 7.52 |
+| `LIST-rebuilds-touchpad` | the same, under a held gesture | ≤ 12 | 7.06 |
+| `LIST-glide` | one glide frame ÷ a full repaint of the same realised rows | 0.92 ± 12 % | 0.9037–0.9193 |
+| `RESIZE` ratio | a configure ÷ a whole-document content change | 0.865 ± 10 % | 0.8582–0.8750 |
+
+A **ceiling** is used wherever the ideal is zero and the failure is one: a two-sided band recorded at
+today's value would fail an engine that got better. A **band** is used where the number is a
+proportion between two real pieces of work and either half moving is worth knowing about.
+
+A missing number is not a pass. A workload whose measurement stops working returns nothing, and a
+criterion written as "not worse than" holds against nothing at all. The verdict types therefore
+report `Broken`, and broken fails.
+
+### The workload that is deliberately not a gate
+
+`unvirtualised-probe` mounts every one of twenty thousand rows.
+
+It is the only document in the repository that would make a change to scrolling look important.
+Wiring it into `ci` would let that change justify itself against a document no application would ship:
+the number would be real, the improvement would be real, and the conclusion drawn from it would be
+false. `xtask/src/workloads/subject.rs` carries a named test asserting the probe is not in the
+gate's list, and a second asserting the same of `glide-split`.
+
+`glide-split` is out for that reason and one more: it asks the offsetting walk to make its descents
+one duty at a time, so what it times is not the shape of the walk a real frame makes.
+
+Both stay runnable on demand. They are diagnostics.
+
+## Running all of it
+
+```bash
+cargo xtask ci          # the whole definition of done
+cargo xtask perf        # the five scenarios, the ratchet, docs/performance.md
+cargo xtask skips       # every counter of avoided work names its pair
+cargo xtask budget      # a cache over its soft limit comes back under it
+cargo xtask cadence     # one frame per refresh at 60, 75 and 240 Hz
+cargo xtask workloads   # the reference workloads against their same-run ratios
+cargo xtask resize      # the resize slope against a same-run baseline
+cargo xtask verify      # a live window's display list against a rebuild's
+cargo xtask wall-clock  # the absolute-duration budgets, in release
+```
+
+The harness underneath, for a number that has gone red:
+
+```bash
+# The ratchet itself. This is exactly what `cargo xtask perf` runs.
+cargo run --release -p zgui-bench --bin zgui-bench -- scenarios
+
+# One scenario, printed, with no verdict.
+cargo run --release -p zgui-bench --bin zgui-bench -- scenario hover-storm
+
+# One phase at one document size, with a latency trace.
+ZGUI_LATENCY=/tmp/trace.jsonl \
+  cargo run --release -p zgui-bench --bin zgui-bench -- click s13 24
+```
+
+The phase names are `idle`, `hover`, `click`, `scroll`, `glide`, `keys`, `resize` and
+`scroll-resize`, plus the differential phases that compare a live window against a rebuilt one. The
+sizes are `s0`, `s1`, `s2`, `s4`, `s8`, `s13` and `s26`; `s13` is the shipped gallery. `all` in place
+of a size runs every size, smallest first, and stops at the first that fails.
+
+The reference workloads run on their own:
+
+```bash
+cargo run --release -p zgui-bench --bin static-slope
+cargo run --release -p zgui-bench --bin list-slope
+cargo run --release -p zgui-bench --bin resize-slope
+cargo run --release -p zgui-bench --bin unvirtualised-probe   # about ten minutes
+cargo run --release -p zgui-bench --bin glide-split           # about forty seconds
+```
+
+`ZGUI_BENCH_GPU=1` swaps the null renderer for this machine's graphics device, offscreen.
+
+## The profiling counters
+
+The counters are the sharper half of every claim on this page. A time measures the machine as much
+as the code; a count measures the design.
+
+They live in `zgui-profile`. That crate is **not** re-exported through `zgui`, so an application
+that wants to read counters names it directly:
+
+```toml
+[dev-dependencies]
+zgui-profile = { version = "0.1.0", features = ["counters"] }
+```
+
+### How they are compiled in
+
+```rust
+// crates/zgui-profile/src/counter/store/mod.rs
+pub const COUNTERS_ENABLED: bool = cfg!(any(feature = "counters", debug_assertions));
+```
+
+When `COUNTERS_ENABLED` is false, every counter function is an empty inlined body and the storage
+behind it does not exist.
+
+**In a shipped release build it is true.** `crates/zgui-runtime/Cargo.toml` names
+
+```toml
+zgui-profile = { path = "../zgui-profile", version = "0.1.0", features = ["counters"] }
+```
+
+as an ordinary dependency, not a dev-dependency, so cargo's feature unification turns `counters` on
+for every application built on the framework.
+
+<Callout type="warn">
+The crate's own documentation says the counters are compiled out of an optimised build. That is not
+what the shipped dependency graph does. Read a release build's counters and they will be there.
+
+The cost was measured: roughly 800 relaxed atomic adds on a shared static per full-damage frame,
+which came out **below the run-to-run noise floor** — a pinned A/B over 300 resize frames could not
+separate the two builds (`docs/perf/pipeline.md`). It is a wrong claim rather than a latency
+problem, and the reason `docs/perf/gallery-interactions.md` can say its numbers need no special
+build.
+</Callout>
+
+### The shape of the table
+
+One macro declaration builds the enum, the metadata and the snapshot struct together, so a counter
+cannot exist in one and be missing from the other. Each of the 70 rows is a variant, a snapshot
+field and a group (`crates/zgui-profile/src/counter/table.rs`):
+
+```text
+ElementsRestyled => elements_restyled, Group::BackendNeutral;
+LayoutsHeld      => layouts_held,      Group::Skip { done: Counter::NodesRelaidOut };
+DrawCalls        => draw_calls,        Group::RendererSpecific;
+```
+
+The group answers two questions that go quietly wrong when they are written down somewhere else:
+
+| Group | Meaning | Consequence |
+|---|---|---|
+| `BackendNeutral` | the count does not depend on what draws the result | a harness with a stub renderer may assert on it |
+| `RendererSpecific` | the GPU renderer increments it | it reads zero under a renderer that submits nothing, so an assertion on it is about that backend |
+| `Skip { done }` | it counts work a stage did **not** do, and names the counter of the work done instead | it may never be asserted on alone |
+
+Six counters are skips today: `LayoutsHeld`, `SizesHeld`, `PlaceWritesWithoutReemit`,
+`ChunksTranslated`, `PrimitivesCulled` and `SpritesResolvedAtPush`.
+
+The reading API is small:
+
+```rust
+use zgui_profile::{Counter, counter};
+
+let _guard = counter::exclusive();   // the counters are process-wide atomics
+counter::reset();
+let before = counter::snapshot();
+
+// … drive one interaction …
+
+let moved = before.delta(&counter::snapshot());
+assert_eq!(moved.get(Counter::GlyphsRasterised), 0);
+```
+
+`Counters` prints only its non-zero fields, which makes a `Debug` of a delta a readable account of
+what one interaction did. Nothing resets the counters per frame on its own.
+
+Four counters distinguish the spike paths covered by the text and upload caches:
+
+| Counter | Read it as |
+|---|---|
+| `TextBytesShaped` | Input bytes that reached real shaping. Read beside `TextShaped`; one large paragraph and many labels are not equal work. |
+| `GlyphEntriesLive` | Glyph placement records held now. Unlike a delta counter, this is a live gauge set at frame start. |
+| `SideTableSlotsPrepared` | Scene-table slots flattened again on the CPU. Zero means the retained table preparation hit completely. |
+| `UploadChunksAllocated` | Reusable staging chunks that had to grow this frame. Repeated non-zero values indicate GPU backlog or bursts beyond the retained working set. |
+
+### The non-vacuity rule
+
+A counter of work *performed* is falsifiable alone: it reads zero when the stage did nothing and a
+number when it did something.
+
+A counter of work *avoided* is not. **It reads zero when the stage is perfect, zero when the stage
+has been deleted, and zero when nobody ever wired it up.** So `skipped <= n` is green from the day
+it is written, whatever happens to the code underneath.
+
+`assert_non_vacuous` is what makes such a counter mean something. It requires three things:
+
+<Steps>
+
+<Step>
+
+A scenario the skip exists for, which **must move** the skip counter.
+
+</Step>
+
+<Step>
+
+A scenario in which skipping would be wrong, which must leave the skip counter **exactly where it was**.
+
+</Step>
+
+<Step>
+
+That second scenario must move the counter of work **performed** — otherwise "nothing was skipped" is satisfied by a stage that was never asked to do anything.
+
+</Step>
+
+</Steps>
+
+```rust
+use zgui_profile::Counter;
+use zgui_profile::counter::non_vacuity::{Scenario, assert_non_vacuous};
+
+assert_non_vacuous(
+    Counter::ChunksTranslated,
+    Scenario::new("scrolling a document already painted once", scroll_a_painted_document),
+    Scenario::new("the first paint of a fresh document", open_a_fresh_document),
+);
+```
+
+`cargo xtask skips` searches every test target in the workspace for calls to this function and fails
+the build for any skip counter that has none.
+
+## The latency trace
+
+The counters say how much work happened. The `Phase` spans say how long each stage took. Neither
+says anything about the wall time **between** one stage ending and the next beginning, or about the
+time an event spent waiting for a frame to be asked for. Those gaps are what a person means when
+they say an application feels slow.
+
+So the latency trace records **instants, not durations**. Every gap between two consecutive instants
+is visible whether or not anybody thought to name the thing that filled it.
+
+Turn it on with an environment variable and nothing else:
+
+```bash
+ZGUI_LATENCY=/tmp/trace.jsonl cargo run --release
+```
+
+The winit backend calls `start_epoch()` when the event loop starts and `flush()` every time the loop
+parks, so a desktop application needs no code change. The output is newline-delimited JSON, one
+object per mark:
+
+```json
+{"t":142900,"base_unix_ns":1785456583000000000,"stage":"b.why","note":"owed=1 spliced=1 noroot=false rebuild=false"}
+```
+
+Marks are named for the stage boundary they sit on: `loop.wake`, `evt.in`, `f.begin`, `f.restyle`,
+`f.boxes`, `b.why`, `f.layout`, `f.fragments`, `p.emit`, `p.draw`, `r.tables`, `r.vectors`,
+`r.plan`, `r.encoder`, `r.buffers`, `r.record`, `pres.out`, `f.end`, `wait.in`, `wait.out`.
+`docs/perf/endtoend.md` lists the full vocabulary in the order one turn produces them.
+
+The `r.record` mark has a note only when the upload belt allocated chunks. The note gives the
+allocation count for the `r.buffers` interval immediately before it. This turns an occasional
+**Update GPU buffers** spike into a specific growth or backlog signal instead of an undivided time.
+
+When nothing is listening a mark costs **one relaxed atomic load**. That only holds if the note is
+built after the check, so a note that allocates is written with `note_with`, which takes a closure:
+
+```rust
+use zgui_profile::latency;
+
+latency::mark("f.fragments");
+latency::note_with("f.restyled", || restyled.to_string());
+```
+
+A mark whose note is built before the enabled check is paid for on every frame of every run,
+recording or not, which makes the instrumentation part of what it is measuring.
+
+There is a second sink for a reader **inside** the process, because a tool drawing the shape of the
+frame on screen cannot read a file it is itself still writing. `latency::retain(n)` keeps the last
+`n` marks in a ring; `latency::recent()` returns them as `Recorded { stage, note, at_ns }`;
+`latency::retain(0)` stops. The capacity is fixed by the first non-zero call.
+
+## Measuring your own frames
+
+A window's interesting state exists only for the instant between the frame that produced it and the
+next frame that overwrites it. A **frame probe** is called once at the end of every frame and handed
+the window as it stands.
+
+```rust
+use std::cell::Cell;
+use std::rc::Rc;
+use zgui::prelude::*;
+use zgui::runtime::{FrameProbe, Window};
+
+/// Counts frames and remembers how many rectangles the last one redrew.
+#[derive(Default)]
+struct Frames {
+    frames: Cell<u64>,
+    rects: Cell<usize>,
+}
+
+impl FrameProbe for Frames {
+    fn frame_ended(&self, window: &Window) {
+        self.frames.set(self.frames.get() + 1);
+        self.rects.set(window.damage().len());
+    }
+}
+
+fn main() -> Result<(), zgui::Error> {
+    app()
+        .with_probe(Rc::new(Frames::default()))
+        .run(|| view! { column() })
+}
+```
+
+The trait has one required method and no return value. It takes `&self`, so a probe that wants to keep
+something writes it through a cell or a signal — which is also what lets one probe serve several
+windows. A probe that mutated the window would change the thing it was measuring, and a probe that
+could refuse a frame would be a second frame loop. `WindowOptions::probe` is an option and not a
+list: one seam, one occupant.
+
+What a probe can read off the `Window`:
+
+| Method | What it gives |
+|---|---|
+| `scene()` | the display list the frame built |
+| `damage()` | the rectangles the frame reported as needing redrawing |
+| `placements()` | what every coordinate system in the drawn frame resolves to |
+| `layout()` | the boxes, their results and their fragments |
+| `scroll()` | where every scroll container is scrolled to |
+| `content()` | the glyph tiles and decoded images this window draws from |
+| `renderer()` | the renderer, to ask it something directly |
+| `scale()` | how many device pixels there are to a CSS pixel |
+| `refresh_interval()` | how long one frame of this window's output lasts |
+| `declined_frames()` | offered frames refused for a reconfiguration that could not yet be seen |
+| `deferred_resizes()` | configures that moved the size with no pipeline run of their own |
+| `surface_configures()` | times the renderer was pointed at a new surface extent |
+| `is_occluded()` | whether the surface is entirely hidden |
+
+Nothing in the framework implements `FrameProbe`. The bundled inspector does, and an open inspector
+redraws every frame, because what it shows changes every frame.
+
+## Environment variables
+
+| Variable | Effect |
+|---|---|
+| `ZGUI_LATENCY=<path>` | writes the instant trace to `<path>` as newline-delimited JSON |
+| `ZGUI_FULL_DAMAGE=1` | every frame starts with the whole surface damaged |
+| `ZGUI_INVARIANTS=1` | turns on the checks that the element, box and fragment levels still agree, plus replay ownership and spatial dependencies |
+| `ZGUI_BENCH_GPU=1` | the bench harness draws through this machine's device offscreen instead of the null renderer |
+| `ZGUI_CADENCE_OUT=<path>` | where the two cadence probes write their report |
+
+`ZGUI_FULL_DAMAGE` exists so that "is this artefact a damage-tracking bug?" is one restart away from
+an answer. It is the first thing to try when a visual artefact is reported. `ZGUI_INVARIANTS` costs
+a lookup per distinct raster per replayed fragment, so it is opt-in rather than compiled in.
+
+<Callout type="warn">
+`ZGUI_GLYPH_MEMO`, `ZGUI_NO_RECONSTRUCT`, `ZGUI_PRESENT_MODE` and `ZGUI_PRE_PRESENT` appear in
+`docs/perf/*.md`. They were counterfactual patches, applied, measured and reverted. They do not
+exist in the tree.
+</Callout>
+
+## How cost scales
+
+Two results from `docs/perf/reference-workloads.md`, both measured on the shipped documents rather
+than on the probe.
+
+**A one-control update does no work proportional to the document — and still walks it.** At every
+one of the four sizes, a single-property change on one control of ten thousand restyles one element,
+lays out none, diffs six fragments, emits one primitive and takes one draw-order insertion. It also
+visits `controls + 17` nodes. That walk is the whole of the seventy-odd nanoseconds per control in
+the advisory table. `Counter::NodesVisited` exists for exactly this case: every other counter
+records work performed, so a traversal that touched ten thousand clean nodes to service one dirty
+one would satisfy all of them.
+
+**A glide over a virtualised list costs about nine tenths of repainting the same rows from their
+styles** (`LIST-glide` = 0.92). Carrying rows past a port is very nearly as expensive as drawing them
+again.
+
+The cliff is what virtualisation buys, and the numbers are worth reading twice:
+
+| Document | Cost per box | Boxes | Per frame |
+|---|---:|---:|---|
+| virtualised list, any row count | about 28 µs per **realised** box | 39 realised | about 1 ms |
+| unvirtualised, 10 000 rows | 287 ns per box at 70 007 boxes | 70 007 | about 20 ms |
+| unvirtualised, 20 000 rows | 5 660 ns per box at 140 007 boxes | 140 007 | **792 ms** |
+
+Every one of those numbers is true. Only the first is about a document somebody ships, which is the
+whole reason the probe is not a gate.
+
+`docs/perf/glide-split.md` puts the same finding another way: at 70 047 boxes a glide frame is
+7.25 ms on the maintainer's machine, so a rigid scroller crosses a 16.6 ms budget at roughly
+160 000 boxes, about 23 000 rows of that shape.
+
+A wheel over a virtualised list costs, per **model** row, between −1.7 and +2.5 ns — indistinguishable
+from zero, which is the point, and what `LIST-virtualisation-wheel` gates at ≤ 1.05 for eight times
+the data.
+
+## Next
+
+<Cards>
+  <Card
+    title="Writing fast interfaces"
+    href="/docs/performance/writing-fast-interfaces"
+    description="The practical rules that follow from the measurements on this page."
+  />
+  <Card
+    title="Caches"
+    href="/docs/performance/caches"
+    description="Every cache in the pipeline: what fills it, what invalidates it, what a miss costs."
+  />
+  <Card
+    title="The cost model"
+    href="/docs/performance/cost-model"
+    description="What each kind of change costs, with the numbers these gates hold in place."
+  />
+  <Card
+    title="Testing"
+    href="/docs/building/testing"
+    description="Driving an application headlessly and asserting on what it produced."
+  />
+</Cards>

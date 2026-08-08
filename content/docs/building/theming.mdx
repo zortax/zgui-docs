@@ -1,0 +1,736 @@
+---
+title: Theming
+description: Design tokens as CSS custom properties — declaring them on the root, light and dark palettes, switching at run time, and what a switch costs.
+---
+
+A **theme** is the set of decisions an interface makes about colour, spacing, roundness and type,
+held in one place instead of repeated in every rule. This page builds one from nothing, using no
+component library, and says what changing it costs per frame. It assumes
+[Styling](/docs/learn/styling) and [Attributes](/docs/learn/attributes).
+
+## A design token
+
+A **design token** is a named value that a decision is written against. The name says what the value
+is *for*; the value says what it is *today*.
+
+```css
+/* Not a token: the decision and the value are the same text, in every rule that repeats it. */
+.card  { background-color: #1b1e24 }
+.panel { background-color: #1b1e24 }
+
+/* A token: one decision, named, and two rules that follow it. */
+:root  { --surface-raised: #1b1e24 }
+.card  { background-color: var(--surface-raised) }
+.panel { background-color: var(--surface-raised) }
+```
+
+In zgui a token is a **custom property**: a name starting with `--`, holding arbitrary text, which
+inherits like `color` and is read back with `var()`. There is no token type, no registry and no
+build step. A token is a CSS value, so anything the engine parses is expressible as one.
+
+| A token holds | Example |
+|---|---|
+| a colour | `--surface: #14161a` |
+| a length | `--space-md: 12px` |
+| a radius | `--radius: 8px` |
+| a whole shorthand | `--shadow-card: 0 1px 2px rgba(0, 0, 0, 0.3)` |
+| a duration or a curve | `--ease-out: cubic-bezier(0, 0, 0.2, 1)` |
+| another token | `--accent-ink: var(--surface)` |
+
+## Declaring tokens on the root
+
+Tokens inherit, so one declaration on the topmost element reaches every element below it, with no
+selector matching anywhere else. `:root` is that element.
+
+```rust
+use zgui::prelude::*;
+
+const TOKENS: &str = css!(
+    ":root {
+        --surface: #ffffff;
+        --surface-raised: #f7f8fa;
+        --ink: #1c2024;
+        --ink-muted: #60646c;
+        --accent: #0090ff;
+        --accent-ink: #ffffff;
+        --danger: #e5484d;
+        --border: #d9d9e0;
+        --radius: 8px;
+        --space: 12px;
+    }"
+);
+```
+
+### Where the root is
+
+A window has a fixed tree shape before any view is built. The application's view goes under the
+root element, and so do the four overlay bands portalled content lands in.
+
+<TreeDiagram
+  label="Where root-level theme tokens are inherited"
+  items={[
+    {
+      title: 'root',
+      description: ':root matches this runtime-created element.',
+      children: [
+        {
+          title: 'overlay_root',
+          children: [
+            { title: 'Content band', code: 'data-layer=content' },
+            { title: 'Popover band', code: 'data-layer=popover' },
+            { title: 'Modal band', code: 'data-layer=modal' },
+            { title: 'Toast band', code: 'data-layer=toast' },
+          ],
+        },
+        { title: 'Your application view', description: 'Everything the view builds.' },
+      ],
+    },
+  ]}
+/>
+
+<Callout type="warn">
+Declare tokens on `:root`, not on your own outermost element. Content sent to an overlay band with
+`Portal` is a descendant of the **root**, not of your view. A menu, a dialog and a toast inherit
+tokens declared on `:root` and inherit nothing declared on the element your view starts with. See
+[Overlays and portals](/docs/building/overlays-and-portals).
+</Callout>
+
+A view cannot write attributes on the root element — the runtime owns it. So the root's tokens come
+from a style sheet, and the sheet is what a theme switch changes.
+
+## Reading a token
+
+```css
+.card {
+    background-color: var(--surface-raised);
+    color: var(--ink);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: var(--space);
+}
+```
+
+`var(--name, fallback)` supplies a value for the case where the name is not declared. A component
+that has to render before any theme is installed writes its own default there:
+
+```css
+.progress__fill { width: var(--progress-fraction, 0%) }
+```
+
+<Callout type="error">
+A `var()` that names an undeclared token is **not** an error anywhere. `css!` does not know property
+names, and the CSS parser accepts every `var()`. The declaration becomes invalid when the value is
+computed, and the property falls back to what it would have been with no declaration at all. A
+misspelt token name is therefore silent. Check the spelling in both places.
+</Callout>
+
+## Light and dark
+
+Two palettes, one set of names. Every rule in the interface reads the names, so switching palettes
+touches no rule.
+
+### The media-query route
+
+`prefers-color-scheme` is answered by the desktop's own setting. The window carries that setting
+into the cascade's device, tracks it while the program runs, and reads it before the **first** frame
+— so a program started on a dark desktop is dark in the frame it appears in, with no flash.
+
+```css
+:root {
+    --surface: #ffffff;
+    --ink: #1c2024;
+    --border: #d9d9e0;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --surface: #111113;
+        --ink: #edeef0;
+        --border: #363a3f;
+    }
+}
+```
+
+This route costs no Rust at all. No signal holds the scheme, no code decides it, and nothing has to
+be kept in step: the same media query the rest of the document is matched against gives the answer.
+What the flip itself costs is in [What a theme switch costs](#what-a-theme-switch-costs).
+
+<Callout type="info">
+The framework's scrollbar chrome follows the window's scheme too. Scrollbar colours are picked from
+the same light-or-dark answer rather than from CSS, so a dark desktop gets dark bars whatever your
+sheet says. See [Scrolling](/docs/building/scrolling).
+</Callout>
+
+### The class route
+
+The other route puts the two palettes behind a class your program toggles.
+
+```css
+:root {
+    --surface: #ffffff;
+    --ink: #1c2024;
+    --border: #d9d9e0;
+}
+
+.dark {
+    --surface: #111113;
+    --ink: #edeef0;
+    --border: #363a3f;
+}
+```
+
+```rust
+// Every element under this column reads the dark palette while `dark` answers true.
+column(class = "page", class:dark = move || dark.get()) {
+    box(class = "card") {
+        label {"Storage"}
+    }
+}
+```
+
+The class goes on an element your view owns, and the tokens then inherit **from that element down**.
+That is the route's one real limit: portalled content is not below it.
+
+### Which to use
+
+| | Media query | Class |
+|---|---|---|
+| Who decides | the desktop | your program |
+| Can be pinned to one palette | no — `App` exposes no method that sets the scheme | yes |
+| Can be remembered between runs | no | yes, it is your own state |
+| Reaches portalled content | yes, when declared on `:root` | only if the class is also on the portalled subtree |
+| Framework scrollbar chrome follows it | yes | no |
+| Costs while nothing changes | nothing | nothing |
+| Costs when it flips | the whole document restyles | the subtree under the class restyles |
+
+**The class route is the more predictable one.** It is a value your program holds, so it answers the
+same way every time, it can be persisted, and a user who wants dark on a light desktop can have it.
+The media query cannot be forced: there is no `App` method that sets the colour scheme, so an
+application that offers a theme choice cannot express that choice as a media query.
+
+The two combine. Declare the desktop's default with a media query, then let a class override it:
+
+```css
+:root { --surface: #ffffff; --ink: #1c2024 }
+
+@media (prefers-color-scheme: dark) {
+    :root { --surface: #111113; --ink: #edeef0 }
+}
+
+.light { --surface: #ffffff; --ink: #1c2024 }
+.dark  { --surface: #111113; --ink: #edeef0 }
+```
+
+The class rules have the same specificity as the `:root` rules and are written later, so they win
+where they apply.
+
+## Switching at run time
+
+Four items carry a sheet at run time. All of them are in the prelude, and
+[Styling](/docs/learn/styling) covers them in full.
+
+<TypeTable
+  type={{
+    'install_stylesheet(name, css)': {
+      description: 'Installs css under name at the author origin. Installing a name that is already installed replaces that sheet’s text and keeps its place in the cascade. Installing text that is already there does nothing.',
+      type: 'fn(&str, &str)',
+    },
+    'remove_stylesheet(name)': {
+      description: 'Removes the sheet installed under name. Removing a name that is not installed does nothing.',
+      type: 'fn(&str)',
+    },
+    'Stylesheet::install(name, css)': {
+      description: 'The same install, as a guard. Dropping the guard removes the sheet. None outside a window’s scope.',
+      type: 'fn(impl Into<String>, &str) -> Option<Stylesheet>',
+    },
+    'Stylesheet::replace(css)': {
+      description: 'Replaces the guarded sheet’s text, keeping its place in the cascade. Replacement never fails, even when the new text has errors.',
+      type: 'fn(&self, &str)',
+    },
+  }}
+/>
+
+A theme's text is **state**: it stops being true when the view that chose it goes away. That is what
+the guard is for. A component's own rules are the other case, and those belong to the component
+type, so `install_stylesheet` is right for them.
+
+```rust
+use zgui::reactive::RenderEffect;
+
+// `rule` builds the `:root { … }` text for one palette. Install once, replace on every change,
+// remove when this scope ends.
+let sheet = Stylesheet::install("tokens", &rule(dark.get_untracked()));
+
+let following = RenderEffect::new(move |previous: Option<()>| {
+    let css = rule(dark.get());
+    // The first run is the install above. Running it again would be a second identical write.
+    if previous.is_some()
+        && let Some(sheet) = sheet.as_ref()
+    {
+        sheet.replace(&css);
+    }
+});
+on_cleanup_local(move || drop(following));
+```
+
+The guard is captured by the effect, and the effect's handle is what the cleanup holds. Both live
+exactly as long as the scope that made them, so the sheet goes when the view does.
+
+`remove_stylesheet` is the matching operation for a sheet installed by name, and the case for it is
+an override that is only sometimes in force:
+
+```rust
+// A high-contrast override, on top of whatever the theme decided.
+let overriding = RenderEffect::new(move |_| {
+    if contrast.get() {
+        install_stylesheet("contrast", ":root { --border: #000000; --ink: #000000 }");
+    } else {
+        remove_stylesheet("contrast");
+    }
+});
+on_cleanup_local(move || drop(overriding));
+```
+
+Install an override **after** the theme sheet: sheets within one origin cascade in installation
+order, so the later one wins at equal specificity. Removing it puts the theme's own values back with
+no other change.
+
+### What each route costs
+
+| Route | What moves | Dependency filters that frame |
+|---|---|---|
+| class toggle | one class-list write on one element | **on** |
+| sheet replacement | the installed set of sheets | **off** |
+| media query | the device the cascade is built against | **off** |
+
+<Callout type="warn">
+A sheet installed, replaced or removed, and a device change that re-matched a media query, reach the
+document through the same gate. For the one frame in which that gate answers true, the **dependency
+filters are switched off** — the index that answers "could this mutation change any computed value"
+describes the previous sheets, so every mutation in that frame takes the full path. The tail of the
+same frame's restyle rebuilds the index.
+
+A class toggle passes through no such gate. Prefer it whenever the class can reach everything that
+needs it.
+</Callout>
+
+## Overriding one token on one element
+
+`var:--name` writes a custom property on a single element from a view. Because custom properties
+inherit, an override on a container re-tones the whole subtree with one declaration, and no rule is
+matched anywhere.
+
+```rust
+// One panel in an accent colour of its own. Every element inside it follows, because the
+// property inherits — including the elements whose rules were written long before this panel.
+column(class = "panel", var:--accent = "#8e4ec6") {
+    label(class = "panel__title") {"Danger zone"}
+    control(class = "btn", attr:data-tone = "accent") {"Delete"}
+}
+```
+
+The name must start with `--`; writing `var:accent` is a compile error. The value is reactive and
+takes `Option<String>`, so a computed token is a closure:
+
+```rust
+box(var:--space = move || Some(format!("{}px", spacing.get())))
+```
+
+<Callout type="info">
+An element that declares custom properties of its own repaints whenever the property map is
+reallocated, even when the values did not change. The identity test over-fires and never under-fires
+by design. Keep `var:` on the container that needs it, not on every element in a list.
+</Callout>
+
+## A component that follows the theme
+
+A themed component holds no colours. It holds a **variant table** that says which choices exist, and
+a **scoped sheet** that maps those choices onto tokens.
+
+### `variants!` for the visual axes
+
+`variants!` turns a set of visual axes into a type per axis, a stable class list, and one `data-`
+attribute per axis. Nothing computes a class name at run time and nothing branches on a variant in
+Rust.
+
+```rust
+variants! {
+    /// The visual choices a button offers.
+    pub ButtonVariants {
+        base: "btn",
+        tone: { Neutral => "", Accent => "", Danger => "" } = Neutral,
+        size: { Sm => "", Md => "" } = Md,
+    }
+}
+```
+
+A choice's class may be the empty string, which is what these are: the sheet selects on the
+attributes instead, so the whole appearance of a variant is one rule reading tokens.
+
+```css
+.btn {
+    padding: calc(var(--space) * 0.75) var(--space);
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+    background-color: var(--surface-raised);
+    color: var(--ink);
+}
+
+.btn[data-tone="accent"] { background-color: var(--accent); color: var(--accent-ink); border-color: transparent }
+.btn[data-tone="danger"] { background-color: var(--danger); color: var(--accent-ink); border-color: transparent }
+.btn[data-size="sm"]     { padding: calc(var(--space) * 0.4) calc(var(--space) * 0.75) }
+```
+
+The component writes the attributes the sheet selects on, and decides nothing else:
+
+```rust
+#[component]
+fn Button(
+    /// Which of the visual choices this button makes.
+    #[prop(optional)]
+    variants: ButtonVariants,
+    children: Children,
+) -> impl IntoView {
+    let [(_, tone), (_, size)] = variants.data_attributes();
+
+    view! {
+        control(class = variants.classes(), attr:data-tone = tone, attr:data-size = size) {
+            {children.into_view_once()}
+        }
+    }
+}
+```
+
+Three tones, two sizes, one palette, and a theme switch that touches none of it.
+[Styling](/docs/learn/styling) has the full generated API and the naming rules.
+
+### `style!` for rules that cannot collide
+
+`style!` gives a component a sheet whose class name is derived from the sheet's own text, so two
+components cannot collide on a class even when both call theirs `.title`.
+
+```rust
+style! { pub CardStyle =>
+    ":scope {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space);
+        padding: var(--space);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        background-color: var(--surface-raised);
+        color: var(--ink);
+    }"
+    ":scope > .title { font-weight: 600 }"
+    ":scope > .note  { color: var(--ink-muted) }"
+}
+```
+
+Every `:scope` is replaced at compile time with `.zs-` and eight hexadecimal digits, hashed from the
+name and the text. `.title` inside it is `.zs-xxxxxxxx > .title`, which no other component's sheet
+can reach.
+
+The tokens the sheet reads are declared **elsewhere**, on the root. That is the division of labour:
+a scoped sheet decides shape and which token to use, and the theme decides what the token is.
+
+<Callout type="error">
+`style!` installs nothing by itself. The component must call
+`install_stylesheet(name, CardStyle::CSS)` in its body **and** put `CardStyle::CLASS` on its root
+element, or it renders unstyled with no error anywhere.
+</Callout>
+
+## The framework's own `--zgui-*` properties
+
+The user-agent sheet refers to custom properties it does not define. System colours arrive that way
+rather than as a fork of the style engine, so a document with no theme installed has no ring colour
+rather than a wrong one.
+
+| Property | Read by | An application may set it |
+|---|---|---|
+| `--zgui-foreground` | the user-agent sheet's `:root { color: … }` | **yes** — a theme is expected to |
+| `--zgui-ring` | the user-agent sheet's `:focus-visible` outline colour | **yes** — a theme is expected to |
+| `--zgui-fill` | `vector` painting; defaults to the element's computed `color` | yes, per element or inherited |
+| `--zgui-stroke` | `vector` painting; absent means no stroke | yes |
+| `--zgui-stroke-width` | `vector` painting; defaults to 1 CSS pixel | yes, **absolute units only** — `em`, `rem` and `%` give no answer |
+| `--zgui-text-fill` | background painting; the only accepted value is the keyword `background` | yes |
+| `--zgui-selection`, `--zgui-selection-text` | nothing in this build | setting them has no effect |
+
+So the two lines that make a theme reach the framework's own rules are these, and a theme that omits
+them leaves the root `color` and the focus ring at their fallbacks:
+
+```css
+:root {
+    --zgui-foreground: var(--ink);
+    --zgui-ring: var(--accent);
+}
+```
+
+<Callout type="warn">
+`::selection` is inert. The selection band and the caret are drawn from the element's own computed
+`color` — the band at 30 % alpha, the caret at full alpha — so `--zgui-selection` and
+`--zgui-selection-text` change nothing. To change how a selection looks, change `color`.
+</Callout>
+
+## A token system, end to end
+
+Everything above, in one program. No component library is involved: this is what you would build to
+get what the bundled `zgui-ui-tokens` crate provides.
+
+```rust
+use zgui::prelude::*;
+use zgui::reactive::RenderEffect;
+
+/// One palette. Every field is CSS text, because a token is a CSS value.
+#[derive(Clone, Copy, PartialEq)]
+struct Tokens {
+    surface: &'static str,
+    surface_raised: &'static str,
+    ink: &'static str,
+    ink_muted: &'static str,
+    accent: &'static str,
+    accent_ink: &'static str,
+    border: &'static str,
+}
+
+impl Tokens {
+    const LIGHT: Self = Self {
+        surface: "#ffffff",
+        surface_raised: "#f7f8fa",
+        ink: "#1c2024",
+        ink_muted: "#60646c",
+        accent: "#0090ff",
+        accent_ink: "#ffffff",
+        border: "#d9d9e0",
+    };
+
+    const DARK: Self = Self {
+        surface: "#111113",
+        surface_raised: "#18191b",
+        ink: "#edeef0",
+        ink_muted: "#b0b4ba",
+        accent: "#3b9eff",
+        accent_ink: "#ffffff",
+        border: "#363a3f",
+    };
+
+    /// The palette as one rule, ready to install.
+    ///
+    /// The two `--zgui-*` names at the end are what carry the theme into the framework's own sheet.
+    fn rule(&self, selector: &str) -> String {
+        format!(
+            "{selector} {{ \
+             --surface: {surface}; --surface-raised: {raised}; \
+             --ink: {ink}; --ink-muted: {muted}; \
+             --accent: {accent}; --accent-ink: {accent_ink}; --border: {border}; \
+             --danger: #e5484d; --radius: 8px; --space: 12px; \
+             --zgui-foreground: {ink}; --zgui-ring: {accent}; }}",
+            surface = self.surface,
+            raised = self.surface_raised,
+            ink = self.ink,
+            muted = self.ink_muted,
+            accent = self.accent,
+            accent_ink = self.accent_ink,
+            border = self.border,
+        )
+    }
+}
+```
+
+The component that installs one and follows a signal:
+
+```rust
+#[component]
+fn Theme(
+    /// True when the dark palette is in force.
+    dark: Signal<bool>,
+    children: Children,
+) -> impl IntoView {
+    // A guard, because the text is state: it stops being true when this scope ends. Read
+    // untracked, because the effect below is what subscribes.
+    let initial = if dark.get_untracked() { Tokens::DARK } else { Tokens::LIGHT };
+    let sheet = Stylesheet::install("tokens", &initial.rule(":root"));
+
+    let following = RenderEffect::new(move |previous: Option<()>| {
+        let tokens = if dark.get() { Tokens::DARK } else { Tokens::LIGHT };
+        if previous.is_some()
+            && let Some(sheet) = sheet.as_ref()
+        {
+            // Replacing under the same name keeps the sheet's place in the cascade.
+            sheet.replace(&tokens.rule(":root"));
+        }
+    });
+    on_cleanup_local(move || drop(following));
+
+    view! { {children.into_view_once()} }
+}
+```
+
+A card that reads the tokens and nothing else:
+
+```rust
+style! { pub CardStyle =>
+    ":scope {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space);
+        padding: var(--space);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        background-color: var(--surface-raised);
+        color: var(--ink);
+    }"
+    ":scope > .title { font-weight: 600 }"
+    ":scope > .note  { color: var(--ink-muted) }"
+}
+
+#[component]
+fn Card(
+    /// The heading line.
+    #[prop(into)]
+    title: String,
+    children: Children,
+) -> impl IntoView {
+    // Unconditional: installing the same name twice does nothing, so a hundred cards install one
+    // sheet.
+    install_stylesheet("card", CardStyle::CSS);
+
+    view! {
+        column(class = CardStyle::CLASS) {
+            label(class = "title") {{title}}
+            {children.into_view_once()}
+        }
+    }
+}
+```
+
+And the program:
+
+```rust
+const PAGE: &str = css!(
+    // No `color` here: the theme sets `--zgui-foreground`, and the framework's own sheet
+    // colours the root from it.
+    "root { background-color: var(--surface); padding: 24px }
+     .page { gap: 16px; align-items: flex-start }
+     .switch {
+        padding: 8px 16px;
+        border-radius: var(--radius);
+        border: 1px solid var(--border);
+        background-color: var(--surface-raised);
+        color: var(--ink);
+     }
+     .switch:hover { background-color: var(--accent); color: var(--accent-ink) }"
+);
+
+fn main() -> Result<(), zgui::Error> {
+    app().with_title("Theming").with_stylesheet(PAGE).run(|| {
+        let dark = RwSignal::new(false);
+
+        view! {
+            Theme(dark = dark.into()) {
+                column(class = "page") {
+                    control(class = "switch", on:click = move |_| dark.set(!dark.get_untracked())) {
+                        {move || if dark.get() { "Light" } else { "Dark" }}
+                    }
+                    Card(title = "Storage") {
+                        text(class = "note") {"41 GB of 128 GB used"}
+                    }
+                }
+            }
+        }
+    })
+}
+```
+
+Read what changed when the button is pressed: one signal write and one sheet replacement. No
+component was rebuilt and no rule was rewritten. Neither `Card` nor the page sheet mentions a
+colour, which is why neither of them had to know a theme existed.
+
+## What a theme switch costs
+
+A switch is two separate questions: **how many elements restyle**, decided by the route, and **what
+each restyled element then owes**, decided by which properties actually moved.
+
+### How many elements restyle
+
+| Route | Restyled set | Why |
+|---|---|---|
+| the desktop's colour scheme | every element in the document | the device is rebuilt and the origins whose media queries mention the scheme have their rules re-collected. The repository records that count as "the honest cost of re-collecting a whole origin's rules" (`crates/zgui-style/tests/device.rs`) |
+| replacing the token sheet | every element under the selector the tokens are declared on — `:root` means the document | the rule the tokens live in changed, and the tokens inherit from there down |
+| a class toggled on a container | that container and its subtree | the class-list write invalidates what the theme selectors reach, and the tokens inherit from there down |
+
+Custom properties inherit, so the subtree is unavoidable in all three: an element whose inherited
+property map moved has to cascade again to find out whether anything it reads moved with it.
+
+None of the three relays anything out by itself. A device rebuild for a colour scheme changes no
+size, so nothing is marked for layout — unlike a scale-factor change, which marks every element.
+
+### What each element then owes
+
+| The tokens moved | Obligation | Layout moves? |
+|---|---|---|
+| a colour only | repaint | no |
+| a radius, a shadow, a transform | refragment, rehit, repaint | no |
+| a spacing or a `font-size` token | relayout, and reshape or rebreak as narrowed | yes |
+
+A colour change carries no damage annotation from the style engine at all. What catches it is the
+**paint key**: the addresses of the shared computed-value groups an element cascaded to. Two
+elements that cascaded to the same result share the same allocations, so the comparison is a handful
+of integer tests per element.
+
+Text is the case that could have been expensive and is not. A shaped paragraph stores an **index
+into a paint table** rather than a colour, so a theme that moves every text colour in the window
+rewrites a handful of table entries. No string is shaped again. Shaping costs more than line
+breaking, which is why that indirection exists.
+
+The repository holds a test for exactly this. It reads the colour off **every** glyph sprite in the
+display list, in the order the strings stack down the window, after a flip by each route — and then
+occludes and reveals the window, so that a paragraph left holding a stale brush slot shows itself
+(`crates/zgui-runtime/tests/theme_flip.rs`).
+
+### The rules that follow
+
+- Declare tokens once, on `:root`, so overlay content is themed by the same declaration.
+- Prefer a class toggle to a sheet replacement when the class can reach everything.
+- Prefer either to writing `style:` declarations from a view: an inline declaration is a new
+  declaration block to cascade and cannot be filtered.
+- Keep tokens on containers. An element that declares custom properties repaints when its property
+  map is reallocated, so declaring one per row of a long list pays per row.
+
+## Failure modes
+
+| What you see | Cause | Fix |
+|---|---|---|
+| a property is at its initial value and nothing is logged | `var()` names a token that is not declared | check the spelling in the sheet and in the declaration; there is no diagnostic for this |
+| the page is themed and an open menu is not | the tokens are declared on your own element, and portalled content is not below it | declare on `:root` |
+| `Stylesheet::install` answers `None` | it was called outside a window's scope | call it from a component body |
+| a `--zgui-stroke-width` in `em` or `%` does nothing | the framework reads that one as an absolute length | use `px`, `pt`, `in`, `cm`, `mm` or `pc` |
+| a rule that used to beat the theme sheet stopped beating it | the sheet was removed and re-added instead of replaced, which moves it to the end of its origin | install under the same name, or use `Stylesheet::replace`; both keep its place in the cascade |
+| a theme value is dropped and the rest of the sheet is fine | the value was assembled from text that is not a valid declaration | dropped declarations are logged; see below |
+
+One thing that is **not** a failure mode: a sheet installed while a view is being built is applied
+after the reactive flush and before the restyle, so a component that mounted this frame is styled by
+its own theme in the frame it appeared in. There is no unstyled first frame to work around.
+
+Dropped declarations and dropped rules are logged at parse time under the tracing target
+`zgui::css`, in release as well as in debug. A theme sheet that "does nothing" is worth checking
+there first.
+
+## Next
+
+<Cards>
+  <Card
+    title="Animation"
+    href="/docs/building/animation"
+    description="Transitions and keyframes, and what an animating frame costs."
+  />
+  <Card
+    title="Testing"
+    href="/docs/building/testing"
+    description="Driving a document headlessly and asserting on what it produced."
+  />
+  <Card
+    title="Tokens and theming in the component library"
+    href="/docs/component-library/tokens-and-theming"
+    description="The same idea, already built: the token names zgui-ui ships and its theme model."
+  />
+</Cards>

@@ -1,0 +1,138 @@
+---
+title: Vector and canvas
+description: Draw declarative vector documents or mutate an imperative retained shape scene.
+---
+
+`vector` and `canvas` both produce paths for the vector renderer. Use `vector` for a drawing that
+the view declares. Use `canvas` for a drawing that Rust code generates or mutates.
+
+## Declarative drawing with `vector`
+
+A vector element accepts path notation or a complete SVG document:
+
+```rust
+use zgui::prelude::*;
+
+const TICK: &str = "M20.5 7.1 L18.9 5.5 L9.6 14.8 L5.1 10.3 L3.5 11.9 L9.6 18.0 Z";
+
+view! {
+    vector(class = "icon", prop:d = TICK, prop:viewBox = "0 0 24 24")
+}
+```
+
+```css
+.icon { width: 24px; height: 24px; color: #6ea8ff; }
+.icon:hover { color: #ffb648; }
+```
+
+The content properties are:
+
+| Property | Value |
+|---|---|
+| `d` | One path per line |
+| `viewBox` | Minimum x, minimum y, width, and height |
+| `svg` | A complete SVG source string |
+
+When a view box exists, zgui scales the drawing uniformly to fit the content box and centers the
+unused axis. Without a view box, coordinates are CSS pixels from the content box's top-left
+corner. The drawing does not give the element an intrinsic size. Set its width and height in CSS.
+
+`currentColor` resolves to the vector element's computed `color`. Three inherited custom
+properties can override paint:
+
+| Property | Default |
+|---|---|
+| `--zgui-fill` | The computed `color` |
+| `--zgui-stroke` | No stroke |
+| `--zgui-stroke-width` | `1` CSS pixel |
+
+Use these custom properties. CSS declarations such as `fill: red` do not reach the vector
+pipeline.
+
+The SVG reader supports paths, shapes, fills, strokes, fill and clip rules, transforms, opacity,
+clip paths, gradients, `use`, symbols, and markers. It does not render SVG text, embedded images,
+filters, masks, patterns, or blend modes. A document that cannot be parsed draws nothing. If both
+`svg` and `d` exist, `svg` wins.
+
+For typed geometry, use `zgui::elements::vector()` with `paths`, `document`, `view_box`, `fill`,
+`stroke`, `stroke_width`, or `hit_shape`. `paths`, `document`, `view_box`, and `hit_shape` take
+plain values. Use a reactive `prop:d` or `prop:svg` closure when the source must change.
+
+## Imperative drawing with `canvas`
+
+A canvas holds a retained `Vec<Shape>`. Shapes use the same path, fill, stroke, gradient, and clip
+types as vector documents. They paint in list order.
+
+The closure form is the shortest option for a chart or generated drawing:
+
+```rust
+use zgui::canvas::{Brush, ShapeBuilder};
+use zgui::canvas::zgui_color::Color;
+use zgui::elements::{canvas, kurbo};
+use zgui::elements::kurbo::Shape as _;
+use zgui::prelude::*;
+
+let progress = RwSignal::new(0.6_f64);
+
+let view = canvas().class("meter").draw(move |cx| {
+    let width = f64::from(cx.size.width.0) * progress.get();
+    let height = f64::from(cx.size.height.0);
+    let path = kurbo::Rect::new(0.0, 0.0, width, height).to_path(0.1);
+    cx.scene.push(
+        ShapeBuilder::new(path)
+            .fill(Brush::Solid(Color::srgb(0.2, 0.5, 0.9, 1.0)))
+            .build(),
+    );
+});
+```
+
+The closure reruns when a signal that it reads changes and when the content-box size changes. Each
+run starts with an empty scene. `DrawCx::size` is in CSS pixels. `DrawCx::scale` gives device pixels
+per CSS pixel. The first run has a zero size because layout has not run. A size-dependent drawing
+settles after the first layout frame.
+
+The retained form is useful when event handlers update the scene:
+
+```rust
+let drawing = CanvasHandle::new();
+let view = zgui::elements::canvas().scene(&drawing);
+
+drawing.draw(|scene| {
+    scene.clear();
+    scene.push(shape);
+});
+```
+
+`CanvasScene` provides `clear`, `push`, `replace`, and `shapes`. Always mutate through
+`CanvasHandle::draw` on the UI thread. It increments the scene revision and wakes each bound
+element.
+
+For a background producer, clone the thread-safe `SceneHandle` from `CanvasHandle::scene()` and
+edit it off the UI thread. That edit increments the revision but does not wake the UI loop. Pair it
+with a signal update or a UI-side `CanvasHandle::draw` call.
+
+A canvas without a view box uses CSS-pixel coordinates. `.view_box(x, y, width, height)` uses the
+same uniform fit as `vector`. The user-agent sheet gives an unstyled canvas a 300 by 150 CSS-pixel
+box; application CSS can override it.
+
+Reuse an `Arc<BezPath>` with `ShapeBuilder::shared` when geometry stays the same. Stable allocation
+identity lets the rasterizer reuse its encoded geometry.
+
+## Rendering and caching
+
+Small solid shapes use a fast path when all these conditions are true:
+
+- The device-pixel bounds are at most 96 by 96.
+- The transform is translation only.
+- The shape has no local clip.
+- The shape has one solid fill or one solid stroke.
+
+zgui rasterizes the shape to a monochrome coverage mask and stores it in the shared atlas. The
+cache key includes the geometry, fill or stroke style, scale, and mask size. It excludes the colour
+and whole-pixel translation. You can recolour or move an icon without rasterizing its outline
+again. The same rule applies to eligible `canvas` shapes.
+
+Gradients, local clips, larger shapes, non-translation transforms, and shapes with both fill and
+stroke use the general vector rasterizer. The renderer packs disjoint pass regions into compact
+scratch space. GPU scratch size therefore follows the drawn regions, not the empty distance between
+them.

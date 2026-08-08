@@ -1,0 +1,35 @@
+---
+title: Media and drawing
+description: Choose between decoded images, declarative vectors, imperative canvases, and external GPU surfaces.
+---
+
+zgui has four elements for visual content. They use different input and rendering paths.
+
+| Element | Input | Use it for |
+|---|---|---|
+| `image` | PNG, JPEG, WebP, or GIF bytes | Photographs and raster assets |
+| `vector` | Path notation or an SVG document | Static or declarative vector art |
+| `canvas` | A retained list of paths that Rust code mutates | Charts, editors, and generated vector art |
+| `surface` | A wgpu texture from another renderer | Games, video, and GPU subsystems |
+
+All four are ordinary elements. CSS sets their box, border, clipping, opacity, transform, and paint
+order. The content is not a child subtree.
+
+`image` and `surface` are replaced elements. Their content can report a natural size or aspect
+ratio to layout. `vector` and `canvas` use the size that CSS gives them. An unstyled `canvas` is
+300 by 150 CSS pixels. An unstyled `vector` can have zero area.
+
+Choose the least expensive input that expresses the result:
+
+- Use [`image`](/docs/building/images) when the source is encoded raster data.
+- Use [`vector`](/docs/building/vector-and-canvas#declarative-drawing-with-vector) when the view can
+  declare the drawing.
+- Use [`canvas`](/docs/building/vector-and-canvas#imperative-drawing-with-canvas) when Rust code must
+  generate or mutate shapes.
+- Use a [`surface`](/docs/advanced/surfaces) when another renderer already produces a texture.
+- Build a [custom element](/docs/advanced/custom-elements) when one retained widget must measure
+  children and emit zgui render primitives.
+
+`vector`, `canvas`, and custom paths share the vector pipeline. A small solid path can use a cached
+coverage mask in the monochrome atlas. Other paths use the general vector rasterizer. An image uses
+the colour atlas. A surface stays in its own texture and is composited as an external quad.

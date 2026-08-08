@@ -1,0 +1,4 @@
+{
+  "title": "Performance",
+  "pages": ["cost-model", "caches", "measurements", "writing-fast-interfaces"]
+}

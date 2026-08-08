@@ -1,0 +1,165 @@
+---
+title: GPU surfaces
+description: Put textures from another wgpu renderer in the document, with framework-driven or producer-driven updates.
+---
+
+A `surface` is a replaced element whose pixels come from another renderer. Use it for a game view,
+a video frame, a PDF renderer, or another subsystem that already produces a wgpu texture.
+
+The standard `zgui::app()` wiring installs surface support. It also re-exports the matching wgpu
+version from `zgui::surface::wgpu`. Use that export so the producer and zgui use the same types and
+device.
+
+<Callout type="warn">
+`surface` is not a semantic container for a card, dialog, or menu. Use `box` for those structures.
+The `surface` element has texture content and `display: inline-block`.
+</Callout>
+
+There are two driving models.
+
+| Model | API | Best for |
+|---|---|---|
+| zgui drives | `surface().renderer(renderer)` | Work that draws on demand or at the display cadence |
+| Producer drives | `surface().source(&handle)` | Games, video, and producers with another thread or cadence |
+
+## Let zgui drive the renderer
+
+Implement `SurfaceRenderer`. zgui allocates a texture at the element's content-box size and calls
+`render` when the texture needs content.
+
+```rust
+use zgui::prelude::*;
+use zgui::surface::{SurfaceRenderCx, wgpu};
+
+struct Clear;
+
+impl SurfaceRenderer for Clear {
+    fn render(&mut self, cx: &mut SurfaceRenderCx<'_>) {
+        let mut encoder = cx.device.create_command_encoder(
+            &wgpu::CommandEncoderDescriptor { label: Some("preview") },
+        );
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("preview.clear"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: cx.view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLUE),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        cx.queue.submit([encoder.finish()]);
+    }
+}
+
+let view = zgui::elements::surface().class("preview").renderer(Clear);
+```
+
+The context provides the device, queue, texture, view, device-pixel size, scale factor, and frame
+timestamp. zgui calls `render` for the first visible content, after a visible resize, after device
+recovery, and after it recreates an idle texture.
+
+For animation, call `cx.request_animation_frame()` during each render that needs a next refresh.
+The request is one-shot. When the renderer stops requesting, zgui stops calling it.
+
+Override `format` when `Rgba8Unorm` is not suitable. Override `intrinsic` to return a
+`SurfaceIntrinsic` when the content has a natural size or ratio.
+
+## Let a producer drive the surface
+
+Create a cloneable `SurfaceHandle`, install an event sink, and bind the handle to an element:
+
+```rust
+use zgui::prelude::*;
+use zgui::surface::{SurfaceConfig, SurfaceEvent, SurfaceHandle};
+
+let handle = SurfaceHandle::new(SurfaceConfig::default());
+let producer = handle.clone();
+
+handle.set_events(move |event| {
+    match event {
+        SurfaceEvent::Attached { gpu, size, scale } => {
+            // Forward the device and initial size to the producer.
+        }
+        SurfaceEvent::Resized { size, scale } => {
+            // Reallocate when convenient.
+        }
+        SurfaceEvent::Visible(visible) => {
+            // Pause work while visible is false.
+        }
+        SurfaceEvent::DeviceLost { gpu } => {
+            // Recreate all textures on the replacement device.
+        }
+        SurfaceEvent::Detached => {
+            // Release producer resources.
+        }
+    }
+});
+
+let view = zgui::elements::surface().source(&producer);
+```
+
+The event sink runs on the UI thread during the frame. It must forward the event and return. Do not
+draw, block, or call back into zgui from the sink.
+
+Create textures on the `GpuShare` device from `Attached` or `DeviceLost`. After queueing the writes
+or render pass, call:
+
+```rust
+handle.present(std::sync::Arc::new(texture));
+```
+
+`present` is a latest-wins mailbox. If several textures arrive before a zgui frame, only the newest
+one is kept. An invisible surface leaves that newest texture in the mailbox and attaches it when the
+surface becomes visible. The call wakes the UI loop. The texture must be two-dimensional, single-sampled,
+filterable, and created with `TextureUsages::TEXTURE_BINDING`. It must belong to the device from the
+most recent `Attached` or `DeviceLost` event.
+
+The attached texture stays in use until a later texture replaces it. If the producer reuses
+textures, use at least two in rotation. Three is safer. You can also wait for
+`Queue::on_submitted_work_done` before reuse. Queue submissions before `present` are ordered before
+the zgui frame that samples the texture.
+
+## Size, visibility, and alpha
+
+`SurfaceConfig::intrinsic` gives layout an initial natural size or ratio. Call
+`handle.set_intrinsic` when this information changes. If a resize event arrives before the producer
+has new content, zgui scales the previous texture across the new box.
+
+A surface is visible only when the window is not occluded, its laid-out content box has non-zero
+size, and its fragment ink intersects the viewport. A producer-driven surface receives
+`SurfaceEvent::Visible` when this state changes. It does not receive resize events while invisible.
+
+After two seconds of continuous invisibility, maintenance releases a texture that zgui allocated
+for a callback renderer. It also detaches the content and its external registration. The next
+visible frame allocates the texture and calls `render` again. Maintenance never releases a texture
+that a producer supplied through `SurfaceHandle`; the producer owns that memory and decides when to
+free it.
+
+Set `SurfaceConfig::premultiplied` to describe the presented alpha. The default is `true`. When it
+is `false`, the compositor premultiplies while it samples.
+
+CSS controls the final box and composition:
+
+```css
+.preview {
+    width: 480px;
+    aspect-ratio: 16 / 9;
+    border-radius: 12px;
+    overflow: hidden;
+}
+```
+
+The surface moves, clips, transforms, and changes opacity like any other element. Its content is
+one external quad and does not enter the image atlas.
+
+`Window::embed_memory_report()` reports callback-owned and producer-owned texture bytes separately.
+Callback-owned bytes are part of zgui's device-memory budget. Producer-owned bytes are diagnostic
+only. Shared producer textures are counted once, including the attached texture and the newest
+mailbox texture. The byte count includes mip levels, block dimensions, and sample count.

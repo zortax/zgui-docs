@@ -1,0 +1,758 @@
+---
+title: Events
+description: Listeners, the complete event table, the handler argument, the capture and bubble path, hit testing, and what a dispatch costs.
+---
+
+Something happens to the interface — a press, a key, a wheel turn — and the framework calls the
+functions you attached to the elements it happened to. This page covers every event name, the
+argument a handler receives, and the path an event travels. It assumes
+[Views](/docs/learn/views), [Elements](/docs/learn/elements), [Signals](/docs/learn/signals) and
+[Control flow](/docs/learn/control-flow).
+
+## Attaching a listener
+
+A **listener** is a function attached to one element for one kind of event. The framework calls it
+when that kind of event reaches that element.
+
+```rust
+use zgui::prelude::*;
+
+#[component]
+fn Counter() -> impl IntoView {
+    let count = RwSignal::new(0);
+
+    view! {
+        row(class = "counter") {
+            text {{move || count.get().to_string()}}
+            control(
+                class = "button",
+                on:click = move |_| count.update(|n| *n += 1)
+            ) {
+                "+"
+            }
+        }
+    }
+}
+```
+
+The attribute is `on:` followed by an event name:
+
+<AnatomyDiagram
+  label="The parts of an event attribute"
+  parts={[
+    { value: 'on:', label: 'The event namespace.' },
+    { value: 'click', label: 'A snake_case event name.' },
+    { value: ':stop', label: 'Zero or more modifiers, each after its own colon.' },
+    { value: ' = move |ev| f(ev)', label: 'Any expression that is a function of the event.' },
+  ]}
+/>
+
+The handler's argument type is **inferred from the name**. `on:click` gives a pointer payload,
+`on:key_down` a key payload, and neither needs an annotation or a downcast. A misspelled name is a
+compile error with a suggestion:
+
+```text
+error: `on:clik` is not an event
+
+help: there is an event called `on:click`
+```
+
+<Callout type="info">
+`on:click` written with no `=` is also an error: `` `on:click` needs a handler: `on:click=…` ``.
+</Callout>
+
+### A component's callback prop is not a listener
+
+An element takes `on:click`. A component takes `on_click`, with an underscore, and the difference
+is not cosmetic.
+
+```rust
+control(on:click = f)     // a listener on an element
+Dialog(on_open_change = f) // an ordinary prop of a component
+```
+
+A listener is registered on a node in the document. It joins the dispatch path, an ancestor can see
+it coming, and a handler can stop it. A callback prop is a value passed to a Rust function. It has
+no node, no path and no phases; the component calls it directly. Naming them differently is what
+keeps the two from being confused for one another.
+
+A component **can** carry listeners through to the element it renders, using `#[prop(attrs)]` and a
+`{..attrs}` spread — see [Components](/docs/learn/components). Those really are listeners, on that
+element.
+
+## Every event
+
+Thirty-one names. `ev` is the handler's argument, which dereferences to the payload named here.
+
+| `on:` name | `ev` derefs to | Bubbles | Fires when |
+|---|---|---|---|
+| `pointer_down` | `PointerEvent` | yes | a button or contact goes down over the element |
+| `pointer_up` | `PointerEvent` | yes | a button or contact comes up over the element |
+| `pointer_move` | `PointerEvent` | yes | the pointer moves while over the element |
+| `pointer_enter` | `PointerEvent` | **no** | the pointer moves onto the element or one of its descendants |
+| `pointer_leave` | `PointerEvent` | **no** | the pointer moves off the element and all of its descendants |
+| `pointer_cancel` | `PointerEvent` | yes | the interaction is taken over and will produce no release |
+| `click` | `PointerEvent` | yes | the element is activated: a press and a release on it, or Enter or Space while it has focus |
+| `double_click` | `PointerEvent` | yes | nothing produces it today |
+| `context_menu` | `PointerEvent` | yes | a touch long press over the element, or an assistive technology asks for its menu |
+| `wheel` | `WheelEvent` | yes | a wheel notch or a scroll gesture arrives over the element |
+| `key_down` | `KeyEvent` | yes | a key goes down while the element has focus |
+| `key_up` | `KeyEvent` | yes | a key comes up while the element has focus |
+| `text` | `TextEvent` | yes | nothing produces it today |
+| `ime_start` | `ImeEvent` | yes | an input method takes over |
+| `ime_preedit` | `ImeEvent` | yes | the input method's provisional text changes |
+| `ime_commit` | `ImeEvent` | yes | the input method finishes and its text becomes real |
+| `ime_end` | `ImeEvent` | yes | the input method lets go, abandoning any provisional text |
+| `focus_in` | `FocusEvent` | yes | focus arrives at the element or one of its descendants |
+| `focus_out` | `FocusEvent` | yes | focus leaves the element and all of its descendants |
+| `drop` | `DropEvent` | yes | files are dropped on the window — aimed at the focused element, not at the drop point |
+| `input` | `ValueEvent` | yes | an edit changes an editable element's value |
+| `change` | `ValueEvent` | yes | focus leaves an element whose value changed since it was last settled |
+| `scroll` | `ScrollEvent` | **no** | the element's scroll offset changed during this frame |
+| `animation_start` | `AnimationEvent` | yes | a declared animation begins, after its delay |
+| `animation_iteration` | `AnimationEvent` | yes | one iteration ends and another begins |
+| `animation_end` | `AnimationEvent` | yes | the animation finishes on its own |
+| `animation_cancel` | `AnimationEvent` | yes | the animation stops before it finishes |
+| `transition_run` | `TransitionEvent` | yes | a transition is created and is waiting out its delay |
+| `transition_start` | `TransitionEvent` | yes | the transitioning value begins moving |
+| `transition_end` | `TransitionEvent` | yes | the value arrives |
+| `transition_cancel` | `TransitionEvent` | yes | the transition stops before the value arrives |
+
+The payload types live at `zgui::vocab`. You rarely name one: the deref does it.
+
+<Callout type="warn">
+Three entries do not reach a view today. `on:double_click` has no producer at all.
+`on:text` has none either — text reaches an editable element through key and input-method events,
+not through this. `on:context_menu` fires on a touch long press and on an accessibility request,
+and **not** on a right-click; read `ev.button == Some(PointerButton::Secondary)` in an
+`on:pointer_down` handler for that.
+</Callout>
+
+The same set is reachable at run time. `EventKind` is the enumeration behind the names, with
+`EventKind::ALL`, `name()`, `web_name()`, `payload_kind()`, `bubbles()`, `is_cancelable()`, a
+`FromStr` and a `Display`.
+
+## The handler argument
+
+A handler takes `&mut EventCx<'_, E>`, where `E` is the event's own type — `events::Click`,
+`events::KeyDown`, and so on. It dereferences to that event's payload.
+
+```rust
+on:key_down = move |ev| {
+    if ev.key == Key::Named(NamedKey::Escape) {   // through the deref
+        ev.stop_propagation();                     // a method on the context
+        close();
+    }
+}
+```
+
+### The fields
+
+<TypeTable
+  type={{
+    kind: { description: 'Which event this is.', type: 'EventKind' },
+    target: { description: 'The node the event was aimed at.', type: 'NodeId' },
+    current: { description: 'The node whose listener is running. Equal to target on the target leg.', type: 'NodeId' },
+    phase: { description: 'Which leg of the dispatch this is: Capture, Target or Bubble.', type: 'Phase' },
+    modifiers: { description: 'Which modifier keys were held. Four bits: shift, control, alt, meta.', type: 'Modifiers' },
+    timestamp: { description: 'When the event happened. Monotonic from process start; never a wall clock.', type: 'Timestamp' },
+  }}
+/>
+
+They are plain public fields, not accessors. The pair to keep straight is `target` and `current`:
+`target` never changes during a dispatch, and `current` is the element you are attached to.
+
+### The methods
+
+| Method | What it does |
+|---|---|
+| `payload()` | the whole payload as a `Payload`, whatever kind it is |
+| `bounds()` | the current node's box from the last completed frame |
+| `stop_propagation()` | the event travels no further **after this element's other listeners have run** |
+| `stop_immediate_propagation()` | the event stops at once; this element's remaining listeners do not run |
+| `prevent_default()` | the framework's own behaviour for this event does not happen |
+| `capture_pointer()` | route later pointer events to `current` until the button is released |
+| `release_pointer()` | end that capture early |
+| `request_focus(node)` | move focus to `node` once this dispatch has finished |
+| `synthesize(event)` | dispatch `event` on `current`, down the ordinary path |
+| `retype::<T>()` | re-view the same payload as a different event type |
+
+There is no `ev.stop()`, no `ev.default_prevented()` and no element-relative position.
+
+<Callout type="warn">
+`ev.bounds()` answers `None` in a real window. Only the test harness fills it in. To measure a
+pointer against an element, hold a `node_ref` and use `NodeRef::window_bounds()`.
+</Callout>
+
+### Commands are queued, not immediate
+
+`capture_pointer`, `release_pointer`, `request_focus` and `synthesize` do not act where you call
+them. A handler runs while the document is part-way through a change, so a command that took effect
+at once would re-enter that change. Each is appended to a queue and carried out after the dispatch
+it was issued in finishes. The queue is drained in at most eight rounds; a command still pending
+after that is dropped with a warning.
+
+<Callout type="warn">
+Commands issued from a handler for a **synthesised** event are discarded. `click`, `pointer_enter`,
+`pointer_leave`, `context_menu` and anything `ev.synthesize` produces are all synthesised, so
+`ev.request_focus(…)` inside an `on:click` handler does nothing today. Focus a node from a
+`NodeRef` instead: `node.focus()`.
+</Callout>
+
+### Naming a handler outside the view
+
+A closure written inline needs no annotation, because the element already told the compiler what
+its argument is. A closure bound to a `let` first is read before anything has said what it will be
+used for, and is then rejected at the element as *implementation of `Fn` is not general enough*.
+`handler` supplies the event at the binding:
+
+```rust
+let dismiss = handler(events::KEY_DOWN, move |ev: &mut EventCx<'_, events::KeyDown>| {
+    if ev.key == Key::Named(NamedKey::Escape) {
+        open.set(false);
+    }
+});
+
+view! {
+    box(on:key_down = dismiss) { "…" }
+}
+```
+
+`handler` returns its second argument unchanged and costs nothing at run time. The whole of it is
+the type the compiler now has.
+
+### Which scope a handler runs in
+
+The one it was written in. An event arrives from the platform and not from the reactive graph, so
+without care a handler would run with no owner: `use_context` would answer nothing and a signal
+created there would be dropped at once. The framework captures the owning scope **once**, when the
+listener is attached, and runs the handler inside it. So a handler behaves exactly as the component
+body does. See [Context](/docs/learn/context).
+
+## Listener modifiers
+
+Five, each written after the event name with its own colon. Order does not matter and they combine.
+
+| Modifier | Effect |
+|---|---|
+| `:capture` | register on the way down instead of on the way up |
+| `:prevent` | call `prevent_default()` before the handler body runs |
+| `:stop` | call `stop_propagation()` before the handler body runs |
+| `:once` | recorded on the registration; nothing acts on it |
+| `:passive` | recorded on the registration; nothing acts on it |
+
+```rust
+// Hear about a press anywhere below, before the element that was pressed does.
+box(on:pointer_down:capture = move |ev| pressed.set(Some(ev.target)))
+
+// Take the wheel over: the nearest scrolling ancestor does not move.
+box(on:wheel:prevent = move |ev| zoom.update(|z| *z += ev.delta.to_pixels(CssPx(16.0)).height.0))
+
+// Toggle without the surrounding row hearing the click.
+control(on:click:stop = move |_| open.update(|open| *open = !*open))
+
+// Parsed and stored; the listener still runs every time.
+control(on:click:once = move |_| start())
+
+// Parsed and stored; the framework does not act on the promise.
+scroll(on:wheel:passive = move |ev| last_phase.set(ev.phase))
+```
+
+<Callout type="warn">
+`:once` and `:passive` are <Status kind="partial">parsed and recorded, and no code reads them</Status>.
+A `:once` listener is **not** removed after it runs. Remove a listener yourself by rebuilding the
+element without it, or by dropping a `ListenerGuard` from `NodeRef::listen`.
+</Callout>
+
+An unknown modifier is a compile error naming all five. `:passive` with `:prevent` is a compile
+error too: `:passive` promises never to suppress the default behaviour and `:prevent` suppresses
+it.
+
+## Dispatch: capture, target, bubble
+
+### The path
+
+An element sits inside another element, which sits inside another, up to the root of the document.
+When an event happens, the framework works out which element it happened to — the **target** — and
+lists that element and every ancestor of it, root first. That list is the **path**.
+
+<TreeDiagram
+  label="An event path from the document root to its target"
+  items={[
+    {
+      title: 'root',
+      code: 'depth 0',
+      children: [
+        {
+          title: 'column',
+          code: 'depth 1',
+          children: [
+            {
+              title: 'row',
+              code: 'depth 2',
+              children: [
+                { title: 'control', code: 'depth 3 · event target' },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  ]}
+/>
+
+The path is built by walking the **document**, not the boxes the layout produced. An element with
+`display: contents` generates no box and is still on the path. Text nodes are not: a press on the
+text inside a button is a press on the button.
+
+### The three legs
+
+An event is delivered along that path three times over, and each pass is a **phase**.
+
+<Steps>
+
+<Step>
+
+**Capture** — down. Every element from the root to the one before the target, in that order. Only
+listeners registered with `:capture` run.
+
+</Step>
+
+<Step>
+
+**Target** — at the element the event was aimed at. Every listener on it runs, however it was
+registered: at the target there is no up or down to tell apart.
+
+</Step>
+
+<Step>
+
+**Bubble** — up. Every element from the one before the target back to the root. Only listeners
+**not** registered with `:capture` run.
+
+</Step>
+
+</Steps>
+
+Within one element and one leg, listeners run in the order they were attached.
+
+An event whose `bubbles()` is `false` skips the third leg only. The way down happens for **every**
+event, including `pointer_enter`, `pointer_leave` and `scroll`. That asymmetry is what a dismissable
+overlay depends on: it hears about a press anywhere beneath it, first, without the pressed element
+cooperating.
+
+```rust
+// A panel that closes when a press lands outside it.
+box(
+    class = "backdrop",
+    on:pointer_down:capture = move |ev| {
+        if !panel.contains(ev.target) {
+            open.set(false);
+        }
+    }
+) {
+    box(node_ref = panel, class = "panel") { "…" }
+}
+```
+
+### Stopping
+
+`stop_propagation()` ends the walk **after the current element's remaining listeners have run**.
+`stop_immediate_propagation()` ends it at once. The distinction matters because one element often
+carries two listeners — a wrapper's own behaviour and the application's handler — and the one that
+stops the event must not silently delete the other.
+
+Stopping is monotone. A later handler can never weaken an earlier stop.
+
+### Preventing the default
+
+Some events have behaviour of the framework's own, on top of any listener:
+
+| Event | What the framework does |
+|---|---|
+| `pointer_down` | focus the nearest focusable element on the path, itself included; press something unfocusable and focus goes away |
+| `pointer_up` | activate the element the press landed on, if the release is over it — dispatched as a `click` |
+| `wheel` | scroll the nearest scrolling ancestor, handing the remainder outward when it bottoms out |
+| `key_down` with Tab | move focus to the next element in sequence, or the previous one with Shift |
+| `key_down` with Enter or Space | activate the focused element — dispatched as a `click` |
+| `key_down` on an editable element | apply the edit, which takes the event away from every other default |
+
+`ev.prevent_default()` cancels it. It does **not** stop the walk; the two are separate questions.
+It is honoured only for a cancelable event: `pointer_down`, `pointer_up`, `pointer_move`, `click`,
+`double_click`, `context_menu`, `wheel`, `key_down`, `key_up`, `text`, `ime_start` and `drop`.
+Preventing anything else does nothing.
+
+<Callout type="info">
+A `click` is a synthesised activation, not a pointer release. `prevent_default()` in a
+`pointer_up` handler therefore cancels the click entirely — and Enter or Space on a focused element
+produces a real `click`, which is why a control written with only `on:click` is already operable
+from the keyboard.
+</Callout>
+
+### The geometry the path is built from
+
+Events are dispatched at the **start** of a frame, before that frame styles, lays out or paints. So
+the hit test reads the geometry the **last completed frame** produced. Three consequences:
+
+- **An element a handler just created cannot be hit in the same frame.** It has no box until this
+  frame lays out. It is still reachable by path — a listener on an ancestor, a focus-routed event —
+  and it becomes hit-testable on the next frame.
+- **A handler must never make layout run.** All the geometry it can see, including
+  `NodeRef::window_bounds()`, is last frame's.
+- **Events in one batch are settled between one another.** A window system hands over everything
+  that arrived while the last frame was drawn. After each event but the last, the framework runs the
+  reactive flush and drains the command queue. A press that opens a dialog and the Escape that
+  follows it in the same batch both work.
+
+A frame that moves content under a stationary pointer re-tests what is under it, so a control that
+slid out from under the cursor stops being hovered and one that slid under it starts.
+
+## Pointer events
+
+One vocabulary covers a mouse, a finger and a stylus. A control written against pointer events
+works under all three without being written twice.
+
+```rust
+pub struct PointerEvent {
+    pub id: PointerId,               // which pointer; PointerId::MOUSE is always 0
+    pub kind: PointerKind,           // Mouse | Touch | Pen | Unknown
+    pub primary: bool,               // the mouse, or the first finger down
+    pub position: Point<CssPx, Css>, // see below
+    pub button: Option<PointerButton>,
+    pub pressure: Option<f32>,       // 0 to 1, when the device reports it
+}
+```
+
+`PointerButton` is `Primary`, `Secondary`, `Middle`, `Back`, `Forward` or `Other(u16)`. A touch
+contact always carries `Some(PointerButton::Primary)`.
+
+`PointerKind::can_hover()` is true for `Mouse` and `Pen` and false for `Touch`. A control whose only
+affordance appears on hover is unreachable by a finger.
+
+### Coordinates
+
+`position` is in **CSS pixels from the window's top-left corner**, already divided by the surface's
+scale factor. There is no element-relative position on the payload.
+
+`NodeRef::window_bounds()` answers in **device pixels** in the same origin. Multiply the pointer by
+the scale to compare them:
+
+```rust
+let track_box = track.window_bounds()?;
+let x = ev.position.x.0 * track.scale();
+let fraction = (x - track_box.origin.x.0) / track_box.size.width.0;
+```
+
+### Enter and leave
+
+There is no `pointer_over` and no `pointer_out` in this vocabulary. There are two crossing events,
+and they behave the way `over`/`out` do not:
+
+- **`pointer_enter` and `pointer_leave` do not bubble.** They are dispatched **once per element that
+  crossed a boundary**, as separate events. A wrapper around a button hears about the pointer being
+  anywhere inside it, and does not hear it again from every child the pointer crosses on the way.
+- **Departures come first**, innermost outwards; then arrivals, outermost inwards. A handler asking
+  where the pointer is now is answered about now, not about the way there.
+- They are **queued**, and announced right after the dispatch that caused them.
+- An ancestor with `on:pointer_enter:capture` **does** hear a descendant's enter, because the way
+  down runs for every event.
+
+### Hover state
+
+`:hover` is a CSS state the framework writes for you, on the hovered element **and every ancestor of
+it** — the pointer is over all of them. Use it for anything visual and reach for the crossing events
+only when the reaction is not a style on that element.
+
+```css
+.button:hover { background-color: #2b3243; }
+```
+
+Moving between siblings writes only the difference. An element on both the old path and the new one
+is not touched at all. `:active` works the same way and is likewise a path, so a toolbar is
+`:active` while a button inside it is held.
+
+### Pointer capture
+
+A press on a slider's thumb must keep receiving moves after the pointer leaves the thumb. That is
+what capture is for. It is a routing rule of this framework's own, not an operating-system grab.
+
+```rust
+control(
+    class = "thumb",
+    on:pointer_down = move |ev| { ev.capture_pointer(); dragging.set(true); },
+    on:pointer_move = move |ev| if dragging.get() { set_from(ev.position) },
+    on:pointer_up = move |ev| { ev.release_pointer(); dragging.set(false); },
+)
+```
+
+While a capture is held, the path ends at the capturing element, so the event still travels down
+through that element's ancestors.
+
+<Callout type="warn">
+`ev.capture_pointer()` always captures the mouse. A handler cannot capture one touch contact today.
+</Callout>
+
+## Keyboard events
+
+`on:key_down` and `on:key_up` are aimed at the element that has **focus** — the one element of a
+window that keys are delivered to. With nothing focused, they are aimed at the root element, so a
+listener there is a window-wide shortcut.
+
+```rust
+pub struct KeyEvent {
+    pub key: Key,                   // layout applied, modifiers applied
+    pub key_without_modifiers: Key, // layout applied, modifiers not applied
+    pub physical: PhysicalKey,      // where the key is on the board
+    pub location: KeyLocation,      // Standard | Left | Right | Numpad
+    pub repeat: bool,               // held down, autorepeating
+}
+```
+
+`Key` is `Named(NamedKey)` for a key that means a name, `Character(SharedString)` for one that means
+text, `Dead(Option<char>)` for an accent awaiting the next key, `Other` for a standard name this
+vocabulary does not enumerate, or `Unidentified`.
+
+```rust
+column(
+    tabindex = Focus::Sequential,
+    on:key_down = move |ev| match &ev.key {
+        Key::Named(NamedKey::Enter) => submit(),
+        Key::Named(NamedKey::Backspace) => draft.update(|d| { d.pop(); }),
+        // Anything else is asked what text it inserts. This is the only reading that
+        // gets the space bar right: it is a named key whose text is one space.
+        key => if let Some(text) = key.inserted_text() {
+            draft.update(|d| d.push_str(text));
+        },
+    }
+)
+```
+
+`Modifiers` is four bits — `SHIFT`, `CONTROL`, `ALT`, `META` — with `shift()`, `control()`, `alt()`,
+`meta()` and `contains()`. Write a shortcut against `META` rather than against a key name: it is
+Super on Linux, Command on macOS and the Windows key on Windows.
+
+```rust
+on:key_down = move |ev| {
+    if ev.modifiers.contains(Modifiers::CONTROL) && ev.key.as_str() == Some("s") {
+        ev.prevent_default();
+        save();
+    }
+}
+```
+
+A repeat still fires `on:key_down`. The framework drops repeats for its **own** defaults, so
+holding Tab does not run through the whole document and holding Enter does not activate a button
+forty times.
+
+[Keyboard and focus](/docs/building/keyboard-and-focus) covers `NamedKey` and `KeyCode` in full,
+what makes an element focusable, traversal order, focus rings and focus traps.
+
+## Wheel and scroll
+
+Two different events. `on:wheel` is the input; `on:scroll` is the result.
+
+```rust
+pub struct WheelEvent {
+    pub delta: ScrollDelta,          // Lines { x, y } or Pixels(Size)
+    pub phase: ScrollPhase,          // Discrete | Started | Moved | Momentum | Ended
+    pub position: Point<CssPx, Css>,
+    pub id: PointerId,
+    pub kind: PointerKind,
+}
+```
+
+**A positive delta moves the scroll offset right and down**, so the content itself travels up and
+left across the screen. The delta arrives in the unit the device reported and is never converted for
+you: how far a line is depends on the used line height of the element that will be scrolled, which
+is not known until the container has been chosen. `ScrollDelta::to_pixels(line_height)` converts
+once you know it.
+
+A notched wheel reports `ScrollPhase::Discrete`; a trackpad reports `Started`, `Moved`, `Momentum`
+and `Ended`.
+
+```rust
+pub struct ScrollEvent {
+    pub offset: Point<CssPx, Css>,
+    pub content_size: Size<CssPx, Css>,
+    pub scrollport: Size<CssPx, Css>,
+}
+```
+
+`on:scroll` **does not bubble**. It is dispatched once per container that moved this frame, after
+the geometry has been composed and before painting, so a handler that repositions something is drawn
+in its final place in the same frame. A container that moved several times in one frame is reported
+once, from where it started to where it ended. `scrollable()` and `is_at_end_vertically()` answer
+the two questions a scroll handler usually has.
+
+[Scrolling](/docs/building/scrolling) covers the offset model, chaining, scrollbars and programmatic
+scrolling.
+
+## Hit testing
+
+**Hit testing** is the question "which element is under this point?". The answer decides the target,
+and therefore the whole path.
+
+The framework keeps an index beside the geometry the last frame produced. Each entry in it is one
+painted piece of one element, carrying its painting order, its rectangle, its corner radii, its clip
+chain and its `pointer-events` value. A query walks the index topmost first — **the last thing
+painted is the first thing hit** — and accepts the first entry that passes three tests, in order:
+
+<Steps>
+
+<Step>
+
+Its `pointer-events` value is `auto`.
+
+</Step>
+
+<Step>
+
+The point is inside its border box **and** not outside a rounded corner. A press on the square
+millimetre outside a rounded button's curve falls through to what is behind it.
+
+</Step>
+
+<Step>
+
+The point survives every clip its ancestors imposed, tested in the coordinate system each clip was
+measured in.
+
+</Step>
+
+</Steps>
+
+Nothing else. The index holds no styles and reads no store while answering, which is why a pointer
+move costs a tree descent rather than a walk over the document. There is no `z-index` rule of its
+own: painting order is carried on the entry, not derived at query time.
+
+An entry that belongs to **no** element does not end the search. The nearest element above it
+answers instead, which is what makes a press on the gap between two lines of a paragraph reach the
+paragraph.
+
+### `pointer-events`
+
+The CSS property `pointer-events` is supported with two answers: `auto`, the initial value, and
+anything else, which means "not hittable".
+
+```css
+.overlay-scrim { pointer-events: none; }
+```
+
+It is **inherited**, so a child of a `pointer-events: none` element is unhittable through its own
+computed value. It does not remove the element from painting, from geometry or from the
+accessibility tree — it only stops the element answering "what is under the pointer", so whatever is
+behind it answers instead. The framework's own sheet uses it twice: `:disabled` elements refuse
+pointer events, and the overlay bands refuse them so that a press in the empty part of an open
+popover's band still reaches the document beneath.
+
+## A control, built from primitives
+
+Click, hover and keyboard activation, with no component library involved.
+
+```rust
+use zgui::prelude::*;
+
+/// A switch that says what it does while the pointer is on it.
+#[component]
+fn Wifi() -> impl IntoView {
+    let on = RwSignal::new(false);
+    let hint = RwSignal::new(String::new());
+
+    view! {
+        column(class = "wifi") {
+            control(
+                class = "switch",
+                state:checked = move || on.get(),
+                a11y:role = Role::Switch,
+                a11y:label = "Wi-Fi",
+                on:click = move |_| on.update(|value| *value = !*value),
+                on:pointer_enter = move |_| hint.set("Space or Enter toggles".to_owned()),
+                on:pointer_leave = move |_| hint.set(String::new())
+            ) {
+                text {{move || if on.get() { "On" } else { "Off" }}}
+            }
+            text(class = "wifi__hint") {{move || hint.get()}}
+        }
+    }
+}
+
+const SHEET: &str = css!(
+    ".wifi { gap: 8px; }
+
+    .switch {
+        padding: 8px 20px;
+        border-radius: 999px;
+        border: 1px solid #2f3646;
+        background-color: #232936;
+        text-align: center;
+    }
+
+    .switch:hover { background-color: #2b3243; }
+    .switch:checked { background-color: #3b6cf6; border-color: #3b6cf6; }
+    .switch:focus-visible { outline: 2px solid #7aa2ff; outline-offset: 2px; }
+
+    .wifi__hint { font-size: 12px; color: #6b7689; }"
+);
+```
+
+Four things are doing work here, and three of them are free:
+
+- **`control` is focusable by nature.** `control`, `field` and `editor` can be reached by tabbing
+  without declaring anything. Any other element needs `tabindex = Focus::Sequential`.
+- **Keyboard activation needs no code.** Enter or Space on the focused element produces a real
+  `click`, down the same path a pointer's click takes. So does an assistive technology's activation
+  request. One `on:click` serves all three.
+- **Hover styling needs no listener.** `:hover` and `:focus-visible` are written into the document
+  by the framework; the sheet reads them.
+- **The crossing listeners earn their place** because the hint is written outside the control, where
+  no selector on the control can reach it.
+
+Adding a second control to the column makes Tab move between the two, in document order, with a
+focus ring on the one the keyboard reached and none on the one a click reached.
+
+## What a dispatch costs
+
+**Attaching a listener is a build-time cost, paid once.** Rebuilding an element **replaces** its
+listeners rather than adding to them, so an element written inside a closure that re-runs does not
+accumulate handlers. Storage is sparse: an element with no listeners carries none.
+
+**A dispatch walks one path, not the tree.** Resolving which listeners run is proportional to the
+depth of the target and the number of registrations on it, and it happens once, before any handler
+runs. Re-resolving mid-walk would re-enter the document's change batch. The buffers are reused, so
+dispatch allocates nothing after the first event.
+
+**A pointer move over a large document costs the crossing, not the document.** Measured over a
+1000-row table, one hover move restyles 2 elements, with 0 relayouts, 0 text reshapes, 0 hit-index
+rebuilds and fewer than 64 nodes visited (`crates/zgui-input/tests/hover.rs`). The whole crossing —
+delivering the move and settling every frame it causes — is measured at 207.78 µs on the
+maintainer's machine (`hover.crossing`, hover-storm, `docs/performance.md`).
+
+**A click that toggles one class is one frame's work.** Measured at 11.34 µs p50 over a document of
+1 851 boxes (`kitchen.click`, `docs/performance.md`).
+
+**A state write nothing matches costs nothing.** Writing `:hover` on an element that no rule
+mentions takes the cheap path and never reaches the style engine, which is why hover state is
+written up the whole path without that being expensive.
+
+**Between events in one batch, the framework polls an empty pool.** That is the cost of settling,
+and it is what a stream of pointer moves pays.
+
+## Next
+
+<Cards>
+  <Card
+    title="Attributes"
+    href="/docs/learn/attributes"
+    description="Every attribute namespace, what each lowers to, and which are reactive."
+  />
+  <Card
+    title="Keyboard and focus"
+    href="/docs/building/keyboard-and-focus"
+    description="Keys in full, what is focusable, traversal order, focus rings and traps."
+  />
+  <Card
+    title="Styling"
+    href="/docs/learn/styling"
+    description="css!, the cascade, selectors and pseudo-classes, and what a style change costs."
+  />
+</Cards>

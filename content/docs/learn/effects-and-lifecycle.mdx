@@ -1,0 +1,522 @@
+---
+title: Effects and lifecycle
+description: Running work by hand when state changes — RenderEffect, cleanup, stored values, node handles, and what happens at mount and unmount.
+---
+
+Almost everything a view does happens in a reactive hole the framework creates and owns. This page
+is about the rest: work you run yourself when a signal changes, and the exact moments a piece of
+interface arrives and goes away. It assumes [Signals](/docs/learn/signals), [Reactivity in
+views](/docs/learn/reactivity-in-views) and [Components](/docs/learn/components).
+
+## What a side effect is
+
+A **side effect** is work that changes something outside the reactive graph. Writing to the
+document, focusing a control, saving a setting to disk, sending a message on a socket.
+
+The framework already runs most of the effects an interface needs. A reactive hole —
+`text {{move || count.get().to_string()}}` — *is* an effect. It reads signals, writes a text node,
+and re-runs when what it read changes. You do not create it, store it or cancel it, because the
+view state owns it and the unmount drops it.
+
+So the question is never "how do I run an effect". It is "does this belong in a hole".
+
+| The work | Where it belongs |
+|---|---|
+| a value appearing in the document | a reactive hole |
+| a class, style or attribute following state | a reactive attribute |
+| a subtree appearing or going away | `if` or `for` |
+| focusing, scrolling, measuring or selecting in a node | an effect over a `NodeRef` |
+| a listener on a node this view did not create | an effect over a `NodeRef` |
+| something outside the process: a file, a socket, a device | an effect |
+| an object that is not reactive, kept in step with a signal | an effect |
+
+The dividing line: describe the document, and use a hole. Call something, and use an effect.
+
+<Callout type="warn">
+An effect that only writes a signal the view reads is nearly always a hole written the long way.
+It also costs a frame: the flush runs the effect, the write marks the view's holes, and those run
+in the frame after. Compute in a closure or a `Memo` instead.
+</Callout>
+
+## `RenderEffect`
+
+One effect type is published, and it is the one the view layer itself is built on.
+
+```rust
+use zgui::prelude::*;
+use zgui::reactive::{RenderEffect, flush};
+
+let count = RwSignal::new(1);
+let doubled = RwSignal::new(0);
+
+let effect = RenderEffect::new(move |_| doubled.set(count.get() * 2));
+
+assert_eq!(doubled.get(), 2);   // the first run happened inside the constructor
+count.set(21);
+assert_eq!(doubled.get(), 2);   // the write only marked the effect
+flush();
+assert_eq!(doubled.get(), 42);  // the frame's flush ran it
+```
+
+`flush()` stands in for a frame-loop flush here. An application never calls it. The loop has a main
+flush and can flush again between queued input events or after geometry observations.
+
+Three properties, all load-bearing:
+
+**The first run is immediate and synchronous.** It happens inside `RenderEffect::new`, before the
+constructor returns. That is what lets a dynamic part of a view hand its parent a real result
+rather than a hole to be filled on the next poll.
+
+**Every later run happens at the flush.** A write marks the effect and wakes its task; the frame
+runs it. Five writes between two frames cost one run.
+
+**The lifetime of the effect is the lifetime of its handle.** Dropping the handle stops the effect
+at that moment. It is not tied to the owner.
+
+### The previous value
+
+The closure takes what the previous run returned, as an `Option<T>`, and returns the value the next
+run will see. `None` on the first run. This is how an effect keeps state between runs without a
+cell beside it.
+
+```rust
+// Acts on the edge, not the level: only the run where the answer changed does anything.
+let watching = RenderEffect::new(move |was: Option<bool>| {
+    let leaving = closing.get();
+    if was != Some(leaving) && leaving {
+        start_exit();
+    }
+    leaving
+});
+```
+
+Every run of an effect disposes of the effect's own scope first, so a signal or a cleanup created
+inside the closure belongs to that one run.
+
+### The handle must be stored
+
+```rust
+let count = RwSignal::new(0);
+
+// Dropped at the end of the statement. It runs once and then never again.
+RenderEffect::new(move |_| println!("{}", count.get()));
+
+count.set(1);
+flush();   // prints nothing
+```
+
+`RenderEffect` is `#[must_use]`, so that statement warns. `let _ = RenderEffect::new(…);` does the
+same thing and warns about nothing.
+
+A `let` binding in a component body is not enough either. The body returns its view, the binding
+goes out of scope, and the effect stops before the first frame. Move the handle into a cleanup
+closure, which is the only thing in a component body that lives as long as the component:
+
+```rust
+use zgui::reactive::RenderEffect;
+
+#[component]
+fn ThemeToggle(dark: RwSignal<bool>) -> impl IntoView {
+    // Outside the document: the choice is written to disk whenever it changes.
+    let saving = RenderEffect::new(move |_| save_preference("dark", dark.get()));
+    // The effect now lives exactly as long as this component.
+    on_cleanup_local(move || drop(saving));
+
+    view! {
+        control(
+            class = "theme",
+            on:click = move |_| dark.update(|dark| *dark = !*dark)
+        ) {"Toggle theme"}
+    }
+}
+```
+
+`save_preference` is your own function. The effect exists because writing a file is not something
+a view can describe.
+
+### The whole API
+
+| Item | What it does |
+|---|---|
+| `RenderEffect::new(fun)` | `fun: impl FnMut(Option<T>) -> T + 'static`. Runs `fun` at once. |
+| `RenderEffect::new_with_value(fun, initial)` | The same, with the value the first run receives. |
+| `effect.with_value_mut(\|v\| …)` | Borrows the value the last run returned. `Option<U>`. |
+| `effect.take_value()` | Takes that value, leaving `None`. |
+| `RenderEffect::new_isomorphic(fun)` | Needs `Send + Sync`, and runs whether the engine's effects are compiled in or not. Rarely what you want. |
+
+The closure for `new` is **not** required to be `Send`. That is deliberate: an effect exists to
+touch node handles, listener guards and view state, none of which cross threads.
+
+## Why there is no plain `Effect`
+
+The reactive engine has an ordinary `Effect` type. zgui does not publish it.
+
+Its thread-safe constructors run the closure off the UI thread, where the document may not be
+touched. An effect that writes the document from there is a data race that compiles. Rather than
+document the hazard, the framework removes the name:
+
+```text
+error[E0433]: cannot find `Effect` in `zgui_reactive`
+ --> src/main.rs:5:20
+  |
+5 |     zgui_reactive::Effect::new_sync(|_: Option<()>| ());
+  |                    ^^^^^^ could not find `Effect` in `zgui_reactive`
+```
+
+That error is pinned by a compile-fail test in the repository, so it stays an error. Three other
+names are absent for the same reason: the engine's own `on_cleanup`, which requires a `Send + Sync`
+closure, unkeyed store indexing, and `batch`. The engine crate itself is not re-exported, so
+`Effect` cannot be reached around the side either.
+
+If you add `reactive_graph` to your own manifest to get at it, you get an effect that runs on
+another thread with no owner and no frame behind it. Use `RenderEffect`.
+
+<Callout type="info">
+There is no `untrack` and no `batch`. Use the `_untracked` read methods where not subscribing is
+the point. Batching is unnecessary: a write never runs anything synchronously, so every write
+between two flushes already coalesces into at most one run per observer.
+</Callout>
+
+## Cleanup
+
+```rust
+pub fn on_cleanup_local(cleanup: impl FnOnce() + 'static);
+```
+
+Registers work to run when the **owner current at registration** is disposed of. That is the
+component's own scope, or a branch's, or a row's.
+
+```rust
+use std::cell::Cell;
+use std::rc::Rc;
+use zgui::reactive::{Mounted, on_cleanup_local};
+
+let cancelled = Rc::new(Cell::new(false));
+
+let node = Mounted::new();
+node.with({
+    let cancelled = Rc::clone(&cancelled);
+    move || on_cleanup_local(move || cancelled.set(true))
+});
+
+assert!(!cancelled.get());
+node.unmount();
+assert!(cancelled.get());   // before `unmount` returned
+```
+
+When a cleanup runs:
+
+- the component, branch or row it was registered in unmounts;
+- the window closes;
+- the effect it was registered inside re-runs, because a run disposes of that effect's own scope
+  before the next one starts.
+
+A cleanup runs with **no owner current**. It runs once. Everything it needs must be captured when
+it is registered, not looked up when it fires.
+
+### Why `_local`
+
+The engine's `Owner::on_cleanup` requires `FnOnce() + Send + Sync`. A useful cleanup captures a
+node handle, a listener guard or an effect — all reference-counted, none of them `Send`.
+`on_cleanup_local` takes the closure without that bound, runs it on the thread that registered it,
+and panics rather than dropping it on another thread.
+
+This is the second of the three escapes from the engine's thread-safety bounds:
+
+| What is not `Send` | Escape |
+|---|---|
+| a signal's value | `RwSignal::<T, LocalStorage>::new_local(v)` |
+| a context value | `provide_local_context(v)` |
+| a cleanup closure | `on_cleanup_local(f)` |
+
+### What it refuses
+
+`on_cleanup_local` panics in debug builds when there is no current owner, and when it is called off
+the UI thread. In a release build with no owner there is no panic: the closure is dropped where it
+stands and whatever it was going to cancel is never cancelled.
+
+## `StoredValue`
+
+A `StoredValue<T>` is a value in the reactive arena that is **not tracked**. Reading it subscribes
+to nothing; writing it marks nothing.
+
+```rust
+use zgui::prelude::*;
+
+#[component]
+fn Slider(offset: RwSignal<f32>) -> impl IntoView {
+    // Where the press started. Two listeners share it; nothing displays it.
+    let origin: StoredValue<Option<f32>> = StoredValue::new(None);
+
+    view! {
+        box(
+            class = "slider",
+            on:pointer_down = move |ev| origin.set_value(Some(ev.position.x.0)),
+            on:pointer_move = move |ev| {
+                if let Some(start) = origin.get_value() {
+                    offset.set(ev.position.x.0 - start);
+                }
+            },
+            on:pointer_up = move |_| origin.set_value(None)
+        )
+    }
+}
+```
+
+| | Signal | `StoredValue` |
+|---|---|---|
+| A read subscribes | yes | no |
+| A write marks readers | yes | nothing happens |
+| `Copy` | yes | yes |
+| Freed when | the owner is disposed of | the owner is disposed of |
+| Read with | `get`, `with`, `read` | `get_value`, `with_value`, `read_value` |
+| Written with | `set`, `update`, `write` | `set_value`, `update_value`, `write_value` |
+| Holds | anything the interface shows | anything the interface does not show |
+
+The method names differ on purpose. A stored value read inside a reactive hole would be a bug that
+looks right on the first frame and never updates, so the two cannot be spelled the same way.
+
+`StoredValue::new(v)` requires `T: Send + Sync`. `StoredValue::new_local(v)` takes anything, and
+pins it to the creating thread — which is what a listener guard, a `NodeRef` or a boxed closure
+needs.
+
+Use it for a cached handle, a generation counter, a guard that has to be kept alive, or the
+imperative scratch state two listeners share.
+
+## Mount and unmount
+
+A component's whole lifetime is four moments. Nothing else happens to it.
+
+<Steps>
+
+<Step>
+
+**The body runs, inside a scope of its own.** `#[component]` wraps the function in that scope, so
+every signal, context, stored value and cleanup made in the body belongs to it. Any `NodeRef`
+created here is unbound: the elements do not exist yet.
+
+</Step>
+
+<Step>
+
+**The returned view is built.** Elements are created, attributes are applied, reactive holes take
+their synchronous first run, children are built. A `node_ref` attribute binds here, which is a
+signal write.
+
+</Step>
+
+<Step>
+
+**The built subtree is inserted into the document.** Styling, layout and paint follow in the same
+frame. Geometry exists only after that frame has completed.
+
+</Step>
+
+<Step>
+
+**Unmount.** The nodes go first, innermost outwards: each child unmounts, then the element's own
+bindings are dropped, then the node is detached. Then the scope is disposed of — child scopes
+first, then the cleanup closures in the order they were registered, then everything the scope
+allocated in the arena.
+
+</Step>
+
+</Steps>
+
+**All of the unmount is synchronous, in the same frame.** When the call that removed the view
+returns, the timers are cancelled, the observers are deregistered, the effects have stopped and the
+signals are gone. Nothing waits for a later collection pass. This is what makes it safe for a
+cleanup to hold the last reference to something the next frame must not see.
+
+<Callout type="error">
+Reading a signal after its owner was disposed of panics, in every build. It is the one reactive
+operation that is not forgiving. A `NodeRef` is the exception — every read on it goes through a
+fallible path, so a handle whose view is gone answers `None` rather than panicking.
+</Callout>
+
+## `NodeRef`
+
+A **node** is one element in the document, and it has an identity the framework can address. A
+`NodeRef` is a handle on that identity: the escape hatch for the few things a view cannot describe,
+only ask for.
+
+```rust
+use zgui::prelude::*;
+use zgui::reactive::RenderEffect;
+
+/// A search box that takes focus the moment it appears.
+#[component]
+fn Search(open: Signal<bool>) -> impl IntoView {
+    let input = NodeRef::new();
+
+    // Both reads track: the effect re-runs when the panel opens, and again when the element
+    // it names comes into being. `get()` is `None` until then.
+    let focusing = RenderEffect::new(move |_| {
+        if open.get() && input.get().is_some() {
+            input.focus();
+        }
+    });
+    on_cleanup_local(move || drop(focusing));
+
+    view! {
+        if move || open.get() {
+            row(class = "search") {
+                field(class = "search__input", node_ref = input)
+            }
+        }
+    }
+}
+```
+
+`NodeRef` is `Copy`, so it goes into as many closures as you need. It belongs to the scope that
+created it, and the handle it holds is written when the element is built. That write is what an
+effect waits on, and it is the answer to "how do I do something once this is mounted": read
+`get()` in an effect and act when it is `Some`.
+
+<Callout type="warn">
+`is_bound()`, `bounds()` and every other getter read **without** tracking. Only `get()` subscribes.
+An effect that waits for a binding must read `get()`, or it runs once with an empty handle and
+never again.
+</Callout>
+
+### Identity
+
+| Method | Answers |
+|---|---|
+| `NodeRef::new()` | an unbound handle, owned by the current scope |
+| `get() -> Option<NodeId>` | the node. **Tracks.** `None` before the bind and after the view is gone |
+| `get_untracked() -> Option<NodeId>` | the same, without subscribing |
+| `is_bound() -> bool` | whether it names a node right now |
+| `contains(other: NodeId) -> bool` | whether `other` is this node or sits inside it |
+| `precedes(other: NodeId) -> bool` | whether this node comes first in tree order |
+| `window_root() -> Option<NodeRef>` | a handle on the root element of this node's window |
+
+### Geometry, as of the last completed frame
+
+Every geometry answer describes the last frame that finished. Layout cannot be read during a build
+both correctly and cheaply, so it is not offered.
+
+| Method | Answers |
+|---|---|
+| `bounds() -> Option<Rect<DevicePx, Device>>` | the box, with its origin **inside the parent's border box** |
+| `window_bounds() -> Option<Rect<DevicePx, Device>>` | the same box in window space |
+| `scale() -> f32` | device pixels per CSS pixel. `1.0` when unbound |
+| `text_content() -> String` | every character this subtree contributes, in order |
+| `scroll_position() -> ScrollPosition` | offset, content extent and visible extent |
+| `scroll_offset() -> Point<DevicePx, Device>` | the offset alone |
+| `running_animations() -> usize` | how many animations and transitions are running on it |
+
+<Callout type="error">
+A pointer event reports its position in CSS pixels, in window space. `bounds()` answers in device
+pixels relative to the parent. Comparing the two is the classic mistake. Use `window_bounds()`, and
+multiply the pointer position by `scale()`:
+
+```rust
+let track_box = track.window_bounds()?;
+let x = ev.position.x.0 * track.scale();
+let fraction = (x - track_box.origin.x.0) / track_box.size.width.0;
+```
+</Callout>
+
+### Asking a node to do something
+
+| Method | Effect |
+|---|---|
+| `focus()` | moves focus to this node |
+| `scroll_to(target, behavior)` | asks for a scroll |
+| `set_value(&str)` | puts text in an editable node. Text it already holds does nothing |
+| `selection() -> Option<Range<usize>>`, `set_selection(range)`, `select_all()` | the selection in an editable node |
+| `focusables() -> Vec<NodeId>` | focusable descendants, in traversal order |
+| `focus_move(direction) -> Option<NodeId>` | moves focus inside this subtree |
+| `trap_focus(options) -> Option<FocusTrap>` | confines traversal to this subtree until the guard drops |
+| `listen(event, options, handler) -> Option<ListenerGuard>` | attaches a listener for as long as the guard is held |
+
+An unbound handle answers rather than failing: `None`, `""`, `1.0`, `false`, or the default. There
+is nothing to check before calling.
+
+`listen` exists for the one case `on:` cannot cover — a listener on a node this view did not
+create, reached through `window_root()`. Dropping the returned guard removes the listener at once,
+so the guard belongs in a `StoredValue` or in the effect's own returned value.
+
+### Geometry as a reactive input
+
+Three observations turn a measurement into a signal. Each is written during the frame that changed
+it, before anything is painted, so a view that positions itself from what it measures is painted in
+its final place in that same frame.
+
+```rust
+#[component]
+fn Ruler() -> impl IntoView {
+    let track = NodeRef::new();
+    let size = track.observe_content_size();
+
+    view! {
+        column {
+            box(class = "ruler__track", node_ref = track)
+            text {{move || format!("{:.0} px", size.get().width.0)}}
+        }
+    }
+}
+```
+
+| Method | Signal |
+|---|---|
+| `observe_border_box()` | `Signal<Option<Rect<DevicePx, Device>>, LocalStorage>` |
+| `observe_content_size()` | `Signal<Size<DevicePx, Device>, LocalStorage>` |
+| `observe_scroll()` | `Signal<ScrollPosition, LocalStorage>` |
+| `observe_border_box_while(active)` and the other two `_while` forms | the same, watched only while `active` answers true |
+
+An observation is refcounted per node and per quantity: however many callers share one, the frame
+pays for one. The share is taken **when the handle binds**, not when `observe_*` is called, which is
+what lets a component body observe an element it has not built yet. `active` is read reactively, so
+a view that is on screen some of the time costs the frame only while it is.
+
+## The startup canary
+
+```rust
+fn main() -> Result<(), zgui::Error> {
+    assert!(zgui::reactive::effects_are_enabled());
+
+    app().with_title("Editor").run(|| view! { Editor() })
+}
+```
+
+`effects_are_enabled()` builds a real effect, writes a signal it reads, flushes, and reports
+whether it re-ran.
+
+It catches one configuration mistake, and that mistake has no other symptom. The reactive engine
+compiles effects behind a cargo feature. Cargo unifies features across the whole dependency graph,
+so another crate that depends on the engine without that feature can resolve it away for everyone.
+Nothing fails to build. The window opens, the layout is right, input is accepted — and then every
+view ignores every change to every signal for the rest of the process's life.
+
+The check runs in microseconds. The alternative diagnosis is bisecting a dependency graph while
+looking at a window that will not repaint.
+
+## Failure modes
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| The effect runs once at build and never again. | The handle was dropped. `RenderEffect::new(…);` as a statement, `let _ = …`, or a `let` in a component body. | Move the handle into `on_cleanup_local(move \|\| drop(effect))`. |
+| Nothing reactive works anywhere, and nothing warns. | The engine's effects were resolved away by another crate in the graph. | `assert!(effects_are_enabled())` at startup, then fix the manifest. |
+| The effect keeps running after its component is gone. | The handle is held by something that outlives the component: a context, a global, a parent's `StoredValue`. | Keep the handle in the scope whose lifetime it should have. |
+| Memory grows by one entry per mount. | The same thing: every mount adds a handle to a collection nothing empties. | The same fix. Assert on the collection's length in a test. |
+| Panic: `Dereferenced SendWrapper<T> variable from a thread different to the one it has been created with.` | Something local-storage was touched off the UI thread — usually an effect reached from the engine crate directly, which runs there. | `RenderEffect`, whose runs are all on the UI thread. |
+| A cleanup never runs, in release only. | It was registered with no current owner. In debug this panics; in release the closure is dropped where it stands. | Register it in a component body, not in a global or a worker thread. |
+| The log reports a task that exhausted its budget, once, at error level. | Two effects write each other's sources. The flush polls one task at most 8 times in a release build and 32 in a debug build (`crates/zgui-reactive/src/executor/budget.rs`), then sets it aside. | Break the cycle. Derive one of the two values instead of writing it. |
+| An effect's write shows up one frame late. | Expected. The flush runs the effect; what it wrote is serviced by the next frame. | Write from the listener, or compute in a hole. |
+
+## Next
+
+<Cards>
+  <Card
+    title="Context"
+    href="/docs/learn/context"
+    description="Owners in full, and passing a value down the tree without threading it through props."
+  />
+  <Card
+    title="UI tasks and timers"
+    href="/docs/learn/async-and-timers"
+    description="Run scoped UI tasks, cancel them, and schedule callbacks."
+  />
+</Cards>

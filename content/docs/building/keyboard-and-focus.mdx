@@ -1,0 +1,919 @@
+---
+title: Keyboard and focus
+description: Key events and the three readings of a press, assembling text by hand, what is focusable, traversal order, focus rings, programmatic focus and focus traps.
+---
+
+Every key press arrives at one element: the one that has focus. This page covers the key payload
+and the three readings on it, what makes an element focusable, the order the keyboard travels in,
+and how to confine that travel to a dialog. It assumes the whole of
+[the guide](/docs/learn/views), and in particular [Events](/docs/learn/events) and
+[Elements](/docs/learn/elements).
+
+## Keyboard events
+
+Three names carry a key. Two of them fire.
+
+| `on:` name | `ev` derefs to | Bubbles | Cancelable | Fires when |
+|---|---|---|---|---|
+| `key_down` | `KeyEvent` | yes | yes | a key goes down, including an autorepeat |
+| `key_up` | `KeyEvent` | yes | yes | the key comes up |
+| `text` | `TextEvent` | yes | yes | <Status kind="planned">nothing produces it</Status> |
+
+A key event is aimed at the **focused element**. With nothing focused it is aimed at the root
+element, so a listener there is a window-wide shortcut. From the target it travels the ordinary
+capture, target and bubble path, so an ancestor hears every key its descendants receive.
+
+Composition events (`on:ime_start`, `on:ime_preedit`, `on:ime_commit`, `on:ime_end`) are aimed the
+same way. Focus events (`on:focus_in`, `on:focus_out`) are aimed at the element that gained or lost
+focus. Both sets are covered further down.
+
+### The payload
+
+```rust
+pub struct KeyEvent {
+    pub key: Key,                   // layout applied, modifiers applied
+    pub key_without_modifiers: Key, // layout applied, modifiers not applied
+    pub physical: PhysicalKey,      // where the key is on the board
+    pub location: KeyLocation,      // Standard | Left | Right | Numpad
+    pub repeat: bool,               // produced by the key being held down
+}
+```
+
+Three descriptions of one press sit side by side. Match on the one that fits the decision:
+
+| Decision | Read | Why |
+|---|---|---|
+| what text to insert | `key` | the layout and the modifiers both apply: shift-a is `A` |
+| which shortcut this is | `key_without_modifiers` | a shortcut bound to the printed keycap stays bound to it when a modifier would remap the key |
+| where the finger is | `physical` | a chord chosen for where the keys sit, not for what they type |
+
+`location` tells two same-named keys apart: the left and right shift, the numpad enter.
+
+### A shortcut that works whatever has focus
+
+A key event bubbles from the focused element to the document root, so a listener on the outermost
+element of your view hears every key aimed anywhere inside it:
+
+```rust
+column(
+    class = "app",
+    on:key_down = move |ev| {
+        if ev.modifiers.control() && ev.key_without_modifiers.as_str() == Some("k") {
+            ev.stop_propagation();
+            palette.set(true);
+        }
+    }
+) { … }
+```
+
+Content rendered through a `Portal` is the exception. It lives under the window's overlay root,
+which is beside your view rather than inside it, so its keys never pass through that listener. To
+reach the real root, take `NodeRef::window_root()` and attach with `NodeRef::listen`, which hands
+back a `ListenerGuard` you have to hold for as long as the listener should live.
+
+## `Key`
+
+`Key` is what a press **means** under the layout in force.
+
+| Variant | Holds | Example |
+|---|---|---|
+| `Key::Named(NamedKey)` | a key whose meaning is a name | Enter, Escape, ArrowLeft, F5 |
+| `Key::Character(SharedString)` | exactly the text the key produces | `"a"`, `"é"`, a ligature |
+| `Key::Dead(Option<char>)` | an accent waiting for the next key | the acute on a French layout |
+| `Key::Other(SharedString)` | a standard name this vocabulary does not enumerate | `"TVPower"` |
+| `Key::Unidentified` | the platform could not identify the key | |
+
+`Character` holds a string and not a `char`, because one press can produce several characters.
+`Other` is why nothing is lost: a key outside the enumerated set still arrives under its standard
+name and is still matchable.
+
+| Method | Answers |
+|---|---|
+| `as_str() -> Option<&str>` | the standard value: the name for a named key, the text for a character key |
+| `inserted_text() -> Option<&str>` | the text this key inserts, and nothing for a key that means a name |
+| `is_modifier() -> bool` | whether this is a modifier held alongside another key |
+| `Key::character(text)` | builds a `Character` |
+
+`Key` is `#[non_exhaustive]`, so match with a final arm.
+
+### `NamedKey`
+
+The enumerated names, `#[non_exhaustive]`, with `NamedKey::ALL`, `as_str()`, `is_modifier()`,
+`is_navigation()`, a `FromStr` and a `Display`.
+
+| Group | Members |
+|---|---|
+| modifiers (`is_modifier()`) | `Alt`, `AltGraph`, `CapsLock`, `Control`, `Fn`, `FnLock`, `NumLock`, `ScrollLock`, `Shift`, `Meta`, `Symbol`, `SymbolLock`, `Hyper`, `Super` |
+| whitespace | `Enter`, `Tab`, `Space` |
+| navigation (`is_navigation()`) | `ArrowDown`, `ArrowLeft`, `ArrowRight`, `ArrowUp`, `End`, `Home`, `PageDown`, `PageUp` |
+| editing | `Backspace`, `Clear`, `Copy`, `Cut`, `Paste`, `Delete`, `Insert`, `Redo`, `Undo` |
+| general | `Cancel`, `ContextMenu`, `Escape`, `Execute`, `Find`, `Help`, `Pause`, `Play`, `Select`, `PrintScreen`, `Again`, `Props` |
+| input methods | `Accept`, `Compose`, `Convert`, `NonConvert`, `ModeChange`, `Process`, `NextCandidate`, `PreviousCandidate`, `AllCandidates`, `HangulMode`, `HanjaMode`, `KanaMode`, `KanjiMode`, `Hiragana`, `Katakana`, `ZenkakuHankaku` |
+| browser | `BrowserBack`, `BrowserForward`, `BrowserRefresh`, `BrowserSearch`, `BrowserHome` |
+| device | `MediaPlayPause`, `MediaStop`, `MediaTrackNext`, `MediaTrackPrevious`, `AudioVolumeDown`, `AudioVolumeUp`, `AudioVolumeMute`, `BrightnessDown`, `BrightnessUp` |
+| function | `F1` through `F24` |
+
+`as_str()` answers the standard key value, which is the name for every member **except one**:
+`NamedKey::Space.as_str()` is `" "`. That single exception is what the next section is about.
+
+### `PhysicalKey` and `KeyCode`
+
+`PhysicalKey` is where the key **is**, with no layout applied at all.
+
+```rust
+pub enum PhysicalKey {
+    Code(KeyCode),        // a position this vocabulary enumerates
+    Unidentified(u32),    // a position it does not, carrying the platform's own number
+}
+```
+
+`PhysicalKey::code() -> Option<KeyCode>` unwraps the first case, and `KeyCode` implements
+`From` into `PhysicalKey`.
+
+`KeyCode` names describe a standard layout. On a Dvorak keyboard the key labelled `.` is still
+`KeyCode::KeyE`, because that is where the key sits. The groups:
+
+| Group | Members |
+|---|---|
+| writing | `Backquote`, `Backslash`, `BracketLeft`, `BracketRight`, `Comma`, `Digit0`–`Digit9`, `Equal`, `IntlBackslash`, `IntlRo`, `IntlYen`, `KeyA`–`KeyZ`, `Minus`, `Period`, `Quote`, `Semicolon`, `Slash` |
+| control | `AltLeft`, `AltRight`, `Backspace`, `CapsLock`, `ContextMenu`, `ControlLeft`, `ControlRight`, `Enter`, `MetaLeft`, `MetaRight`, `ShiftLeft`, `ShiftRight`, `Space`, `Tab` |
+| input methods | `Convert`, `KanaMode`, `NonConvert` |
+| navigation | `Delete`, `End`, `Help`, `Home`, `Insert`, `PageDown`, `PageUp`, `ArrowDown`, `ArrowLeft`, `ArrowRight`, `ArrowUp` |
+| numpad | `NumLock`, `Numpad0`–`Numpad9`, `NumpadAdd`, `NumpadComma`, `NumpadDecimal`, `NumpadDivide`, `NumpadEnter`, `NumpadEqual`, `NumpadMultiply`, `NumpadSubtract` |
+| system | `Escape`, `PrintScreen`, `ScrollLock`, `Pause` |
+| function | `F1` through `F24` |
+| device | `AudioVolumeDown`, `AudioVolumeMute`, `AudioVolumeUp`, `MediaPlayPause`, `MediaStop`, `MediaTrackNext`, `MediaTrackPrevious` |
+
+`KeyCode::ALL`, `as_str()`, a `FromStr` and a `Display` are all there, and `KeyCode` is
+`#[non_exhaustive]`.
+
+### Logical or physical: which to match
+
+```rust
+// Logical. "Escape closes this" is about what the key means, on every layout.
+if ev.key == Key::Named(NamedKey::Escape) { close(); }
+
+// Logical, unmodified. "Control-Z is undo" stays on the Z keycap when a modifier remaps it.
+if ev.modifiers.control() && ev.key_without_modifiers.as_str() == Some("z") { undo(); }
+
+// Physical. "The four keys under my left hand move the piece", whatever they type.
+if ev.physical == PhysicalKey::Code(KeyCode::KeyW) { move_up(); }
+```
+
+The rule in one line: **match a logical key when the user reads the binding off the keycap, and a
+physical key when the user feels the binding under their fingers.** A game's movement cluster is
+physical. Everything a menu could print is logical.
+
+<Callout type="warn">
+Do not match a physical position for a text shortcut. `PhysicalKey::Code(KeyCode::KeyZ)` is undo on
+a QWERTY board and is the key labelled `W` on an AZERTY one.
+</Callout>
+
+### `Modifiers`
+
+Four bits in a `u8`, carried on every `EventCx` as `ev.modifiers` and not only on key events.
+
+```rust
+// The constants.
+Modifiers::NONE;
+Modifiers::SHIFT;
+Modifiers::CONTROL;
+Modifiers::ALT;
+Modifiers::META;
+Modifiers::ALL;                                 // all four bits
+
+// The tests.
+ev.modifiers.shift();                           // one bit
+ev.modifiers.control();
+ev.modifiers.alt();
+ev.modifiers.meta();
+ev.modifiers.is_empty();
+ev.modifiers.contains(Modifiers::SHIFT);        // subset test
+
+// The rest.
+ev.modifiers.bits();                            // the raw u8
+Modifiers::from_bits_truncate(raw);
+ev.modifiers.with(Modifiers::ALT, true);        // the same set with one bit changed
+```
+
+`BitOr`, `BitAnd` and `Not` are implemented, so a chord is written as a value:
+
+```rust
+let chord = Modifiers::CONTROL | Modifiers::SHIFT;
+if ev.modifiers == chord { … }              // exactly these two, nothing else held
+if ev.modifiers.contains(chord) { … }        // at least these two
+```
+
+Equality is an exact test and `contains` is a subset test. Pick deliberately: a shortcut written
+with `==` refuses to fire when the user happens to be holding another modifier, which is usually
+what you want for a destructive command.
+
+`META` is Super on Linux, Command on macOS and the Windows key on Windows. Write a portable
+shortcut against the modifier, never against `NamedKey::Meta`.
+
+## `inserted_text`, and the space bar
+
+`Key::inserted_text()` answers the text a press should put into a document, and nothing at all for
+a press that means a name.
+
+```rust
+assert_eq!(Key::character("é").inserted_text(), Some("é"));
+assert_eq!(Key::Named(NamedKey::Space).inserted_text(), Some(" "));
+assert_eq!(Key::Named(NamedKey::Enter).inserted_text(), None);
+```
+
+The space bar is the case that decides which reading you use. Space is a **named** key — it arrives
+as `Key::Named(NamedKey::Space)`, not as `Key::Character(" ")` — and its standard value is a single
+space character. So:
+
+| Reading | Space bar | Verdict |
+|---|---|---|
+| `if let Key::Character(text) = &ev.key` | no match | drops every space the user types |
+| `ev.key.as_str()` | `Some(" ")` | also answers `Some("Enter")` for enter, which inserts the word |
+| `ev.key.inserted_text()` | `Some(" ")` | correct |
+
+`inserted_text` is the only one of the three that inserts a space and refuses to insert the
+word `Enter`. Use it for text and nothing else for text.
+
+## Repeats
+
+`KeyEvent::repeat` is true when the press was produced by the key being held down. A repeat still
+fires `on:key_down`, because text insertion needs it: holding a letter has to keep inserting it.
+
+The framework drops repeats for **its own** behaviour, so holding Tab does not run through the
+whole document and holding Enter does not activate a button forty times. Do the same in a handler
+that runs a command:
+
+```rust
+on:key_down = move |ev| {
+    if ev.repeat {
+        return;                    // a command runs once per press
+    }
+    …
+}
+```
+
+## What the framework does with a key
+
+Two behaviours, and no more. Both are computed after every listener on the path has run, and both
+are cancelled by `ev.prevent_default()`.
+
+| Key | Behaviour |
+|---|---|
+| Tab | move focus to the next element in sequence; with Shift, the previous one |
+| Enter or Space | activate the focused element, dispatched as a real `click` |
+
+Both are matched against `key_without_modifiers`, and both drop repeats. `on:key_up` never
+produces a behaviour of the framework's own.
+
+A third thing takes precedence over both: if the focused element is editable, the editing model
+takes the key first and the other two do not run. That is what stops a space typed into a field
+from also activating it.
+
+## Assembling text from key presses
+
+<Status kind="partial">Only `field` and `editor` accept typing. Every other element receives keys
+and does nothing with them.</Status>
+
+Assembling the text yourself is one match arm, and it is the clearest demonstration of a typed
+payload: `ev.key` in an `on:key_down` handler is a `Key`, with no downcast anywhere.
+
+```rust
+use zgui::prelude::*;
+
+/// A one-line prompt built out of key presses.
+#[component]
+fn Prompt() -> impl IntoView {
+    let draft = RwSignal::new(String::new());
+    let entered = RwSignal::new(String::new());
+
+    view! {
+        column(
+            class = "prompt",
+            tabindex = Focus::Sequential,
+            a11y:role = Role::Group,
+            a11y:label = "Prompt",
+            on:key_down = move |ev| match &ev.key {
+                Key::Named(NamedKey::Backspace) => draft.update(|draft| { draft.pop(); }),
+                Key::Named(NamedKey::Escape) => draft.set(String::new()),
+                Key::Named(NamedKey::Enter) => {
+                    entered.set(draft.get_untracked());
+                    draft.set(String::new());
+                }
+                // Every other key is asked what text it inserts. A key that means a name
+                // answers nothing and falls through, which is what leaves Tab moving focus.
+                key => if let Some(text) = key.inserted_text() {
+                    draft.update(|draft| draft.push_str(text));
+                },
+            }
+        ) {
+            row(class = "prompt__line") {
+                text(class = "prompt__draft") {{move || draft.get()}}
+                text(class = "prompt__caret") {"|"}
+            }
+            label(class = "prompt__last") {{move || entered.get()}}
+        }
+    }
+}
+
+const SHEET: &str = css!(
+    ".prompt { gap: 8px; }
+
+    .prompt__line {
+        align-items: center;
+        padding: 8px 10px;
+        border: 1px solid #2a3242;
+        border-radius: 8px;
+        background-color: #10141c;
+    }
+
+    .prompt:focus-visible { outline: 2px solid #7aa2ff; outline-offset: 2px; }
+    .prompt__caret { color: #7aa2ff; }
+    .prompt__last { font-size: 12px; color: #6b7689; }"
+);
+```
+
+Four things make it work:
+
+- **`tabindex = Focus::Sequential`.** A `column` is not focusable by nature, and an element with no
+  focus receives no keys.
+- **The final match arm.** Every key that is not handled by name is asked what text it inserts.
+  Tab, the arrows and the function keys answer nothing and fall through untouched, so Tab still
+  moves focus out.
+- **`draft` is the only copy of the text.** The `text` node renders it; nothing else holds it.
+- **The caret is yours to draw.** The framework paints a real caret only for `field` and `editor`.
+
+What this does not give you: caret placement with the pointer, selection, undo, word motion,
+clipboard, or an input method. All of those live in the editing model, and the editing model is
+attached to two element names.
+
+The repository's own `examples/todo.rs` is this pattern at full size.
+
+## What text input gives you today
+
+`field` and `editor` are wired to the editing model in `crates/zgui-edit`. The model is attached the
+first time a key or an input method reaches the element, and it holds the caret, the selection, the
+undo stack and the composition. **The text itself lives in the document, one text node per
+paragraph** — a view never owns a second copy.
+
+| Works today | Not built |
+|---|---|
+| typing, Backspace, Delete, by grapheme or by word | paste: no key maps to it and nothing reads the system clipboard |
+| left and right arrows, Home, End, with Shift to extend | up and down arrows: there is no line granularity |
+| Control-A to select all | PageUp and PageDown inside an editable element |
+| Control-Z, Control-Shift-Z and Control-Y | double-click word selection, triple-click line selection |
+| copy and cut to the system clipboard | dragging text, spell checking, rich text |
+| caret placement and drag selection with the pointer | any caret styling beyond its built-in width and colour |
+| input-method composition | the `value` and `placeholder` attributes, which the model does not read |
+| `on:input` and `on:change`, and `NodeRef::set_value` / `selection` / `set_selection` / `select_all` | |
+
+`zgui-edit` is a lower crate. It is not re-exported through `zgui`, and an application does not name
+it: everything it does is reached through the two element names and through `NodeRef`.
+
+<Callout type="warn">
+Editing is a **default action**. It runs after every listener on the path and only if none of them
+called `prevent_default`. A `field` with an `on:key_down` handler that calls `prevent_default`
+types nothing, which is exactly how a numeric-only field is written.
+</Callout>
+
+## Focus
+
+**Focus** is which single element of a window the keyboard is talking to. At most one element in a
+window has it. Every key event is delivered to that element first, and travels up from there.
+
+### Declaring focusability
+
+`tabindex` takes a `Focus`, which has two values and not an integer.
+
+| Value | Written as | Means |
+|---|---|---|
+| `Focus::Sequential` | `tabindex="0"` | reached by tabbing, in the order the element appears |
+| `Focus::Programmatic` | `tabindex="-1"` | focusable, but only when something focuses it deliberately |
+
+`Focus::Sequential` is the `Default`. `Focus::as_str()` gives the two strings above, which is what
+a selector and a document dump see.
+
+`control`, `field` and `editor` are focusable without declaring anything. Every other element name
+needs `tabindex`.
+
+An element can hold focus when all four of these are true:
+
+<Steps>
+
+<Step>
+
+It is an element, not a text node.
+
+</Step>
+
+<Step>
+
+It does not carry `:disabled`.
+
+</Step>
+
+<Step>
+
+It declares a `tabindex` that parses, or it is `control`, `field` or `editor`.
+
+</Step>
+
+<Step>
+
+Once laid out, it generates at least one box whose `visibility` is `Visible`.
+
+</Step>
+
+</Steps>
+
+A focus trap is deliberately **not** part of that list. Confinement is a property of the window,
+not of the element; whether an element can hold focus and whether the keyboard is allowed to travel
+to it right now are two questions, asked separately.
+
+`tabindex` is reactive like any other attribute, and that matters:
+
+```rust
+control(tabindex = move || {
+    if disabled.get() { Focus::Programmatic } else { Focus::Sequential }
+})
+```
+
+A control disabled while it holds focus has to leave the sequence. A composite control moves the
+one sequentially reachable item between its children as the arrow keys travel.
+
+### Traversal order
+
+Tab and Shift-Tab walk a snapshot of the focusable elements in one subtree, taken from the last
+completed frame. The subtree is the whole document, or the root of the innermost installed focus
+trap.
+
+1. Elements with a **positive** `tabindex` come first, in increasing order of that number.
+2. Everything else follows, in document order.
+3. Ties inside either group are broken by document order.
+4. A **negative** `tabindex` is focusable and is **not in the sequence**.
+5. The root of the walk is itself included when it is focusable.
+
+With nothing focused, a forward move enters the sequence at the start and a backward move enters it
+at the end. That is what tabbing into a trap from outside does.
+
+Wrapping is a property of a trap and of nothing else. With no trap installed, tabbing past the last
+element **clears focus** instead of returning to the first, and the press after that enters the
+sequence at the start again.
+
+<Callout type="info">
+A positive `tabindex` cannot be written with `Focus`. It is reachable by hand with
+`attr:tabindex = "3"`, and the framework honours it. A tab order that is a number is a tab order
+nobody maintains: every positive value has to be kept consistent with every other one across a
+whole application. A value that does not parse is **no** `tabindex` at all rather than a zero,
+because a typo that silently made an element a tab stop would be worse than one that did nothing.
+</Callout>
+
+### The three focus states
+
+The framework writes three CSS states into the document as focus moves. They are three different
+bits, not one bit written three ways.
+
+| Selector | Written on | Use it for |
+|---|---|---|
+| `:focus` | the focused element only | a style that should appear however focus arrived |
+| `:focus-within` | the focused element **and every ancestor of it** | a wrapper that draws the ring for the field inside it |
+| `:focus-visible` | the focused element, when the way focus arrived should show a ring | the ring itself |
+
+```css
+.field:focus            { border-color: #3b6cf6; }
+.field-row:focus-within { background-color: #161a23; }
+.button:focus-visible   { outline: 2px solid #7aa2ff; outline-offset: 2px; }
+```
+
+`:focus-visible` is a judgement about **how** focus arrived, made once by whatever moved it rather
+than guessed at by each control:
+
+| Focus arrived by | Ring |
+|---|---|
+| the keyboard — tabbing, or an arrow inside a composite control | shown |
+| the program, through `NodeRef::focus` or a trap | shown |
+| a pointer press | not shown |
+
+A ring on every click is noise. A ring that never appears is a keyboard trap the user cannot see.
+Focusing the element that already has focus writes nothing **except the ring**: clicking the
+element the keyboard had already reached takes the ring away.
+
+The framework's own sheet already draws a ring, and it needs one custom property from your theme:
+
+```css
+:focus-visible { outline: 2px solid var(--zgui-ring); outline-offset: 2px; }
+```
+
+Define `--zgui-ring`, or the ring has no colour. See [Theming](/docs/building/theming).
+
+### Focus events
+
+```rust
+pub struct FocusEvent {
+    pub related: Option<NodeId>,   // the element at the other end of the move
+    pub cause: FocusCause,
+}
+
+pub enum FocusCause { Pointer, Keyboard, Programmatic, Window }
+```
+
+`on:focus_in` fires when focus arrives at the element or a descendant of it; `on:focus_out` when it
+leaves the element and every descendant. Both bubble and neither is cancelable.
+
+Three rules about the ordering, all of them load-bearing:
+
+- **The departure is dispatched before the arrival.** A handler asking what holds focus is answered
+  about where focus is now, not about where it was on the way.
+- **Both are deferred.** Focus moves as the framework's own behaviour for an event that is still
+  being carried out, with the document's change batch open. The move is recorded where it happens
+  and announced once that dispatch has finished.
+- **A handler that moves focus again belongs to the next round.** The queue is taken, not drained
+  in place.
+
+`FocusCause::shows_ring()` is true for `Keyboard` and `Programmatic`.
+
+<Callout type="warn">
+`FocusEvent::related` is an accessibility node identifier and **not** a `zgui::view::NodeId`. To
+compare it with a `NodeRef`, convert it: `zgui::view::NodeId::from_u64(related.0)`.
+</Callout>
+
+## Moving focus from code
+
+| Want | Call |
+|---|---|
+| read what holds focus, reactively | `focused_node() -> Signal<Option<NodeId>, LocalStorage>` |
+| focus one element | `node_ref.focus()` |
+| move within a subtree | `node_ref.focus_move(FocusMove) -> Option<NodeId>` |
+| list what is reachable | `node_ref.focusables() -> Vec<NodeId>` |
+| ask whether focus is still inside | `node_ref.contains(other: NodeId) -> bool` |
+| put registered items back into document order | `node_ref.precedes(other: NodeId) -> bool` |
+
+```rust
+pub enum FocusMove { First, Last, Next, Prev }
+```
+
+`focus_move` computes the destination from the same snapshot Tab uses, asks for focus to go there,
+and answers with the node it chose. It wraps when a trap that wraps is installed, and it answers
+`None` and moves nothing when there is nowhere to go.
+
+`focused_node()` is a free function rather than a method, because there is no node to hang it on. It
+reads the host the enclosing window provided, so it must be called inside a window's scope; outside
+one it panics in debug builds. Together with `NodeRef::contains` it answers the question every
+dismissable overlay and every roving-focus group asks:
+
+```rust
+let panel = NodeRef::new();
+let focus = focused_node();
+
+// True while the keyboard is anywhere inside the panel.
+let inside = move || focus.get().is_some_and(|node| panel.contains(node));
+```
+
+<Callout type="warn">
+`ev.request_focus(node)` from inside a handler is queued and carried out after the dispatch — but
+commands issued from a handler for a **synthesised** event are discarded, and `click`, `focus_in`
+and `focus_out` are all synthesised. Focusing from an `on:click` handler therefore has to go
+through a `NodeRef`: `node.focus()`. That route works from anywhere, including an effect and a
+callback, and is carried out in the frame it schedules.
+</Callout>
+
+## Focus traps
+
+A **focus trap** confines sequential navigation to one subtree. A dialog that can be tabbed out of
+is not modal, and nothing on the screen says so: focus lands on a control behind the backdrop, the
+keyboard operates something invisible, and every screenshot of it looks right.
+
+```rust
+pub struct FocusTrapOptions {
+    pub wrap: bool,        // past the last focusable, go back to the first
+    pub auto_focus: bool,  // move focus inside as the trap is installed
+    pub restore: bool,     // put focus back where it was when the trap is removed
+}
+```
+
+Two constants cover almost every case:
+
+| Constant | `wrap` | `auto_focus` | `restore` | For |
+|---|---|---|---|---|
+| `FocusTrapOptions::MODAL` (also `Default`) | true | true | true | a dialog, a sheet, a drawer |
+| `FocusTrapOptions::CONFINE_ONLY` | true | false | false | a menu opened from a toolbar, which keeps the toolbar's focus where it was |
+
+A trap is installed from a `NodeRef` and is held by a **guard**:
+
+```rust
+#[must_use = "dropping the guard uninstalls the trap immediately"]
+pub struct FocusTrap { /* … */ }
+
+impl NodeRef {
+    pub fn trap_focus(&self, options: FocusTrapOptions) -> Option<FocusTrap>;
+}
+
+impl FocusTrap {
+    pub fn id(&self) -> FocusTrapId;
+    pub fn root(&self) -> NodeId;
+}
+```
+
+It is a guard rather than a pair of calls because the failure mode of the pair is a window that can
+never be tabbed out of again, and that failure survives every path that returns early.
+`trap_focus` answers `None` when the handle is not bound, because there is no subtree to confine
+anything to.
+
+Traps **stack**, and the innermost wins. A dialog opened from a dialog behaves, and closing the
+inner one hands navigation back to the outer one rather than to the document.
+
+### A dialog that keeps the keyboard inside itself
+
+```rust
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use zgui::reactive::RenderEffect;
+use zgui::view::{OverlayLayer, Portal};
+
+/// Asks before doing something irreversible, and takes the keyboard while it asks.
+#[component]
+fn Confirm(open: RwSignal<bool>) -> impl IntoView {
+    let panel = NodeRef::new();
+    let held: Rc<RefCell<Option<FocusTrap>>> = Rc::new(RefCell::new(None));
+
+    let installing = {
+        let held = Rc::clone(&held);
+        RenderEffect::new(move |_| {
+            // Both reads matter. Reading the handle is what brings this effect back when the
+            // element binds, which the first run is too early for. Reading `open` is what
+            // releases the trap again.
+            let ready = open.get() && panel.get().is_some();
+            if ready {
+                if held.borrow().is_none() {
+                    *held.borrow_mut() = panel.trap_focus(FocusTrapOptions::MODAL);
+                }
+            } else {
+                // Taken out of the borrow before it is dropped: releasing a trap moves focus,
+                // and moving focus can re-enter anything holding this.
+                let released = held.borrow_mut().take();
+                drop(released);
+            }
+        })
+    };
+    on_cleanup_local(move || drop(installing));
+
+    view! {
+        if move || open.get() {
+            Portal(layer = OverlayLayer::Modal) {
+                box(
+                    node_ref = panel,
+                    class = "dialog",
+                    a11y:role = Role::Dialog,
+                    a11y:label = "Confirm deletion",
+                    on:key_down = move |ev| if ev.key == Key::Named(NamedKey::Escape) {
+                        ev.stop_propagation();
+                        open.set(false);
+                    }
+                ) {
+                    label(class = "dialog__title") {"Delete this file?"}
+                    row(class = "dialog__actions") {
+                        control(class = "button", on:click = move |_| open.set(false)) {"Cancel"}
+                        control(class = "button", on:click = move |_| open.set(false)) {"Delete"}
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+What that buys, in order:
+
+<Steps>
+
+<Step>
+
+**The trap goes up when the panel binds.** `panel.get()` is a signal read, so the effect re-runs the
+moment the element exists.
+
+</Step>
+
+<Step>
+
+**Focus moves inside after layout.** A trap that asks to auto-focus is entered in a stage of its
+own, after the frame has laid the panel out. Asking earlier answers with nothing: the panel has no
+boxes yet, so nothing inside it is focusable yet.
+
+</Step>
+
+<Step>
+
+**Tab cycles.** Past the last control it returns to the first, and Shift-Tab from the first wraps
+to the last. Neither leaves the panel.
+
+</Step>
+
+<Step>
+
+**Closing restores.** Setting `open` to `false` re-runs the effect, which drops the guard, and
+`restore` puts focus back on whatever opened the dialog. The branch is torn down in the same flush.
+
+</Step>
+
+</Steps>
+
+Each of those four is asserted end to end against a real window in
+`crates/zgui-runtime/tests/focus_trap.rs`.
+
+<Callout type="warn">
+Release the trap from the state that closed the surface, not from the handle. A `NodeRef` is not
+unbound when the element it named is removed, so `panel.get()` keeps answering with a node that has
+gone. The reverse — installing the trap only when the handle is bound — is right, because the
+element really does not exist before then.
+</Callout>
+
+<Callout type="info">
+A trap whose subtree leaves the document without the guard being dropped is uninstalled on the way
+past, and its focus is restored as an orderly removal would have restored it. Without that, a
+stranded trap confines the keyboard to a subtree that no longer exists, and no key moves focus
+anywhere in the window for the rest of the session.
+</Callout>
+
+## Keyboard activation
+
+**A control needs no key handling at all.** Enter or Space on the focused element is turned into a
+real `click`, dispatched down the ordinary capture, target and bubble path. So is an assistive
+technology's activation request. One `on:click` serves the pointer, the keyboard and the screen
+reader.
+
+```rust
+control(
+    class = "button",
+    a11y:role = Role::Button,
+    on:click = move |_| save()
+) {
+    "Save"
+}
+```
+
+Nothing in that rule is specific to `control`. Enter and Space activate **whatever holds focus**,
+whatever its element name — so a `box` with `tabindex = Focus::Sequential` is activated the same
+way.
+
+### Activating on another key
+
+When a composite control has a key of its own — the arrows inside a menu, Enter on a list row —
+turn the press into an activation rather than calling the action directly:
+
+```rust
+on:key_down = move |ev| {
+    if ev.key == Key::Named(NamedKey::ArrowRight) && !ev.repeat {
+        ev.prevent_default();
+        ev.synthesize(events::CLICK);
+    }
+}
+```
+
+`ev.synthesize` dispatches on `ev.current`, down the full path. Calling the action directly instead
+would reach a different set of listeners from the one a click reaches, and every wrapper that
+relies on capturing or on stopping propagation would work for a pointer and not for a keyboard.
+
+### A roving-focus group
+
+The convention for a group of items — a toolbar, a tab strip, a menu — is that Tab reaches the
+group once and the arrow keys move inside it. A toolbar of twelve buttons is one thing to tab past,
+not twelve. That is two values of `tabindex`, one signal and one handle per item:
+
+```rust
+/// Three buttons the keyboard reaches as one stop.
+#[component]
+fn Toolbar() -> impl IntoView {
+    const LABELS: [&str; 3] = ["Cut", "Copy", "Paste"];
+
+    let current = RwSignal::new(0usize);
+    let items: Vec<NodeRef> = LABELS.iter().map(|_| NodeRef::new()).collect();
+    let moving = items.clone();
+
+    view! {
+        row(
+            class = "toolbar",
+            a11y:role = Role::Toolbar,
+            on:key_down = move |ev| {
+                if ev.repeat {
+                    return;
+                }
+                let step = match &ev.key {
+                    Key::Named(NamedKey::ArrowRight) => 1,
+                    Key::Named(NamedKey::ArrowLeft) => LABELS.len() - 1,
+                    _ => return,
+                };
+                ev.prevent_default();
+                let next = (current.get_untracked() + step) % LABELS.len();
+                current.set(next);
+                // Focus the item itself. A `Focus::Programmatic` item is focusable and is not in
+                // the tab sequence, so no sequential move reaches it.
+                moving[next].focus();
+            }
+        ) {
+            for index in move || 0..LABELS.len(), key = |index: &usize| *index {
+                control(
+                    node_ref = items[index],
+                    class = "toolbar__button",
+                    a11y:role = Role::Button,
+                    // Exactly one item is in the tab sequence at a time.
+                    tabindex = move || {
+                        if current.get() == index { Focus::Sequential } else { Focus::Programmatic }
+                    },
+                    // Whatever else focused this item — a press, a shortcut — the tab stop follows.
+                    on:focus_in = move |_| current.set(index)
+                ) {
+                    {LABELS[index]}
+                }
+            }
+        }
+    }
+}
+```
+
+Three things are load-bearing:
+
+- **The arrow key focuses the node directly**, through its own `NodeRef`. `focus_move` would not
+  work here: it walks the sequence, and every item but one has been taken out of the sequence.
+- **`on:focus_in` moves the tab stop.** Focus arrives by a press and by a shortcut as well as by an
+  arrow, and the tab stop has to follow all three or Tab leaves the group from the wrong place.
+- **Each item's own action goes in an `on:click`**, which Enter and Space already produce.
+
+## Input methods
+
+An **input method** turns several key presses into one character: a Japanese keyboard composing
+kana, a Chinese keyboard picking a candidate from a list, a compose sequence producing an accent.
+While it runs it shows **provisional text** — text that is on the screen and not yet committed.
+
+Four events carry it, each with an `ImeEvent` payload, aimed at the focused element:
+
+| `on:` name | `ImeEvent` | Cancelable | Means |
+|---|---|---|---|
+| `ime_start` | `Enabled` | yes | the input method has taken over |
+| `ime_preedit` | `Preedit { text, cursor }` | no | the provisional text changed |
+| `ime_commit` | `Commit(text)` | no | the provisional text became real |
+| `ime_end` | `Disabled` | no | the input method let go, abandoning anything provisional |
+
+`cursor` is a **byte range** into the provisional text and not a caret position, because an input
+method selects a span as often as it places a point. `ImeEvent::is_composing()` is true for
+`Enabled` and `Preedit`.
+
+What the framework does today, without any code from you:
+
+- **The surface is told text input is wanted, and where the caret is.** Until it is told, no
+  composition is ever started at all — a field that never reports it is a field a Japanese keyboard
+  cannot type into. The caret rectangle is reported again on every keystroke that moves it, so the
+  candidate window follows the insertion point.
+- **The composition is applied to the editing model.** Provisional text goes into the document, so
+  it is laid out, painted and read back like any other text. A commit records exactly **one** undo
+  entry for the whole composition, and the commit lands where the provisional text is rather than
+  where the caret is.
+- **Abandoning restores.** `Disabled` puts back exactly what the composition displaced.
+- **A key that arrives during a composition takes no framework default.** The window system
+  forwards every key the input method did not consume; letting Tab move focus mid-composition would
+  land the commit in whatever gained focus.
+
+<Status kind="partial">Composition works only inside `field` and `editor`.</Status> Text input is
+reported to the surface only when an **editable** element has focus, so an element assembling text
+from `on:key_down` receives no composition. The purpose hint the platform contract carries —
+`TextInputPurpose::Password`, `Pin`, `Number` and the rest — is always reported as `Normal` today,
+so an input method cannot be told that a field holds a password.
+
+## What it costs
+
+**A key press is one edit and one paragraph.** The editing model's unit of change is the paragraph,
+because a text shaper has no incremental mode: one inserted character reshapes one whole shaped
+result. One keystroke through the whole loop — the edit, one paragraph reshaped, one box repainted
+— is measured at 301.39 µs p50 on the maintainer's machine (`kitchen.keystroke`, kitchen-sink,
+`docs/performance.md`).
+
+**A focus move writes the difference and nothing else.** `:focus-within` is written up the whole
+path, and an element on both the old path and the new one is not written at all. A write that no
+rule matches never reaches the style engine.
+
+**Traversal is a snapshot.** `focusables()` walks the subtree once and answers a `Vec`. Tab pays
+that walk per press, over the trap's subtree when one is installed and over the document when none
+is.
+
+**Attaching a key listener costs nothing per frame.** It is a build-time registration, and
+rebuilding an element replaces its listeners rather than adding to them.
+
+## Next
+
+<Cards>
+  <Card
+    title="Overlays and portals"
+    href="/docs/building/overlays-and-portals"
+    description="Anchoring, dismissal and focus containment for menus, tooltips and dialogs."
+  />
+  <Card
+    title="Accessibility"
+    href="/docs/building/accessibility"
+    description="Every a11y: attribute, the role list, live regions and keyboard reachability."
+  />
+  <Card
+    title="Scrolling"
+    href="/docs/building/scrolling"
+    description="The offset model, scrollbars, and scrolling an element into view."
+  />
+</Cards>

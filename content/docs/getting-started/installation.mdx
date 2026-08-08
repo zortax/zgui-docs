@@ -1,0 +1,190 @@
+---
+title: Installation
+description: The pinned toolchain, the system libraries a window needs, and how to add zgui to a project.
+---
+
+zgui builds on a pinned nightly toolchain and draws through the GPU. This page covers both
+requirements and gets a window on the screen.
+
+## The toolchain
+
+<Callout type="warn">
+There is no stable-Rust build. The repository pins a nightly in `rust-toolchain.toml`, and rustup
+installs it for you the first time you build.
+</Callout>
+
+```toml title="rust-toolchain.toml"
+[toolchain]
+channel = "nightly-2026-04-16"
+components = ["rustfmt", "clippy", "rust-src", "miri"]
+profile = "minimal"
+```
+
+Nightly is required for edition 2024 together with the trait-solver behaviour the style engine
+depends on. The pin moves deliberately, in its own commit.
+
+If you build zgui from a checkout, rustup honours that file and nothing else is needed. If you use
+zgui from another project, copy the same `rust-toolchain.toml` into your project root so that both
+build with the same compiler.
+
+Check what you have:
+
+```bash
+rustc --version --verbose
+```
+
+## System libraries
+
+The desktop backend uses winit for the window and wgpu for the GPU.
+
+<Tabs items={['Debian / Ubuntu', 'Arch', 'Fedora']}>
+<Tab value="Debian / Ubuntu">
+
+```bash
+sudo apt-get install -y --no-install-recommends \
+  pkg-config libx11-dev libxkbcommon-dev libxkbcommon-x11-dev \
+  libwayland-dev libxcb1-dev libxcursor-dev libxi-dev libxrandr-dev
+```
+
+</Tab>
+<Tab value="Arch">
+
+```bash
+sudo pacman -S --needed pkgconf libx11 libxkbcommon libxkbcommon-x11 \
+  wayland libxcb libxcursor libxi libxrandr
+```
+
+</Tab>
+<Tab value="Fedora">
+
+```bash
+sudo dnf install pkgconf-pkg-config libX11-devel libxkbcommon-devel \
+  libxkbcommon-x11-devel wayland-devel libxcb-devel libXcursor-devel \
+  libXi-devel libXrandr-devel
+```
+
+</Tab>
+</Tabs>
+
+You also need a working graphics driver. Any adapter wgpu accepts will do. Continuous integration
+runs the whole suite on Mesa's software rasteriser, so a machine with no discrete GPU still works:
+
+```bash
+# force a backend when the default pick is wrong
+WGPU_BACKEND=vulkan cargo run --example counter
+```
+
+<Callout type="info">
+Nothing above is needed to run the framework **headless**. The headless backend draws into buffers
+with no display server and no graphics device, which is how most of zgui's own tests run. See
+[Testing](/docs/building/testing).
+</Callout>
+
+## Adding zgui to a project
+
+zgui is not published to crates.io yet. Depend on the repository directly.
+
+<Tabs items={['Git dependency', 'Path dependency']}>
+<Tab value="Git dependency">
+
+```toml title="Cargo.toml"
+[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+zgui = { git = "https://github.com/zortax/zgui" }
+```
+
+</Tab>
+<Tab value="Path dependency">
+
+```toml title="Cargo.toml"
+[package]
+name = "my-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+zgui = { path = "../zgui/crates/zgui" }
+```
+
+</Tab>
+</Tabs>
+
+`zgui` is the only crate an application names. Everything below it — the document, the style engine,
+layout, text, painting, the renderer, the platform — is re-exported through it. You reach for
+another crate only when you replace a backend.
+
+## A window
+
+```rust title="src/main.rs"
+use zgui::prelude::*;
+
+fn main() -> Result<(), zgui::Error> {
+    app()
+        .with_title("Hello")
+        .with_size(480.0, 320.0)
+        .with_stylesheet(css!(
+            ":root {
+                background-color: #12141a;
+                color: #e8ecf4;
+                font-family: sans-serif;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }
+            .hello { font-size: 32px; font-weight: 700; }"
+        ))
+        .run(|| view! { text(class = "hello") {"Hello"} })
+}
+```
+
+```bash
+cargo run
+```
+
+A window opens with centred white text on a dark background. `app()` builds the application.
+`run` opens the primary window and drives the event loop until the selected exit policy stops the
+application. The closure builds that window's root view. A platform resume can build it again.
+
+<Callout type="info">
+`css!` checks the structure of the sheet at compile time: unclosed blocks, unclosed strings and
+comments, a rule with no selector, a declaration with no colon. It does not check property names —
+the CSS parser handles those at run time, as in a browser.
+</Callout>
+
+## Running the repository's examples
+
+If you have a checkout of zgui, twelve worked applications live in `examples/`:
+
+```bash
+cargo run -p zgui-examples --example counter
+cargo run -p zgui-examples --example todo
+cargo run -p zgui-examples --example styled
+cargo run -p zgui-examples --example tally
+cargo run -p zgui-examples --example resize
+cargo run -p zgui-examples --example vector
+cargo run -p zgui-examples --example canvas
+cargo run -p zgui-examples --example surface
+cargo run -p zgui-examples --example custom
+cargo run -p zgui-examples --example async
+cargo run -p zgui-examples --example windows
+cargo run -p zgui-examples --example csd
+```
+
+`counter` and `todo` are the two this guide refers back to most. `windows` demonstrates shared state
+and lifecycle across several windows. `csd` demonstrates a window that draws its own decorations.
+
+## Next
+
+Build the counter one line at a time and see what each part does.
+
+<Cards>
+  <Card
+    title="Your first application"
+    href="/docs/getting-started/your-first-application"
+    description="A counter, taken apart: the component, the signal, the view, the sheet, the entry point."
+  />
+</Cards>

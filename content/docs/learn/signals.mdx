@@ -1,0 +1,311 @@
+---
+title: Signals
+description: Reactive state from first principles — what a signal is, how tracking works, and when the work actually happens.
+---
+
+A component runs once. Something else has to update the interface when state changes. That
+something is a signal. This page explains signals with no reference to views, so that the model is
+clear before it is applied.
+
+## The problem
+
+Here is state and a display of it, written the obvious way:
+
+```rust
+let mut count = 0;
+let label = count.to_string();
+
+count += 1;
+// `label` still says "0".
+```
+
+`label` was computed from `count` at one moment. Nothing connects them, so nothing updates `label`.
+
+A user interface is full of this. The title bar shows the document name. The status line shows the
+selection size. The Save button is disabled while there is nothing to save. Each is a value derived
+from state, and each has to be recomputed when that state changes — but only when it changes, and
+only that value.
+
+The usual answers are: recompute everything every frame (correct, and wasteful), or write the
+update by hand at every write site (fast, and impossible to keep right).
+
+A signal is the third answer. It is a container that **records what read it**, so that a write can
+find exactly what to recompute.
+
+## A signal
+
+```rust
+use zgui::prelude::*;
+
+let count = RwSignal::new(0);
+
+assert_eq!(count.get(), 0);
+count.set(1);
+assert_eq!(count.get(), 1);
+```
+
+`RwSignal<T>` is a readable and writable handle to a `T`. It is `Copy`, so you can move it into as
+many closures as you like without cloning it. The value itself lives in a reactive arena; the
+handle is a small index into it.
+
+Two things make it more than a cell:
+
+**Reading it inside a tracking context subscribes.** If the read happens while the framework is
+running some piece of code on your behalf, the framework records the dependency.
+
+**Writing it marks the subscribers.** Every piece of code that read the signal is flagged as stale.
+
+## Tracking, concretely
+
+A *tracking context* is any code the reactive system runs for you and is watching: an effect, a
+memo, or a reactive hole in a view. Reads inside one subscribe. Reads outside one do not.
+
+```rust
+let count = RwSignal::new(0);
+
+// Not a tracking context: this subscribes to nothing.
+let snapshot = count.get();
+
+// A tracking context: this closure now depends on `count`.
+let effect = RenderEffect::new(move |_| {
+    println!("count is {}", count.get());
+});
+```
+
+The subscription is discovered by running the closure, not declared. There is no dependency array
+and no list to keep in step. If a closure reads three signals on one run and one signal on the
+next, its dependency set changes to match.
+
+<Callout type="warn">
+A read outside a tracking context is silent. Nothing warns you. The value is correct once, and
+never updates. This is the most common reactive bug, and the symptom is always the same: the
+interface renders once and then freezes.
+</Callout>
+
+## Reading and writing
+
+Reads and writes are **trait** methods, not inherent ones. That is why `use zgui::prelude::*;`
+matters, and it is what lets a function accept "anything readable as a `T`" without caring what it
+was handed.
+
+| Method | What it does |
+|---|---|
+| `get()` | Clones the value out. Subscribes. |
+| `with(\|v\| ...)` | Borrows the value. Subscribes. Avoids the clone. |
+| `read()` | Returns a guard that derefs to the value. Subscribes. |
+| `set(v)` | Replaces the value. Marks subscribers. |
+| `update(\|v\| ...)` | Mutates in place. Marks subscribers. |
+| `write()` | Returns a mutable guard. Marks subscribers when dropped. |
+
+`get()` requires `T: Clone`. For a large `T`, prefer `with` or `read`:
+
+```rust
+let items = RwSignal::new(vec![1, 2, 3]);
+
+let total: i32 = items.with(|items| items.iter().sum());   // no clone
+let copy = items.get();                                    // clones the Vec
+```
+
+### Untracked reads
+
+Every read method has an `_untracked` counterpart: `get_untracked`, `with_untracked`,
+`read_untracked`.
+
+```rust
+let draft = RwSignal::new(String::new());
+
+// Inside a listener: read the current text without subscribing the listener to it.
+let text = draft.get_untracked();
+```
+
+Use it where not subscribing is the point — usually inside an event listener, which is not a
+tracking context anyway, or when reading a value once at setup. Writing `_untracked` states the
+intent, so a reader can tell a deliberate non-subscription from a forgotten one.
+
+## The two shapes of a signal handle
+
+```rust
+// One handle that reads and writes.
+let count = RwSignal::new(0);
+count.update(|n| *n += 1);
+
+// A reader and a writer, separately.
+let (count, set_count) = signal(0);
+set_count.update(|n| *n += 1);
+```
+
+`signal(0)` returns `(ReadSignal<T>, WriteSignal<T>)`. Split them when you hand the writer to one
+place and the reader to another, so that the types say who may do what. Use `RwSignal` when the
+same code does both.
+
+Both are `Copy`. Neither needs to be cloned into a closure.
+
+## Work happens at the flush
+
+This is the rule that surprises people, and it is the reason listeners are cheap.
+
+**Writing a signal does not run its subscribers.** It marks them and wakes their tasks. The frame
+loop then calls a single **flush**, which runs every marked task to a stall.
+
+```rust
+use zgui::reactive::{RenderEffect, RwSignal, flush};
+
+let count = RwSignal::new(1);
+let doubled = RwSignal::new(0);
+
+let effect = RenderEffect::new(move |_| doubled.set(count.get() * 2));
+
+assert_eq!(doubled.get(), 2);   // a render effect runs once, immediately, when created
+count.set(21);
+assert_eq!(doubled.get(), 2);   // still the old value: the write only marked the effect
+flush();
+assert_eq!(doubled.get(), 42);  // the flush ran it
+```
+
+In an application you never call `flush()` yourself. The frame loop calls it in the main reactive
+phase, between queued input events when necessary, and after an observation changes a view. The
+consequence you can rely on:
+
+```rust
+// One listener, five writes, one update pass. Not five.
+on:click = move |_| {
+    first.set(1);
+    second.set(2);
+    third.set(3);
+    fourth.set(4);
+    fifth.set(5);
+}
+```
+
+If you need the value you just wrote **inside the same listener**, read it back through the same
+handle. The handle is up to date immediately; it is the *dependents* that wait for the flush.
+
+## Signals hold any type
+
+```rust
+#[derive(Clone, Debug, PartialEq)]
+struct Filter {
+    text: String,
+    only_open: bool,
+}
+
+let filter = RwSignal::new(Filter { text: String::new(), only_open: false });
+
+filter.update(|f| f.only_open = true);
+```
+
+A write marks every subscriber of the whole signal, whatever changed inside. If one part of a large
+struct changes often and the parts have separate readers, either split it into several signals or
+use a [store](/docs/learn/stores-and-selectors), which subscribes per field.
+
+### Signals inside collections
+
+A common and useful shape: a `Vec` of items, where each item owns a signal for the part of it that
+changes.
+
+```rust
+#[derive(Clone, Debug)]
+struct Todo {
+    id: u64,
+    label: String,
+    done: RwSignal<bool>,
+}
+
+let items = RwSignal::new(Vec::<Todo>::new());
+```
+
+Adding or removing an item writes `items`. Ticking one item writes only that item's `done`. The two
+kinds of change have different subscribers, so ticking an item does not disturb the list.
+
+## Where a signal may be created
+
+A signal belongs to an **owner** — a scope that disposes of everything created inside it. The
+component body is inside an owner, so signals created there are cleaned up when the component is
+removed from the interface.
+
+```rust
+#[component]
+fn Panel() -> impl IntoView {
+    let open = RwSignal::new(false);   // correct: owned by this component
+    // ...
+}
+
+static COUNT: ... = ...;               // wrong: no owner
+```
+
+<Callout type="error">
+Creating a signal with no current owner leaks it permanently. In debug builds an assertion fires.
+In release builds there is no panic and no log — the signal never works. Create signals in
+component bodies, not in statics and not in lazily initialised globals.
+</Callout>
+
+[Ownership](/docs/learn/context) covers owners properly.
+
+## Which thread
+
+One thread runs reactivity. Starting the application claims the calling thread as the UI thread and
+installs a task pool that lives on it.
+
+- Signals with synchronized storage may be **read and written** from any thread.
+- Reactive tasks only ever **run** on the UI thread.
+
+A write from a worker marks its subscribers and asks the platform for a frame. However, owners and
+observers are thread-local. Do not use cross-thread signal access as the normal communication
+method. Obtain a `Ui` handle on the UI thread and use `Ui::post` from the worker. See [Background
+work](/docs/learn/background-work).
+
+## Signals whose values are not `Send`
+
+The reactive engine is thread-safe by default: a signal's value must be `Send + Sync`.
+
+Anything from the view layer — a node handle, a reference-counted callback, a backend handle — is
+`Rc`-based on purpose, because it never leaves the UI thread. Storing one in a signal needs the
+local-storage form:
+
+```rust
+use std::rc::Rc;
+use zgui::reactive::{LocalStorage, RwSignal};
+
+let handle: RwSignal<Rc<str>, LocalStorage> = RwSignal::new_local("a".into());
+assert_eq!(&*handle.get(), "a");
+```
+
+Every handle type is generic over its storage; the default is the thread-safe one. `new_local`
+picks the other. The promise is then checked at run time: reading a local-storage signal from
+another thread panics with a message naming the thread.
+
+There are two more escapes of the same kind — one for context values and one for cleanup closures.
+Both appear where they are needed, in [Context](/docs/learn/context) and [Effects and
+lifecycle](/docs/learn/effects-and-lifecycle).
+
+<Callout type="info">
+If a build has stopped on a `Send` or `Sync` bound somewhere near a signal, the fix is one of those
+three escapes and nothing else.
+</Callout>
+
+## Common mistakes
+
+| Symptom | Cause |
+|---|---|
+| The interface renders once and never changes. | A signal was read outside a tracking context. |
+| A write "does not work" when read back from another closure in the same listener. | Dependents settle at the flush, not at the write. |
+| A whole list re-runs when one row changes. | One signal holds the whole collection *and* each row's state. Split them. |
+| Nothing works and nothing panics, in release only. | A signal was created with no owner. |
+| The build fails on `Send`/`Sync`. | The value is not thread-safe; use `new_local`. |
+
+## Next
+
+Signals become useful the moment a view reads one.
+
+<Cards>
+  <Card
+    title="Reactivity in views"
+    href="/docs/learn/reactivity-in-views"
+    description="Reactive holes: which parts of a view update, and how the framework decides."
+  />
+  <Card
+    title="Derived state"
+    href="/docs/learn/derived-state"
+    description="Computing from signals: plain closures, memos, and the Signal<T> prop type."
+  />
+</Cards>

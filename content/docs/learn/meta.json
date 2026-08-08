@@ -1,0 +1,24 @@
+{
+  "title": "The guide",
+  "pages": [
+    "views",
+    "elements",
+    "signals",
+    "reactivity-in-views",
+    "derived-state",
+    "components",
+    "children-and-slots",
+    "control-flow",
+    "events",
+    "attributes",
+    "styling",
+    "layout",
+    "effects-and-lifecycle",
+    "context",
+    "stores-and-selectors",
+    "async-and-timers",
+    "background-work",
+    "tokio-integration",
+    "error-handling"
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "title": "Documentation",
+  "root": true,
+  "pages": [
+    "index",
+    "---Getting started---",
+    "...getting-started",
+    "---The guide---",
+    "...learn",
+    "---Building interfaces---",
+    "...building",
+    "---Advanced topics---",
+    "...advanced",
+    "---Under the hood---",
+    "architecture",
+    "performance",
+    "---Batteries included---",
+    "component-library"
+  ]
+}

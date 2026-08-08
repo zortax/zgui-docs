@@ -1,0 +1,529 @@
+---
+title: The crate map
+description: Every crate in the workspace, the layer it sits in, the rule that keeps the arrows pointing one way, and the checks that enforce it.
+---
+
+This page is the reference for the workspace: fifty-three crates under `crates/`, plus the `xtask`
+gate runner. It assumes [the architecture overview](/docs/architecture/overview), which gives the
+pipeline these crates implement. None of it is needed to write an application — an application
+names one crate.
+
+## The nine layers
+
+A layer is a position in the dependency graph. **A crate may depend on crates in the same layer or
+in a lower layer. It must not depend on a crate in a higher layer.**
+
+| Layer | Name | What belongs there |
+|---|---|---|
+| L0 | foundation | Geometry, colour, storage, interned names, invalidation bits, counters. Values and algorithms with no policy. |
+| L1 | contracts | Traits and value types the rest of the tree agrees on. Nothing replaceable is implemented here. |
+| L2 | backends | Implementations of L1 contracts against a real library: a graphics API, a windowing library. |
+| L3 | document | The retained node tree. |
+| L4 | engines | Cascade, layout, text, paint, vector documents. |
+| L5 | systems | Input dispatch, scrolling, accessibility, animation, editing. |
+| L6 | frontend | The view layer, its macros, and the element vocabulary. |
+| L7 | runtime and tooling | The frame pipeline, the umbrella crate, the test instruments. |
+| L8 | product | The component library, the inspector, the worked applications. |
+
+The names come from `xtask/src/new_crate/layer.rs`, which is also what `cargo xtask new-crate`
+stamps into a new manifest.
+
+## Every crate
+
+| Crate | Layer | What it is for |
+|---|---|---|
+| `zgui-geom` | L0 | Coordinate spaces and units — `CssPx`, `DevicePx`, `Au` — and the plain-data geometry every stage speaks. |
+| `zgui-color` | L0 | CSS colour: fourteen colour spaces, interpolation between them, one conversion to what a renderer draws with. |
+| `zgui-arena` | L0 | Storage whose addresses hold still, and the handles that name what it holds. |
+| `zgui-interned` | L0 | Interned names: one shared copy per string, plus an eight-byte handle, so a name comparison is a pointer test. |
+| `zgui-bits` | L0 | The invalidation primitives: what still owes work, and where it has to be redrawn. |
+| `zgui-profile` | L0 | Frame stages as `tracing` spans, and the counters that say what each stage did. |
+| `zgui-vocab` | L1 | The words the view layer and the document both say: event kinds, keys, roles, interaction states, shared strings. |
+| `zgui-css` | L1 | The computed-style facade: one name for a cascaded style, and one place the style engine is named. |
+| `zgui-scene` | L1 | The display list, as a value, with no renderer in it. |
+| `zgui-render` | L1 | The `Renderer` and `VectorRaster` contracts. Nothing here implements either. |
+| `zgui-atlas` | L1 | Texture-atlas policy: placement, eviction, reference counting, the upload queue. No GPU. |
+| `zgui-platform` | L1 | The contract a windowing system satisfies, and nothing about any particular one. |
+| `zgui-reactive` | L1 | Signals, memos, stores, owners, and the single-threaded executor the frame loop drives. |
+| `zgui-image` | L1 | Raster image codecs, registered in-memory sources, decode limits, and decoded RGBA data. |
+| `zgui-render-wgpu` | L2 | The graphics backend: device, pipelines, batching, and the persistent target a frame is composed into. |
+| `zgui-render-vector-vello` | L2 | Vector rasterisation with a compute-shader path renderer. |
+| `zgui-render-vector-coverage` | L2 | Vector rasterisation for a device with no compute shaders, so a capability check has somewhere to fall back to. |
+| `zgui-platform-winit` | L2 | The desktop: a real event loop, real windows, the clipboards, the accessibility adapter. |
+| `zgui-platform-headless` | L2 | A platform with no windowing system: a clock a test moves, scripted input, a surface that is a buffer. |
+| `zgui-tokio` | L2 | The optional Tokio backend for background work, UI-task runtime context, and Tokio channel helpers. |
+| `zgui-dom` | L3 | The document: one arena of nodes, safe to read from many threads while the cascade runs over it. |
+| `zgui-style` | L4 | The style engine over a document: the sheets, the restyle itself, and what a restyle owes the stages below. |
+| `zgui-layout` | L4 | Boxes, sizes and positions: the box tree, the layout run, the fragments and the hit regions. |
+| `zgui-text` | L4 | The text contracts, with no font engine behind any of them. |
+| `zgui-text-style` | L4 | Text properties lowered out of the cascade, split into the half that forces re-shaping and the half that does not. |
+| `zgui-text-parley` | L4 | The text engine: shaping, face resolution, metrics, glyph rasterisation, bidirectional text. |
+| `zgui-paint` | L4 | Computed style and fragment geometry into scene primitives: the stage that decides what a frame draws. |
+| `zgui-svg` | L4 | SVG documents read into outlines, paints and clips that either rasteriser can draw. |
+| `zgui-canvas` | L4 | Retained shape scenes, brushes, and revisions for imperative canvas drawing. |
+| `zgui-input` | L5 | What an event means for a document: where it landed, what state it changed, which listeners it reaches. |
+| `zgui-scroll` | L5 | Scroll offsets: chaining, elastic overscroll, momentum and smooth motion. Layout owns the regions; this owns the offsets. |
+| `zgui-a11y` | L5 | The accessibility projection, and the actions an assistive technology sends back. |
+| `zgui-anim` | L5 | Transitions, keyframe animations, and the tiers that move a frame without restyling it. |
+| `zgui-edit` | L5 | Editing text: caret, selection, undo, composition, and where a click lands in a shaped run. |
+| `zgui-view` | L6 | The view layer: what a view is, and the three seams it is described against. |
+| `zgui-view-dom` | L6 | The node-tree seam, implemented over a real document. |
+| `zgui-view-macro` | L6 | The authoring surface: `view!`, `#[component]`, `#[slot]`, `variants!`, `css!` and `style!`. |
+| `zgui-elements` | L6 | The element vocabulary: sixteen names, each a typed builder. |
+| `zgui-custom` | L7 | The user-facing custom-element trait and the registry that bridges views to layout and paint. |
+| `zgui-wgpu` | L7 | Surface handles and render callbacks that bridge external wgpu textures into a frame. |
+| `zgui-runtime` | L7 | The frame pipeline in a window: dispatch, flush, restyle, layout, paint, draw, park. |
+| `zgui` | L7 | The umbrella crate an application names, and the wiring that turns the seams into a desktop program. |
+| `zgui-testkit-view` | L7 | The component-test instrument: a recording tree, a scripted host, synthesised input, a clock a test moves. |
+| `zgui-testkit-scene` | L7 | The frame-test instrument: a capture renderer, a fixed-metrics shaper, a virtual clock and the counters. |
+| `zgui-conformance` | L7 | CSS parity as a measurement: the denominator, the classification and a pass rate that can only go up. |
+| `zgui-ui` | L8 | The component library, written against exactly the public API an application author has. |
+| `zgui-ui-primitives` | L8 | The headless interaction behaviours every visible component is built out of. |
+| `zgui-ui-tokens` | L8 | The design tokens, as CSS custom properties an application can override without rebuilding anything. |
+| `zgui-ui-icons` | L8 | A vector icon set. Each icon is a `const` outline in path notation, drawn by the `vector` element. |
+| `zgui-devtools` | L8 | The inspector: what a frame did, shown over the window that did it. |
+| `zgui-bench` | L8 | The reference workloads and the instruments they are built from. |
+| `zgui-examples` | L8 | The worked applications. One dependency: `zgui`. |
+| `probe` | none | The stack-compiles canary: every external engine in one compilation unit, naming one type from each. |
+| `xtask` | none | The gate runner. It lives beside `crates/`, not in it. |
+
+<Callout type="info">
+`probe` and `xtask` are the two members with no layer. `xtask/src/ledger/check/topo.rs` names both
+in its `UNSCHEDULED` list: the canary and the gate runner exist from the start and depend on
+nothing scheduled.
+</Callout>
+
+## How a layer is declared
+
+As a comment above the manifest's `[dependencies]` table. The first line states the layer and its
+name; a second paragraph states why the crate's dependency list looks the way it does.
+
+```toml
+[package]
+name = "zgui-layout"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# L4 — engines. External dependencies are inherited: `foo.workspace = true`.
+[dependencies]
+taffy.workspace = true
+zgui-css = { path = "../zgui-css", version = "0.1.0" }
+```
+
+`cargo xtask new-crate <name> --layer L4` stamps that manifest and a crate root that already
+carries `#![deny(missing_docs)]` and `#![forbid(unsafe_code)]`
+(`xtask/src/new_crate/template.rs`). The layer argument refuses anything outside `L0` through
+`L8`.
+
+## How the rule is checked
+
+`cargo xtask ledger` runs fourteen checks. It is a gate, not a convention: any violation fails the
+build, and `cargo xtask ledger <name>` runs one of them alone.
+
+| Check | What it asserts |
+|---|---|
+| `engines` | each external engine is named only by the crates permitted to name it |
+| `unsafe` | unsafe is forbidden outside the allowlist, and every `Sync` promise states its reason |
+| `attribution` | adapted code carries its licence header and a matching `NOTICE` row |
+| `versions` | the pinned versions, the single wgpu, and the feature sets that fail silently |
+| `pinned` | the two dependency lists that are pinned exactly, and the edge that must not exist |
+| `topo` | the phase schedule is a topological order of the real manifest graph |
+| `ignored` | no test is switched off, so a gate satisfied by one is satisfied by a test that runs |
+| `counters` | every frame counter is incremented by something, or listed as awaiting its stage |
+| `skips` | every counter of avoided work names its pair and has a non-vacuity test |
+| `clock` | every wall-clock assertion lives in a target the gate runs in release |
+| `mutation` | a document is changed only through its own batch API, never through the arena |
+| `inert` | every enum variant something branches on is built by something |
+| `tag-syntax` | no view, in code or in a document, is written in the spelling the grammar replaced |
+| `spikes` | every spike names the phase that deletes it, and none outlives it |
+
+Three of them hold the crate graph in place.
+
+### `topo` — the direction of every edge
+
+No check parses the layer number. The layer comment is documentation and review discipline. What is
+enforced mechanically is a finer record: `docs/PHASES.md`, the build schedule. Each crate is
+assigned to the earliest phase whose *Creates* paragraph names it, and **a crate may not depend on
+one that arrives in a later phase** (`xtask/src/ledger/check/topo.rs`).
+
+That is a weaker statement than the layer rule and a stronger one to test against: the schedule is
+only a schedule if it is buildable in order, and every crate arrives after the crates it needs. A
+new upward edge is almost always an edge to a crate that arrived later, and it fails here. The
+edges the architecture cares about most are pinned by name in the two checks below.
+
+Two escape lists, both exact and both short:
+
+- `UNSCHEDULED` — `probe` and `xtask`.
+- `DRIVEN` — five named edges, each from one named crate to one named crate. Four are
+  `zgui-runtime` to `zgui-scroll`, `zgui-anim`, `zgui-edit` and `zgui-a11y`: the frame loop is
+  built before the systems it runs, because a system with no loop to run it cannot be tested at
+  all. The fifth is `zgui-testkit-view` to `zgui-edit`, because typing is a framework default and a
+  harness that does not perform it passes components that do not work in a window.
+
+The map is parsed out of `docs/PHASES.md` rather than kept beside it. A second copy of the schedule
+would drift.
+
+### `pinned` — two lists and one forbidden edge
+
+Most crates may grow a dependency without anyone thinking hard. Two may not.
+
+| Crate | Its list, exactly |
+|---|---|
+| `zgui-view` | `zgui-geom`, `zgui-interned`, `zgui-reactive`, `zgui-vocab` |
+| `zgui-vocab` | `accesskit`, `zgui-geom`, `zgui-interned` |
+
+The view layer is what a different backend is substituted underneath, and it can be substituted
+only underneath something that cannot see a document, a style engine, a layout engine, a renderer
+or a window system. One added dependency and that stops being true, silently.
+
+`zgui-vocab` exists so the view layer and the document can name the same event kinds, roles and
+states without either depending on the other. A fourth dependency would make it a bridge that
+carries something, which is a different crate with a different name.
+
+Both lists are pinned across **all** sections, development dependencies included. A test that
+reached for a document would be evidence that the seam had stopped being sufficient. The check also
+names fourteen packages — `stylo`, `taffy`, `parley`, `wgpu`, `vello`, `winit`, `zgui-dom`,
+`zgui-layout`, `zgui-style`, `zgui-render`, `zgui-scene`, `zgui-platform` and their satellites —
+that neither crate may see in any section.
+
+The forbidden edge: **no crate below `zgui-view` may name it.** Thirteen crates are listed by name
+as being below it. The temptation is event dispatch. Resolving which listeners an event reaches is
+a job for the layer that owns hit testing; *calling* one is a job for the layer above. A crate that
+named the view layer to call a handler directly would invert the whole graph, in one line that
+reviews easily.
+
+### `engines` — which crate may name which library
+
+Every external engine is reachable from a bounded, enumerable set of crates, and that table is the
+architecture (`xtask/src/ledger/check/engines.rs`). The consequence is that replacing, patching or
+dropping any one of them is a change to a named set of manifests that can be counted before the
+work starts.
+
+<Callout type="info">
+Two rows are easy to miss. `app_units` — the style engine's own length unit — and `euclid` — the
+geometry its container-query hook answers in — appear in return position of trait methods the
+document has to implement. Both sit on the style engine's row for the same reason the engine does:
+a firewall with two of its three names unpoliced is not a firewall.
+</Callout>
+
+`cargo xtask ledger --self-test` aims every check at a planted-violation fixture. A check nobody
+has ever seen fail is a check nobody should trust.
+
+## What the rule buys
+
+It costs real ergonomics. A stage that wants one fact from a stage above it has to be handed that
+fact rather than fetching it: a new parameter, sometimes a new trait, occasionally a value type
+invented to sit between two crates that must not see each other. What the repository claims in
+return, in `docs/guide/layering.md`:
+
+**A backend's next major version reaches one crate.** A windowing library that renames its size
+accessors, splits its lifecycle callbacks and removes its user-event payload touches every crate in
+a framework that names it directly. Behind `zgui-platform` it touches `zgui-platform-winit` and
+nothing else.
+
+**Every stage is testable without the one below it.** The style engine is exercised over a document
+with no layout engine. Layout is exercised with a fixed-metrics text source and no fonts. Paint is
+exercised with no graphics device. The frame loop is exercised with no display server. None of that
+is a special test mode.
+
+**A second implementation is an implementation, not a fork.** There are two platform backends, two
+vector rasterisers, two text metric sources, and a capture renderer beside the real one. Each
+exists because the boundary above it names no library.
+
+When the rule is in the way, three moves cover almost every case: **invert it** (the lower crate
+declares a trait, the higher crate implements it and hands it in), **push the type down**
+(`zgui-vocab` is exactly this), or **add a facade** (`zgui-css` is that for the style engine —
+sixteen crates read computed styles and exactly one names the engine). A feature flag that turns an
+upward edge on is not an answer, and neither is a development-only dependency across a seam. Both
+fail the build.
+
+## What is published, and what it promises
+
+Forty-nine of the fifty-three crates publish. Four do not, and each says why in its manifest:
+
+| Crate | Why it is not published |
+|---|---|
+| `probe` | The stack-compiles canary. It ships nothing. |
+| `zgui-conformance` | The instrument the framework is measured with, not part of it. |
+| `zgui-bench` | The reference workloads. |
+| `zgui-examples` | The worked applications. |
+
+`xtask` also carries `publish = false` and is not a member of `crates/`.
+
+Published is not the same as intended for direct use. The surface an application writes against is
+`zgui` and what it re-exports. `zgui-testkit-view`, `zgui-testkit-scene` and
+`zgui-platform-headless` publish and are meant to be named directly — by a test, in
+`[dev-dependencies]`. None of the three is re-exported by `zgui`; `zgui` names
+`zgui-platform-headless` only in its own development dependencies.
+
+Three rules govern what is visible and what may change.
+
+**`#[non_exhaustive]` where the set is expected to grow without a change in this workspace.** Error
+enums, the reasons a frame did not reach the screen, the answers a host hook may give, and the
+parity vocabulary. Adding a variant to one of those is a normal consequence of learning something
+new about a device, a platform or a style engine, and it should not cost a consumer a major
+version.
+
+It deliberately does **not** mean the enums that enumerate the framework's own content.
+`PrimitiveKind`, `Batch` and `Filter` in `crates/zgui-scene/src/` carry no such attribute, and the
+CSS keyword types do not either. Adding a member to one of those is a change that has to be made
+everywhere in this tree at once, and the compiler refusing every non-exhaustive match is the
+mechanism that finds those places.
+
+Traits extend the other way. A method added later arrives with a default body, so an existing
+implementation keeps compiling. `HostBinding` in `zgui-runtime` is the worked example: every one of
+its methods has a do-nothing default.
+
+**`#[doc(hidden)]` on anything that exists only so one crate can reach another.** The typestate
+markers that turn a missing required prop into a named compile error, and the inference markers
+that let one setter take a literal, a closure or a signal, are mechanism. Nothing is written by
+hand against them. The macro-expansion roots are the exception and stay visible, because a crate
+writing views without the umbrella crate over it has to know they exist.
+
+**`cargo semver-checks` against the previous release tag, run as a gate.** `cargo xtask release`
+runs the lockstep check and then the compatibility gate (`xtask/src/release/`).
+
+### Versions
+
+Every member inherits one version from `[workspace.package]` and is released with the others. There
+is no crate at 0.3 while another is at 0.1. A consumer who has `zgui 0.1.0` knows exactly which
+`zgui-render` is underneath it, and a compatibility matrix between the framework's own crates never
+comes into existence.
+
+Two things have to hold, and `xtask/src/release/lockstep.rs` checks both on every run:
+
+- a member writes `version.workspace = true` rather than spelling a version;
+- every non-development dependency on another member carries a version requirement beside its path.
+  A bare path is a fact about one checkout; a package whose dependencies are only paths publishes
+  to no registry at all.
+
+<Status kind="unstable">The workspace is at `0.1.0` and no `v*` tag exists yet.</Status> The
+compatibility gate reports **no baseline** rather than passing quietly, because a gate that says
+"ok" when it did not run is worse than no gate (`xtask/src/release/semver.rs`).
+
+## One dependency
+
+An application normally names `zgui` and nothing else. The examples package proves that all view,
+canvas, surface, custom-element, and application APIs are available through the umbrella crate.
+An application also names `zgui-image` when it registers encoded image bytes from memory. File-path
+image sources need only `zgui`.
+
+The component library obeys the same rule. `zgui-ui-tokens`, `zgui-ui-icons` and
+`zgui-ui-primitives` each name `zgui` and nothing else, and `zgui-ui` names those three and `zgui`.
+Anything a component needs, an application author needs too, so a further edge into the
+framework's own crates would be a hole in the public API rather than a convenience.
+
+`crates/zgui/src/lib.rs` re-exports each lower crate under a short name:
+
+```rust
+pub use crate::app::{App, app};
+pub use crate::error::Error;
+
+pub use zgui_view_macro::{component, css, slot, style, variants, view};
+pub use zgui_elements::expansion;
+
+pub use zgui_atlas as atlas;
+pub use zgui_bits as bits;
+pub use zgui_canvas as canvas;
+pub use zgui_custom as custom;
+pub use zgui_elements as elements;
+pub use zgui_geom as geom;
+pub use zgui_platform as platform;
+pub use zgui_reactive as reactive;
+pub use zgui_reactive::task;
+pub use zgui_render as render;
+pub use zgui_runtime as runtime;
+pub use zgui_scene as scene;
+pub use zgui_text as text;
+pub use zgui_wgpu as surface;
+#[cfg(feature = "tokio")]
+pub use zgui_tokio as tokio;
+pub use zgui_view as view;
+pub use zgui_vocab as vocab;
+```
+
+`zgui::runtime` reaches the frame pipeline, `zgui::render` the renderer contract, `zgui::platform`
+the windowing contract. `zgui-image` is the one direct addition for registered in-memory sources.
+
+### `zgui::expansion`
+
+`view!` expands to ordinary calls on the view layer and on the element vocabulary. Those calls have
+to name the crates they come from, and a macro cannot know what the caller called them. So the
+expansion names exactly one path — `::zgui::expansion::view::…` and
+`::zgui::expansion::elements::…` — and `zgui` offers that root.
+
+The whole of `crates/zgui-elements/src/expansion.rs`:
+
+```rust
+/// The element vocabulary.
+pub use crate as elements;
+/// The view layer.
+pub use zgui_view::expansion::view;
+```
+
+Nothing in the module is written by hand. It is public because the generated code says
+`::zgui::expansion::…`, which is what lets a crate that writes views depend on `zgui` alone rather
+than on every crate an expansion happens to touch.
+
+A crate writing views with no umbrella over it supplies the root itself:
+
+```rust
+extern crate zgui_elements as zgui;
+```
+
+`zgui-elements` and `zgui-view` each carry an `expansion` module for that case.
+
+## The workspace dependency ledger
+
+Every external dependency is declared once, in `[workspace.dependencies]` in the root `Cargo.toml`,
+and inherited with `foo.workspace = true`. A version, a feature set and a `default-features`
+decision therefore exist in exactly one place in the tree.
+
+`cargo xtask ledger versions` enforces both halves. A member that spells a version for an external
+package instead of inheriting it is reported by name, and the workspace declaration itself is
+checked against the pins below.
+
+| Dependency | Named by | What it is for |
+|---|---|---|
+| `stylo`, `stylo_dom`, `stylo_atoms`, `stylo_static_prefs`, `selectors`, `servo_arc`, `web_atoms`, `cssparser`, `app_units`, `euclid` | `zgui-css`, `zgui-dom`, `zgui-style` | The style engine: parsing, selector matching, the cascade, and the shared computed style. |
+| `taffy` | `zgui-layout` | The flexbox, grid, block and float layout algorithms. |
+| `parley`, `fontique`, `harfrust`, `skrifa`, `swash`, `zeno` | `zgui-text-parley`; `zeno` also in `zgui-paint` | Shaping, face resolution, metrics, glyph rasterisation, and small vector coverage masks. |
+| `wgpu` | `zgui-render-wgpu`, `zgui-wgpu`, both vector rasterisers, `zgui-platform-winit` | The graphics API. |
+| `image` | `zgui-image` | Decodes PNG, JPEG, WebP, and the first frame of GIF data. |
+| `vello` | `zgui-render-vector-vello` | Compute-shader path rasterisation. |
+| `usvg` | `zgui-svg` | Reads an SVG document into paths, paints and clips. It draws nothing. |
+| `winit` | `zgui-platform-winit` | The event loop and the windows. |
+| `accesskit` | `zgui-vocab`, `zgui-platform`, `zgui-dom`, `zgui-a11y`, `zgui-text`, `zgui-text-parley`, both platform backends | The accessibility tree, as pure `no_std` data with no platform coupling. |
+| `accesskit_winit`, `arboard`, `smithay-clipboard`, `zbus` | `zgui-platform-winit` | The desktop's accessibility adapter, its clipboards and its portals. |
+| `reactive_graph`, `reactive_stores`, `any_spawner`, `send_wrapper` | `zgui-reactive` | The reactive engine and the process-wide executor slot. |
+| `tokio` | `zgui-tokio` | The optional runtime for background work and runtime-dependent asynchronous APIs. |
+| `kurbo`, `peniko` | `zgui-elements`, `zgui-scene`, `zgui-paint`, `zgui-svg`, `zgui-text`, `zgui-text-parley`, the three graphics crates, `zgui-ui-icons`, `zgui-ui-primitives` | Béziers and paint description, as pure data. An outline crosses from a view to the rasteriser with no conversion. |
+| `etagere` | `zgui-atlas` | Shelf allocation inside an atlas. |
+| `bytemuck` | `zgui-geom`, `zgui-scene`, the three graphics crates | Casting plain-data structs to the bytes a GPU buffer takes. |
+| `syn`, `quote`, `proc-macro2` | `zgui-view-macro` | The macros. |
+| `raw-window-handle` | `zgui-platform`, `zgui-platform-winit` | The handles a graphics API draws into. Confined to the `GpuSurface` sub-trait, so a backend with no GPU does not implement it. |
+| `rayon` | `zgui-dom`, `zgui-style` | The parallel half of selector matching. |
+| `thiserror`, `tracing`, `bitflags`, `rustc-hash`, `smallvec` | many | Errors, spans, flag sets, hashing and small-vector storage. Not ledgered: none of them is an engine. |
+| `proptest`, `trybuild`, `criterion`, `loom`, `toml` | test and tool targets | Property tests, compile-failure tests, micro-benchmarks, the concurrency model checker, and manifest reading in `xtask`. |
+
+<Callout type="warn">
+`insta` is declared in `[workspace.dependencies]` and named by no member. Golden files are a
+hand-rolled mechanism in `zgui_testkit_scene::dump::golden`, blessed with `ZGUI_BLESS`. The
+workspace list is a declaration of allowed versions, not a list of what is used.
+</Callout>
+
+### Four feature sets that fail silently
+
+`cargo xtask ledger versions` pins these because getting them wrong produces a wrong answer rather
+than an error (`xtask/src/ledger/check/versions.rs`):
+
+| Pin | What goes wrong without it |
+|---|---|
+| `reactive_graph` must enable `effects` | The whole interface compiles, runs, and silently never updates. |
+| `reactive_graph` must not enable `nightly` | The framework's own nightly toolchain must not switch it on. |
+| `taffy` with `default-features = false` and exactly eight features | Losing `content_size` zeroes every intrinsic size; losing `float_layout` deletes floats. `taffy_tree` is unwanted because the box tree is this framework's own. |
+| `wgpu` at 29.x, exactly one copy in the resolved graph | vello 0.9 links wgpu 29.0.4 and shares one device, one queue and one target texture with the renderer. |
+
+`stylo`, `reactive_graph`, `reactive_stores` and `any_spawner` are pinned to an exact patch
+release. `skrifa` may resolve to two copies — the text engine and the vector rasteriser are on
+different releases — and `linebender_resource_handle` to exactly one, which is what makes the two
+font-data types the same type and the glyph bridge free.
+
+## Replacing a backend
+
+Each seam names the crate to depend on, the traits to implement, and where the implementation is
+handed in.
+
+| What you replace | Depend on | Implement | Install with |
+|---|---|---|---|
+| The renderer | `zgui-render` | `Renderer` | `App::with_renderer`, which takes a `zgui_runtime::RendererFactory` |
+| The vector rasteriser | `zgui-render`, plus `zgui-render-wgpu` for the wgpu half | `VectorRaster`, plus `zgui_render_wgpu::VectorSource` | `WgpuRenderer::set_vector_factory_for`, normally through `zgui_render_vector_vello::attach` |
+| The platform | `zgui-platform` | `Surface`, `Clock`, `Waker`, `Clipboard`, `PlatformCx` | A driver `fn(Box<dyn AppHandler>) -> Result<(), PlatformError>` passed to `App::run_on` |
+| The text engine | `zgui-text` | `FontSource`, `FontMetricsSource`, `ParagraphShaper`, `GlyphRaster` | `zgui_runtime::App::with_text_engine`, `with_metrics` and `with_glyph_raster` |
+
+Three notes the source is explicit about.
+
+A platform backend does not implement `AppHandler` — it **calls** one. `zgui_runtime::Runtime` is
+the implementation, and the driver is handed it boxed. `zgui_platform_winit::run` is the shipped
+one, and `zgui::app::desktop()` returns it.
+
+A renderer with no vector rasteriser attached plans a display list's vector passes, counts them,
+and composites a scratch nothing ever wrote. That is not an error, not a warning and not a wrong
+colour, but an empty rectangle where a drawing should be. `zgui_render_vector_vello::attach` is one
+call, and every path that opens a renderer makes it.
+
+The umbrella `App` deliberately does not expose the three text factories. It installs them from
+`zgui::app::Fonts`, which serves every window and all three text seams, so a face registered once
+is visible to all of them. Replacing the text engine wholesale means building through
+`zgui_runtime::App` directly.
+
+<Callout type="warn">
+The argument order differs between the two builders. `zgui::App::run_on(driver, view)` takes the
+driver first. `zgui_runtime::App::run(view, driver)` takes the view first.
+</Callout>
+
+## Feature flags
+
+The whole workspace has five, and every one is off by default.
+
+| Crate | Feature | What it turns on |
+|---|---|---|
+| `zgui-profile` | `counters` | Keeps the frame counters live in a build that would otherwise drop them. They are compiled in whenever debug assertions are on, so this is what a release-mode test harness switches on. |
+| `zgui-view` | `stub-backend` | `zgui_view::stub::{StubDom, StubHost}`: an in-memory tree and host, enough to build a view, run its effects, mount it and read back what happened. Not a test harness. |
+| `zgui-bits` | `loom` | Builds every atomic out of `loom`'s instrumented primitives, for the concurrency model checks. A build with it on panics outside `loom::model`. |
+| `zgui-layout` | `wall-clock` | Compiles the `wall_clock` test target. Off by default so an unoptimised test run cannot report an unoptimised number as a regression. |
+| `zgui` | `wall-clock` | The same, for the path from an input event to a finished frame. |
+
+Features are additive, so naming `zgui-testkit-view` in `[dev-dependencies]` turns on
+`zgui-view/stub-backend` for that test build. `zgui-testkit-scene` names `zgui-profile/counters` as
+a **normal** dependency feature, not a development one: the crate exists to read those counters, and
+a build that compiled them out would make every assertion written against them pass while measuring
+nothing.
+
+## Lints, workspace-wide
+
+`[workspace.lints]` in the root manifest denies `missing_docs` and `unsafe_code`, denies broken
+intra-doc links, and warns on `unreachable_pub` and all of clippy. Every member writes
+`[lints] workspace = true`.
+
+`cargo xtask ledger unsafe` requires `#![forbid(unsafe_code)]` in the crate root of every member
+outside a six-entry allowlist, and each allowlist entry names what the crate needs unsafe *for*:
+
+| Crate | What it is permitted unsafe for |
+|---|---|
+| `zgui-arena` | chunk initialisation hands out address-stable references |
+| `zgui-dom` | the cell discipline and the mutation cell |
+| `zgui-geom` | plain-old-data impls for the types that cross to the GPU |
+| `zgui-render-wgpu` | GPU resource handling |
+| `zgui-render-vector-vello` | creating a pipeline cache from a stored blob |
+| `zgui-platform-winit` | the Wayland clipboard's unsafe constructor |
+
+Every hand-written `unsafe impl Send` or `unsafe impl Sync` in the workspace must carry a
+`// SAFETY:` comment directly above it. A crate that needs unsafe for something not on its row
+needs a new entry, and the review that comes with it.
+
+## Next
+
+<Cards>
+  <Card
+    title="Architecture overview"
+    href="/docs/architecture/overview"
+    description="The pipeline these crates implement, and the twenty seams between them."
+  />
+  <Card
+    title="Cost model"
+    href="/docs/performance/cost-model"
+    description="What each kind of change costs, measured, with the source of every number."
+  />
+  <Card
+    title="Measurements"
+    href="/docs/performance/measurements"
+    description="The bands, the standing gates, and how to run cargo xtask perf yourself."
+  />
+  <Card
+    title="The component library"
+    href="/docs/component-library"
+    description="An L8 crate that is an ordinary consumer of everything above."
+  />
+</Cards>

@@ -1,0 +1,121 @@
+---
+title: zgui
+description: A retained user interface framework for native Rust applications — components, signals, CSS, and a GPU pipeline the framework owns end to end.
+---
+
+zgui is a user interface framework for desktop applications written in Rust. It gives you
+components, fine-grained reactive state, CSS styling, text layout, accessibility and GPU rendering.
+It does not embed a browser, and it uses no HTML and no JavaScript.
+
+<Callout type="warn">
+zgui is under active development. The API is not yet stable. Pages mark anything that is expected
+to change with a badge such as <Status kind="planned">not built yet</Status>.
+</Callout>
+
+## What you need to know first
+
+These documents assume you know Rust well. They never explain a language feature.
+
+They assume you know **nothing** about user interfaces. Signals, the cascade, layout, damage,
+hit testing and stacking contexts are all explained from the beginning, in the order you meet them.
+You do not need to have used a UI framework before, and you do not need to know any other one.
+
+## The whole model, in one file
+
+```rust
+use zgui::prelude::*;
+
+#[component]
+fn Counter() -> impl IntoView {
+    let count = RwSignal::new(0);
+
+    view! {
+        column(class = "counter") {
+            text(class = "value") {{move || count.get().to_string()}}
+            control(on:click = move |_| count.update(|n| *n += 1)) {
+                "Increment"
+            }
+        }
+    }
+}
+
+const SHEET: &str = css!(
+    ":root {
+        background-color: #111318;
+        color: #f2f4f8;
+        font-family: sans-serif;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+    .counter { gap: 12px; align-items: center; }
+    .value { font-size: 48px; font-weight: 700; }
+    control {
+        padding: 8px 16px;
+        border-radius: 8px;
+        background-color: #356df3;
+    }"
+);
+
+fn main() -> Result<(), zgui::Error> {
+    app()
+        .with_title("Counter")
+        .with_size(360.0, 240.0)
+        .with_stylesheet(SHEET)
+        .run(|| view! { Counter() })
+}
+```
+
+Four ideas carry the whole framework, and all four are in that file.
+
+**A component runs once.** `Counter` is called one time. It builds its part of the document and
+returns. It is not called again when the count changes.
+
+**A signal is the state.** `RwSignal::new(0)` makes a value that remembers which closures read it.
+Writing it re-runs exactly those closures and nothing else.
+
+**A closure in a view is the reactive part.** `{move || count.get().to_string()}` is written to the
+document again whenever the count changes. The same expression without the closure —
+`{count.get().to_string()}` — is written once and never again. The difference is the type of the
+expression, not a keyword.
+
+**The appearance is CSS.** Selectors, the cascade, inheritance, flexbox, grid, gradients, shadows,
+filters and transforms. The `css!` macro checks the sheet where you write it.
+
+## How to read this
+
+The pages are ordered. Each one uses only what the pages before it established, so you can read
+straight through and end up knowing the framework. Each one also works alone, so you can arrive
+from a search engine and get an answer.
+
+## What is not covered until the end
+
+zgui ships a component library. This guide does not use it until the
+[last section](/docs/component-library). Everything before that builds what it needs out of the
+element vocabulary directly. By the time you reach the library you will be able to see how each of
+its components is put together — and decide whether you want it at all.
+
+## Next
+
+<Cards>
+  <Card
+    title="Getting started"
+    href="/docs/getting-started/what-zgui-is"
+    description="What a UI framework has to do, how to install this one, and the first application."
+  />
+  <Card
+    title="The guide"
+    href="/docs/learn/views"
+    description="Views, signals, components, control flow, events, styling and layout, in order."
+  />
+  <Card
+    title="Building interfaces"
+    href="/docs/building/text-and-fonts"
+    description="Task-shaped pages: keyboard input, scrolling, overlays, animation, accessibility, testing."
+  />
+  <Card
+    title="Under the hood"
+    href="/docs/architecture/overview"
+    description="The pipeline stage by stage, and what every part of a frame costs."
+  />
+</Cards>

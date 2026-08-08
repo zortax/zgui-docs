@@ -1,0 +1,377 @@
+---
+title: Views
+description: The view! grammar in full — calls, attribute lists, children blocks, and what a view is as a value.
+---
+
+A view describes a piece of the interface. You write one with the `view!` macro, which reads a
+small grammar of nested calls and blocks. This page covers that grammar completely and does not use
+signals; [Reactivity in views](/docs/learn/reactivity-in-views) adds those.
+
+## The shape
+
+```rust
+use zgui::prelude::*;
+
+view! {
+    column(class = "card") {
+        label(class = "card__title") {"Storage"}
+        row(class = "card__row") {
+            text {"Used"}
+            spacer()
+            text {"41 GB"}
+        }
+    }
+}
+```
+
+Every node is a **head**, followed by an attribute list, a children block, or both.
+
+<AnatomyDiagram
+  label="The parts of a view node"
+  parts={[
+    { value: 'column', label: 'The head: an element or component name.' },
+    { value: '(class = "card")', label: 'A comma-separated attribute list in parentheses.' },
+    { value: '{ … }', label: 'The children block in braces.' },
+  ]}
+/>
+
+Either part may be left out. **Both may not.**
+
+```rust
+view! {
+    spacer()             // attributes only, and there are none
+    label {"Total"}      // children only
+    label() {"Total"}    // the same thing, written out
+    label {}             // no attributes, no children
+}
+```
+
+<Callout type="error">
+A bare name is not a node. `spacer` on its own is a compile error that tells you the three things
+it could have meant: `spacer()` for a childless element, `{spacer}` for the value of a variable,
+or `"spacer"` for the text.
+</Callout>
+
+## The three kinds of node
+
+The first token decides which one you wrote, and nothing after it can change the answer.
+
+| You write | It is | Example |
+|---|---|---|
+| a string literal | text | `"Save"` |
+| a braced expression | a value converted into a view | `{label}` |
+| an identifier | a call: an element or a component | `row(...)` |
+
+```rust
+view! {
+    row {
+        "a literal"        // text
+        {name}             // an expression
+        column()           // a call
+    }
+}
+```
+
+### Text
+
+A string literal is a text child. It needs no element around it.
+
+```rust
+label {"Save"}
+```
+
+### Braced expressions
+
+A braced child is **exactly one expression**. Its value is converted into a view.
+
+```rust
+let title = String::from("Storage");
+
+view! {
+    label {{title}}                        // a String
+    text {{format!("{n} left")}}           // any expression
+    box {{maybe_footer}}                   // an Option<impl IntoView> renders nothing when None
+}
+```
+
+The doubled braces are not a mistake. The outer pair is the children block; the inner pair is the
+braced expression.
+
+<Callout type="warn">
+A bare expression is **not** a child. `column { item.label.clone() }` does not compile: `item` is
+read as a name beginning a call. Wrap it: `column { {item.label.clone()} }`. The same applies to a
+macro call — write `{format!("{n} left")}`, not `format!("{n} left")`.
+</Callout>
+
+### Calls
+
+An identifier begins a call. Whether it is an element or a component is decided by the case of the
+name:
+
+- lower case — an **element**: `row`, `text`, `control`. Resolved by the macro from the vocabulary.
+- upper camel case — a **component**: `Counter`, `Card`. An ordinary Rust function you wrote.
+
+A head can also be a path, which is how a vocabulary other than the built-in one is reached:
+
+```rust
+html::div()          // an element from a foreign vocabulary
+ui::Button()         // a component from another module
+```
+
+Hyphens are allowed in an element name and become underscores: `overlay-root()` calls
+`overlay_root()`. Rust keywords work as heads: `box()` is the element named `box`.
+
+## Children are juxtaposed
+
+Children are written one after another with no separator. No commas, no closing tags.
+
+```rust
+row {
+    "a"
+    {b}
+    column()
+}
+```
+
+Nesting is unlimited, and every level reads the same way.
+
+<Callout type="warn">
+A `{` after an attribute list is **always** that call's children, whatever whitespace stands
+between them. A macro cannot see line breaks. So this adopts the block as children:
+
+```rust
+vector(class = "axes")
+{"x"}                    // a child of `vector`, not a sibling
+```
+
+Write an empty block to keep them apart:
+
+```rust
+vector(class = "axes") {}
+{"x"}                    // now a sibling
+```
+</Callout>
+
+## Attributes
+
+Attributes go inside the parentheses, separated by commas, each written `name = value`. A trailing
+comma is allowed.
+
+```rust
+control(
+    class = "button",
+    tabindex = Focus::Sequential,
+    a11y:label = "Save",
+    on:click = save,
+)
+```
+
+A name written with no value is shorthand for `name = name`:
+
+```rust
+let hidden = true;
+box(hidden)             // the same as box(hidden = hidden)
+```
+
+### Values are ordinary Rust expressions
+
+An attribute value is any expression Rust admits. Commas inside it belong to it.
+
+```rust
+row(state:open = count.get() > 0)
+row(prop:mask = bits >> 2)
+row(n = value as Wrapping<u8>)
+row(x = if a > b { p } else { q })
+row(f = |x| -> Vec<u8> { x })
+row(on:click = move |ev: &mut EventCx<'_, Click>| f(ev))
+
+// A comma inside a closure is the closure's.
+For(key = |a: &Todo, b: &Todo| a.id > b.id, each = items) { "x" }
+```
+
+Braces around a value are optional and mean nothing: `class = {class}` and `class = class` produce
+the same code.
+
+<Callout type="info">
+One expression needs its braces: a **struct literal**, because a `{` after a value would otherwise
+open a children block. Write `at = {Point { x, y }}`. The error message tells you this if you
+forget.
+</Callout>
+
+### Namespaced attributes
+
+A prefix before a colon selects what kind of attribute it is. Ten namespaces exist; this page names
+them, and [Attributes](/docs/learn/attributes) documents each one.
+
+```rust
+row(
+    class = "row",                    // the class list
+    class:active = on,                // one class, toggled
+    style:gap = "1rem",               // one inline style property
+    var:--brand = "red",              // a CSS custom property
+    attr:data-testid = "row",         // an attribute selectors can match
+    prop:value = v,                   // a typed property on the element
+    state:disabled,                   // a built-in interaction state
+    custom_state:picked = p,          // a state of your own
+    on:click = handler,               // a listener
+    a11y:label = "Save",              // accessibility
+    node_ref = handle,                // a handle to the created node
+)
+```
+
+A custom property keeps the dashes it is declared with: `var:--brand`, not `var:brand`.
+
+### Spreading a bundle of attributes
+
+`{..expr}` replays a prepared bundle of attributes at the position it is written. Attributes before
+it apply first, attributes after it apply last, so a later one wins.
+
+```rust
+Button(class:mine = true, {..attrs}, attr:data-x = "1")
+```
+
+A spread goes in the attribute list. Written among the children it is a compile error that says so.
+
+## A view is a value
+
+`view!` is an expression. It produces a value that implements `IntoView`, and you can bind it, pass
+it, and return it like anything else.
+
+```rust
+let header = view! { label(class = "title") {"Storage"} };
+
+view! {
+    column {
+        {header}
+        text {"41 GB"}
+    }
+}
+```
+
+### Several roots make a fragment
+
+A `view!` with more than one root node produces a tuple. A `view!` with none produces `()`.
+
+```rust
+let two = view! {
+    label {"a"}
+    label {"b"}
+};
+```
+
+Both render as siblings wherever they are placed. There is no wrapper element and no extra node in
+the document.
+
+### What implements `IntoView`
+
+You rarely name it, but it explains what may sit in a braced child.
+
+| Type | What it renders |
+|---|---|
+| `&'static str`, `String`, `Rc<str>` | one text node, written again only when the string changes |
+| `bool`, `char`, and the integer and float primitives | their `to_string()` |
+| `()` | nothing, and contributes no node |
+| tuples, up to 26 members | a fragment: the members in order, each keeping its own type |
+| `Option<V>` | `None` renders nothing but keeps the place; `Some` to `Some` rebuilds in place |
+| `Vec<V>` | the items, matched **by position** — see the warning below |
+| `Result<V, E>` | the `Err` arm renders nothing and hands the error to the nearest **error boundary** — a wrapper that shows a fallback in its place. See [Error handling](/docs/learn/error-handling) |
+| a closure returning a view | a **reactive hole**: a part of the view the framework runs again when what it read changes. See [Reactivity in views](/docs/learn/reactivity-in-views) |
+| an element or component call | that element or component |
+| `AnyView` | whatever was erased into it |
+
+<Callout type="warn">
+`Vec<V>` is positional, not keyed: it rebuilds the shared prefix in place, builds the extra items
+and unmounts the surplus. That is right for a fixed set of children and wrong for a collection with
+identity. Use [`for`](/docs/learn/control-flow) for anything a user can insert into, remove from or
+reorder.
+</Callout>
+
+## Where a view goes
+
+At the top of an application, `run` takes a closure that builds the root view:
+
+```rust
+fn main() -> Result<(), zgui::Error> {
+    app()
+        .with_stylesheet(SHEET)
+        .run(|| view! { column(class = "app") { text {"Hello"} } })
+}
+```
+
+Inside a component, the view is what the function returns:
+
+```rust
+#[component]
+fn Header() -> impl IntoView {
+    view! { label(class = "title") {"Storage"} }
+}
+```
+
+And a component is called like any other node:
+
+```rust
+view! {
+    column {
+        Header()
+        text {"41 GB"}
+    }
+}
+```
+
+## What the macro refuses
+
+The grammar is small, so the errors are specific. These are worth recognising:
+
+| You wrote | The message |
+|---|---|
+| `spacer` | `` `spacer` is a name, not a node `` — with the three things it could have been |
+| `<row/>` | `` `<` cannot begin a node `` — the tag spelling was replaced by this grammar |
+| `column { 42 }` | `expected a node` — brace it: `{42}` |
+| `column { item.label() }` | `` `item` is a name, not a node `` |
+| `row() (class = "a")` | `` `(` cannot begin a node `` — one attribute list, and it comes first |
+| `row(class = "a" hidden)` | `attributes are separated by commas` |
+| `row(at = Point { x, y })` | `a struct literal` — brace the value |
+| `Card({attrs})` | names the spread spelling, `{..attrs}` |
+| `while() {}` | `has no meaning in a view` — `for` and `if` are the control flow a view has |
+
+## The grammar, formally
+
+For reference:
+
+```text
+view      = node* ;
+node      = text | block | call | flow ;
+text      = STRING_LITERAL ;
+block     = "{" expression "}" ;
+call      = head ( attrs children? | children ) ;
+head      = name | path ;
+name      = IDENT_ANY segment* ;
+segment   = "-" ( IDENT_ANY | INT_LITERAL ) ;
+path      = IDENT ( "::" IDENT )+ ;
+attrs     = "(" ( attr ( "," attr )* ","? )? ")" ;
+children  = "{" node* "}" ;
+```
+
+`flow` is `for` and `if`, which [Control flow](/docs/learn/control-flow) covers.
+
+<Callout type="info">
+`cargo fmt` does not format the inside of a `view!` block. It cannot: the contents are not Rust
+expressions. Indent by hand, and keep one node per line.
+</Callout>
+
+## Next
+
+The names you can call are a fixed vocabulary of sixteen.
+
+<Cards>
+  <Card
+    title="The element vocabulary"
+    href="/docs/learn/elements"
+    description="All sixteen element names, what each means, and the layout each starts with."
+  />
+  <Card
+    title="Signals"
+    href="/docs/learn/signals"
+    description="Reactive state, so that a view can change after it is built."
+  />
+</Cards>

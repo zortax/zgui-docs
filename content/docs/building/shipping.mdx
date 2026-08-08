@@ -1,0 +1,500 @@
+---
+title: Shipping an application
+description: The release build, the pinned toolchain, the desktop identity, the libraries a machine needs at run time, and what to check before a release.
+---
+
+An application built with zgui is one ordinary Rust binary. This page covers what to set before you
+build it, what the target machine has to provide, and what to check before you hand it to someone.
+It assumes [Installation](/docs/getting-started/installation) and the guide.
+
+## The release build
+
+Build with `--release`. Every number the repository publishes was measured that way. Its own
+wall-clock budget target is compiled only when a feature asks for it, and the gate runs that target
+in release, so that an unoptimised run cannot report an unoptimised number (`crates/zgui/Cargo.toml`).
+
+```bash
+cargo build --release
+```
+
+A debug build is not a slower release build. `debug_assertions` switches on work that is not
+present in a release binary at all:
+
+| What a debug build adds | Where |
+|---|---|
+| The frame counters are compiled in and every stage increments them | `crates/zgui-profile/src/counter/store/mod.rs` |
+| The reactive flush runs up to 32 iterations rather than 8 | `crates/zgui-reactive/src/executor/budget.rs` |
+| Each document node record is eight bytes larger, because the style engine's data carries a borrow token | `crates/zgui-dom/src/node/inner.rs` |
+| Every shader's declaration of an instance structure is checked once against the Rust structure | `crates/zgui-render-wgpu/src/pipeline/mod.rs` |
+| `spawn_local` off the UI thread panics, and creating a value with no current owner panics | `crates/zgui-reactive/src/executor/assert.rs` |
+| `set_timeout` outside a window's scope panics; a release build returns a handle that cancels nothing | `crates/zgui-view/src/time.rs` |
+
+The last two are the reason to keep a debug build in your own loop: they turn a silent leak and a
+timer that never fires into a message that names the mistake.
+
+### What is worth setting
+
+Cargo's `release` profile is already optimised. Three keys change something that matters here.
+
+```toml title="Cargo.toml"
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
+```
+
+- `lto` and `codegen-units` let the optimiser work across crate boundaries. An application's own
+  code is a small part of what runs in a frame: the cascade, layout, shaping and paint all live in
+  dependency crates, and every call into them crosses one of those boundaries.
+- `debug = "line-tables-only"` keeps a readable backtrace without changing the generated code. A
+  panic in a listener is otherwise a stack of addresses.
+
+<Callout type="warn">
+Do not set `panic = "abort"`. A task that panics reaches the caller of the flush and the executor
+stays usable, so the next frame polls what is left
+(`crates/zgui-reactive/src/executor/`). With `panic = "abort"` the same panic ends the process.
+</Callout>
+
+For your own development loop, optimise the dependencies and leave your crate unoptimised:
+
+```toml title="Cargo.toml"
+[profile.dev.package."*"]
+opt-level = 2
+```
+
+## The toolchain, in your project
+
+zgui has no stable-Rust build. The pin is a file, and rustup honours it in whatever directory the
+build starts from — so copy it into your own project root:
+
+```toml title="rust-toolchain.toml"
+[toolchain]
+channel = "nightly-2026-04-16"
+components = ["rustfmt", "clippy", "rust-src", "miri"]
+profile = "minimal"
+```
+
+Three things follow for reproducibility.
+
+1. **The compiler is a version, not a channel.** Two machines with this file build with the same
+   nightly. A project that writes `channel = "nightly"` instead builds with whatever was released
+   this morning.
+2. **Commit `Cargo.lock`.** An application is a binary, and a binary's lock file is part of what it
+   is. zgui itself pins every external dependency in one `[workspace.dependencies]` table — `wgpu`
+   at 29.0.4 workspace-wide, because the vector rasteriser links the same version and shares one
+   device, queue and target.
+3. **There is no minimum supported Rust version.** The pin moves deliberately, in its own commit,
+   with continuous integration green on the new toolchain first. Move your copy with it.
+
+## Naming the application to the desktop
+
+`with_title` names the *window*. `with_application_id` names the *program*.
+
+```rust
+use zgui::prelude::*;
+
+fn main() -> Result<(), zgui::Error> {
+    app()
+        .with_application_id("dev.example.Counter")
+        .with_title("Counter")
+        .with_size(360.0, 300.0)
+        .with_stylesheet(SHEET)
+        .run(|| view! { Counter(start = 0) })
+}
+```
+
+| Builder | What it sets | What reads it |
+|---|---|---|
+| `with_title` | the window title | the title bar, the window list, a screen reader |
+| `with_application_id` | the Wayland toplevel's `app_id`, and the general class of the X11 `WM_CLASS` with the instance part beside it | window rules, the icon, task-bar grouping |
+
+The identifier is set through both display servers' extensions, because which one the binary ends up
+on is decided when the event loop is built and the same binary runs under either
+(`crates/zgui-platform-winit/src/surface/attributes.rs`).
+
+An application that sets none carries an empty class. It has no icon of its own, no compositor rule
+can select it, and its windows group under nothing. That is the default: `with_application_id` is
+not called for you.
+
+### The convention
+
+Use a reverse-domain name — `dev.example.Counter`. The desktop matches the identifier against the
+base name of the `.desktop` file you ship, so the two must be the same string.
+
+```text title="/usr/share/applications/dev.example.Counter.desktop"
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Counter
+Comment=Counts things
+Exec=/usr/bin/counter
+Icon=dev.example.Counter
+Terminal=false
+Categories=Utility;
+```
+
+Three names have to agree:
+
+| Name | Value |
+|---|---|
+| the file, without `.desktop` | `dev.example.Counter` |
+| `with_application_id` in the binary | `dev.example.Counter` |
+| `Icon=`, and the icon file's own base name | `dev.example.Counter` |
+
+Install the icon as `/usr/share/icons/hicolor/scalable/apps/dev.example.Counter.svg`, or under a
+sized directory such as `256x256/apps` for a raster one. A per-user install puts both files under
+`~/.local/share/`.
+
+<Callout type="info">
+If you cannot rename the file to match the identifier, add `StartupWMClass=dev.example.Counter` to
+the entry. That is the X11 fallback the desktop uses to attach a running window to its entry. It
+does nothing on Wayland, where the base name is the only rule.
+</Callout>
+
+## What the platform decides
+
+An application asks for a title and a size. Everything else about the window is the desktop's.
+
+| Decided by | What |
+|---|---|
+| the application | title, starting size in CSS pixels, application identifier, style sheet, fonts |
+| the compositor | whether the starting size is honoured at all — a tiling compositor ignores it — and where the window is placed |
+| the output | the scale factor, and the refresh rate the frame loop parks against |
+| the desktop | the colour scheme, and how far one wheel detent travels |
+
+Three of those arrive as events after the window is open, and the framework handles each without
+you writing anything:
+
+- **Scale factor.** A change invalidates the layout cache in full, misses every shaped paragraph
+  and every rasterised glyph, and multiplies the scroll offsets. Computed styles are in CSS pixels
+  and survive untouched.
+- **Colour scheme.** The desktop's preference is applied before the first frame, so a dark desktop
+  never shows one light frame. A platform that cannot be asked reports nothing, and nothing is not
+  light: the window keeps the scheme it opened with.
+- **Refresh rate.** An output that reports no rate, or a rate of zero, is treated as 60 Hz
+  (`crates/zgui-platform/src/monitor.rs`).
+
+The window is created hidden and made visible by its first painted frame, never before it. That is
+what stops a flash of empty window at launch, and it is also what makes an accessibility adapter
+attachable — the adapter refuses a window that has already been shown.
+
+<Callout type="warn">
+The title and the starting size are set once, at build time. `zgui::App` exposes no way to change
+either while the application runs, and no way to set a minimum size, a maximum size, decorations or
+full screen. The platform layer has all of those; the umbrella crate does not publish them.
+</Callout>
+
+## Libraries the machine needs at run time
+
+Most of what a window needs is opened at run time rather than linked. Check the binary you built:
+
+```bash
+ldd target/release/my-app
+```
+
+```text
+libfontconfig.so.1
+libfreetype.so.6   libexpat.so.1   libz.so.1
+libbz2.so.1.0      libpng16.so.16  libbrotlidec.so.1
+libgcc_s.so.1      libm.so.6       libc.so.6
+```
+
+| Library | How it is reached | Needed for |
+|---|---|---|
+| `libfontconfig.so.1` and its own dependencies | linked; it is in the binary's list | enumerating the faces installed on the machine |
+| `libxkbcommon.so.0` | opened at run time | turning key codes into characters |
+| the Wayland client libraries | opened at run time | a Wayland session |
+| `libX11.so.6`, `libXcursor`, `libXi`, `libXrandr`, `libxcb` | opened at run time | an X11 session |
+| `libvulkan.so.1`, or `libEGL.so.1` and `libGL.so.1` | opened at run time | the graphics device |
+
+Fontconfig is the one hard link, and it comes from font enumeration. An application built with
+`Fonts::shipped_only()` and its own registered faces still links it but does not enumerate through
+it — see [Text and fonts](/docs/building/text-and-fonts).
+
+A missing run-time library is not a link error. It is a failure at the moment the window is opened,
+which is why the four checks below are worth running on a clean machine rather than on the one you
+built on.
+
+<Steps>
+
+<Step>
+
+**Both display servers.** Run once under Wayland and once with `WAYLAND_DISPLAY` unset so the X11
+path is taken. They are different code, and the identifier reaches the window through a different
+extension in each.
+
+</Step>
+
+<Step>
+
+**A fractional scale factor.** Set the display to 125% or 150%. A ratio change re-shapes every
+paragraph and re-rasterises every glyph, so this is where a text bug appears.
+
+</Step>
+
+<Step>
+
+**Both colour schemes.** Switch the desktop between light and dark while the application is
+running. A desktop-wide change reaches the window, and the next frame restyles the document.
+
+</Step>
+
+<Step>
+
+**A screen reader.** The accessibility tree goes out over AT-SPI, on the session bus, and it is
+published only while something is listening. Nothing is published on a machine with no assistive
+technology running, so a broken tree is invisible until you start one. See
+[Accessibility](/docs/building/accessibility).
+
+</Step>
+
+</Steps>
+
+## The graphics device
+
+zgui opens a device through wgpu. Vulkan and OpenGL are both enumerated by default: a machine that
+has only GL is a machine that would otherwise be shown a black window.
+
+Adapters are sorted, then each is **tried in turn**. A device is created from the candidate and a
+surface is configured for it under a validation error scope, because the capabilities an adapter
+reports are not always the capabilities a device made from it has.
+
+The sort order is:
+
+1. the device id named in `ZGUI_DEVICE_ID`, if one was named;
+2. discrete, then integrated, then virtual, then software;
+3. Vulkan before GL.
+
+| Variable | Value | Effect |
+|---|---|---|
+| `ZGUI_BACKENDS` | `vulkan`, `gl`, both comma-separated, `all`, or `none` | restricts which backends are enumerated at all |
+| `ZGUI_DEVICE_ID` | a decimal or `0x`-prefixed PCI device id | a preference in the sort, not a filter |
+
+An unrecognised word contributes nothing, so `ZGUI_BACKENDS=nonsense` asks for the same thing as
+`none`. That is deliberate: a typo that fell back to every backend would make the variable useless
+for reproducing a machine with no device.
+
+<Callout type="info">
+`WGPU_BACKEND` is wgpu's own variable and zgui does not consult it. The instance is built with an
+explicit backend set from `ZGUI_BACKENDS`, so wgpu's environment reader is never called
+(`crates/zgui-render-wgpu/src/renderer/builder.rs`).
+</Callout>
+
+### When no adapter works
+
+There is no silent fallback. When every candidate is rejected, `run` returns
+`zgui::Error::GpuUnavailable`, carrying every adapter that was tried and the reason each failed.
+
+```rust
+fn main() {
+    if let Err(error) = app().with_title("Counter").run(|| view! { Counter() }) {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
+}
+```
+
+The message reads `no usable graphics device: N adapter(s) were tried and rejected`, and the error's
+`candidates` field holds the name and the reason for each one. Reporting the list is the point: "no
+device" with no explanation is a bug report nobody can act on.
+
+The alternative — opening an offscreen surface and drawing into it — is refused by design. A window
+that appears and never paints looks like a program that has hung.
+
+<Callout type="idea">
+Reproduce that path on a working machine with `ZGUI_BACKENDS=none`. It is the only way to see what
+a user with no driver sees without uninstalling a driver.
+</Callout>
+
+### Software rendering
+
+A software adapter sorts last and is still a candidate. Mesa's software rasteriser is a supported
+target: the repository's own continuous integration runs the whole suite on it, with
+`VK_ICD_FILENAMES` pointing at `lvp_icd.x86_64.json` and `LIBGL_ALWAYS_SOFTWARE=1`
+(`.github/workflows/ci.yml`).
+
+The vector rasteriser that draws every `vector` element needs no compute shaders, so there is no
+machine on which a window opens with its drawings missing.
+
+### The pipeline cache
+
+The driver's compiled pipelines are kept between runs, keyed by the adapter's identity:
+
+```text
+$XDG_CACHE_HOME/zgui/pipelines/<adapter key>
+~/.cache/zgui/pipelines/<adapter key>      # when XDG_CACHE_HOME is unset
+```
+
+`ZGUI_CACHE_DIR` names a different directory. This is a first-launch saving, and a saving on drivers
+that keep no cache of their own. A cache that cannot be written is logged and ignored — refusing to
+start over it would be absurd.
+
+## Startup cost
+
+`cold.first_frame` measures a real wall clock from nothing to a gallery of 1 851 boxes painted in a
+window. Every other measurement in the repository runs on a virtual clock; this one cannot.
+
+The **band** is the ceiling this build must stay under; the **budget** is what the design was
+supposed to cost. See [Measurements](/docs/performance/measurements).
+
+| Measurement | Value | Band | Budget |
+|---|---:|---:|---|
+| `cold.first_frame`, headless | 103.31 ms | 140.00 | 250.00 met |
+| the same start on a real desktop | 216–247 ms | — | 250.00 met |
+
+Measured on the maintainer's machine and recorded in `docs/performance.md`, which
+`cargo xtask perf` generates. The desktop figure is the rationale string shipped with the band in
+`crates/zgui-bench/src/scenario/cold.rs`.
+
+What is inside the headless number:
+
+- font enumeration;
+- style sheet parsing;
+- the first cascade over a document with no previous style to reuse;
+- the first layout with no cached measurement;
+- the first frame's whole emission — 844 primitives, against 4 575 culled.
+
+**The difference between the two numbers is the graphics device**: enumerating adapters, creating
+one, and compiling the pipeline set. It is excluded from the measured scenario on purpose. What a
+driver takes to compile a pipeline is a property of the machine and varies by more than everything
+else put together, so a band around it would fire on a driver update rather than on a change to the
+framework.
+
+Two consequences for shipping:
+
+- The device dominates a cold start, and the pipeline cache is what removes most of it on the
+  second launch. Test the *first* launch on a clean profile.
+- The cold-start number is measured once per process and never repeated. The second start in a
+  process is not cold, and neither is the second launch on a machine.
+
+## Windows
+
+An application can open several windows. They share the application identifier and the default
+graphics device, but each has its own document, surface, stylesheet override, layout, caches, and
+accessibility tree. The default exit policy stops the process after the last window closes.
+
+Use an [overlay](/docs/building/overlays-and-portals) for content that belongs inside one window. Use
+a [separate window](/docs/building/windows) when the desktop must move, resize, minimize, or place it
+independently.
+
+## Versions and the public API
+
+| Question | Answer today |
+|---|---|
+| Published to crates.io | no |
+| Version | `0.1.0`, one workspace version, every crate released together |
+| Semantic versioning in force | no baseline yet |
+| Crates under `crates/` | 53, of which 49 are published |
+
+`cargo xtask release` runs two checks. The first is lockstep: every member inherits the workspace
+version, and every dependency on another member carries a version requirement beside its path. The
+second is `cargo-semver-checks` against the newest `v*` tag. No such tag exists, so it reports
+**no baseline** rather than passing quietly — a gate that says "ok" when it did not run is worse
+than no gate.
+
+Three rules already hold on the published surface, and one of them affects code you write now:
+
+- **`#[non_exhaustive]`** is on every enum whose set is expected to grow — error enums, the reasons
+  a frame did not reach the screen. A `match` on `zgui::Error` needs a `_` arm.
+- **`#[doc(hidden)]`** covers the items that exist only so one crate can reach another. The
+  macro-expansion roots stay visible, because a crate writing views without the umbrella has to
+  know they exist.
+- A trait a consumer implements stays extensible by giving every later method a default body,
+  because a trait cannot carry `#[non_exhaustive]`.
+
+### Which crates an application names
+
+`zgui` is the only framework dependency most applications need. It re-exports canvas, custom
+element, and surface APIs. Add `zgui-image` only when the application must register encoded image
+bytes from memory; a file-path `image` source needs only `zgui`.
+
+```toml title="Cargo.toml"
+[dependencies]
+zgui = { git = "https://github.com/zortax/zgui" }
+
+[dev-dependencies]
+zgui-testkit-view = { git = "https://github.com/zortax/zgui" }
+zgui-platform-headless = { git = "https://github.com/zortax/zgui" }
+```
+
+The test instruments are published crates and public API, and **none of them is re-exported through
+`zgui`**. Name them yourself, in `[dev-dependencies]`, so that an application links none of the
+harness. See [Testing](/docs/building/testing).
+
+`crates/probe`, `zgui-bench`, `zgui-conformance` and `zgui-examples` carry `publish = false`. They
+are the repository's own instruments and are not API.
+
+## Before a release
+
+<Steps>
+
+<Step>
+
+**Build with `--release`** and run the binary, not `cargo run`. A profile difference is the easiest
+thing to measure by accident.
+
+</Step>
+
+<Step>
+
+**Set `with_application_id`** and ship the matching `.desktop` file and icon. Check the result:
+`xprop WM_CLASS` on X11, or your compositor's window list on Wayland.
+
+</Step>
+
+<Step>
+
+**Run `ldd`** on the binary and install what it names on the target machine. Then run it on a
+machine you did not build on.
+
+</Step>
+
+<Step>
+
+**Run with `ZGUI_BACKENDS=none`** and read what your `main` prints. That is the message a user with
+no working driver gets, and it is the one you will be sent.
+
+</Step>
+
+<Step>
+
+**Run on the software rasteriser** if you support machines without a driver, and delete
+`~/.cache/zgui/pipelines` before you time a cold start.
+
+</Step>
+
+<Step>
+
+**Test at 100% and at 150% scale**, in light and in dark, under both display servers.
+
+</Step>
+
+<Step>
+
+**Run your headless tests in release**, so the numbers they assert are the numbers the binary
+produces.
+
+</Step>
+
+<Step>
+
+**Commit `Cargo.lock` and `rust-toolchain.toml`.** Together they are the build.
+
+</Step>
+
+</Steps>
+
+## Next
+
+<Cards>
+  <Card
+    title="Architecture overview"
+    href="/docs/architecture/overview"
+    description="The whole pipeline, the layering rules, and the seams a consumer meets."
+  />
+  <Card
+    title="The cost model"
+    href="/docs/performance/cost-model"
+    description="What each kind of change costs, and the measured numbers behind every claim."
+  />
+</Cards>

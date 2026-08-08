@@ -1,0 +1,234 @@
+---
+title: Children and slots
+description: Taking content from the caller — the Children and ChildrenFn prop types, and named slots for more than one region.
+---
+
+A component that wraps or arranges content needs the caller to supply that content. Two prop types
+do this, and a third mechanism handles a component with more than one region to fill. This page
+assumes [Components](/docs/learn/components).
+
+## `Children`
+
+Declare a prop of type `Children` and the caller's block becomes its value.
+
+```rust
+use zgui::prelude::*;
+
+/// A bordered region with a heading above it.
+#[component]
+fn Panel(
+    /// What the panel is called.
+    #[prop(into)]
+    title: String,
+    /// What it shows.
+    children: Children,
+) -> impl IntoView {
+    view! {
+        column(class = "panel") {
+            label(class = "panel__title") {{title}}
+            box(class = "panel__body") {{children.into_view_once()}}
+        }
+    }
+}
+```
+
+```rust
+view! {
+    Panel(title = "Storage") {
+        text {"41 GB used"}
+        text {"9 GB free"}
+    }
+}
+```
+
+`Children` holds an `FnOnce`. Call `into_view_once()` where the content belongs. You may call it
+once, which matches the ordinary case: put the children somewhere and never ask again.
+
+| Method | What it does |
+|---|---|
+| `Children::new(f)` | wraps an `FnOnce() -> AnyView` |
+| `Children::from_view(v)` | wraps a view that is already built |
+| `into_view_once()` | consumes it and yields the view |
+
+### Optional children
+
+```rust
+#[component]
+fn Separator(
+    /// What stands between the two things, when it is not the default.
+    #[prop(optional)]
+    children: Option<Children>,
+) -> impl IntoView {
+    match children {
+        Some(children) => children.into_view_once(),
+        None => AnyView::new("/"),
+    }
+}
+```
+
+```rust
+view! { Separator() }        // renders "/"
+view! { Separator {"—"} }    // renders "—"
+```
+
+## `ChildrenFn`
+
+Use `ChildrenFn` when the content may be built **more than once**: it appears in two places, or it
+is taken away and shown again.
+
+The example below uses the view grammar's own `if`. It takes a closure and builds its body while the
+answer holds, then removes it again. [Control flow](/docs/learn/control-flow) covers it.
+
+```rust
+#[component]
+fn Tooltip(
+    /// The content of the bubble, which is rebuilt each time it opens.
+    children: ChildrenFn,
+) -> impl IntoView {
+    let open = RwSignal::new(false);
+
+    view! {
+        box(
+            on:pointer_enter = move |_| open.set(true),
+            on:pointer_leave = move |_| open.set(false)
+        ) {
+            if move || open.get() {
+                box(class = "tooltip") {{children.view()}}
+            }
+        }
+    }
+}
+```
+
+| Method | What it does |
+|---|---|
+| `ChildrenFn::new(f)` | wraps an `Fn() -> AnyView` |
+| `view()` | builds the content; may be called any number of times |
+
+`ChildrenFn` is `Clone`, and a `ChildrenFn` converts into a `Children`.
+
+<Callout type="warn">
+Reach for `ChildrenFn` only when you need it. `Children` says "built once" in the type, and a
+reader of the component signature can rely on that.
+</Callout>
+
+## Slots
+
+A component with more than one region cannot use a single children block for all of them. A **slot**
+is a named region, declared as a struct.
+
+```rust
+use zgui::prelude::*;
+
+/// The heading of a [`Card`].
+#[slot]
+pub struct CardHeader {
+    /// What the heading shows.
+    children: Children,
+}
+
+/// A card, with an optional heading.
+#[component(slot_aware)]
+pub fn Card(
+    /// The heading, when there is one.
+    #[prop(optional)]
+    card_header: Option<CardHeader>,
+    children: Children,
+) -> impl IntoView {
+    let heading = card_header.map(|header| header.children.into_view_once());
+
+    view! {
+        column(class = "card") {
+            {heading}
+            box(class = "card__body") {{children.into_view_once()}}
+        }
+    }
+}
+```
+
+```rust
+view! {
+    Card {
+        CardHeader(slot) {"Total"}
+        "£12.00"
+    }
+}
+```
+
+Three rules:
+
+1. **A slot child carries the `slot` attribute.** `CardHeader(slot) { … }`.
+2. **It fills the prop named after its type**, in snake case: `CardHeader` fills `card_header`. To
+   fill a differently named prop, write `CardHeader(slot = "header")`.
+3. **The parent needs `#[component(slot_aware)]`.** Without it, the compile error says so and names
+   the component.
+
+A slot's own fields are props and take the same `#[prop(...)]` attributes as a component's
+arguments. `#[slot]` itself takes no options, and the struct must have named fields.
+
+### What a slot may take
+
+A slot's attribute list accepts its own props, `class`, `let:` and `slot`. Nothing else:
+
+```text
+a slot takes props of its own, and nothing that belongs to an element
+
+note: a slot is not an element, so it has nowhere to put a listener, an attribute or a state
+help: put them on an element inside the slot's children
+```
+
+Slots nest: a slot child of a slot fills that slot's own prop.
+
+<Callout type="info">
+Slots are rarely the right answer. Two `Children`-typed props, or two ordinary nested components,
+usually read better and compose better. Reach for a slot when the region genuinely belongs to the
+parent's structure and cannot be a component of its own.
+</Callout>
+
+## Passing a builder instead
+
+For a region whose content depends on something the parent computes, take a closure prop rather
+than children:
+
+```rust
+#[component]
+fn Repeat<F>(
+    /// How many times to repeat.
+    times: usize,
+    /// Called once per repetition, with the index.
+    children: F,
+) -> impl IntoView
+where
+    F: Fn(usize) -> AnyView + 'static,
+{
+    let items: Vec<AnyView> = (0..times).map(&children).collect();
+    view! { {items} }
+}
+```
+
+The caller writes the closure with `let:`, which names the argument the children block receives:
+
+```rust
+view! {
+    Repeat(times = 3, let:index) {
+        text {{index.to_string()}}
+    }
+}
+```
+
+This is the same mechanism `for` uses for its row binding.
+
+## Next
+
+<Cards>
+  <Card
+    title="Control flow"
+    href="/docs/learn/control-flow"
+    description="for and if inside a view, and the components they lower to."
+  />
+  <Card
+    title="Events"
+    href="/docs/learn/events"
+    description="Listeners, the dispatch path, and what a handler receives."
+  />
+</Cards>

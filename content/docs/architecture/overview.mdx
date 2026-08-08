@@ -1,0 +1,246 @@
+---
+title: Architecture overview
+description: What zgui is made of, how a frame gets from a pointer movement to pixels, and the three ideas the design turns on.
+---
+
+This section explains how the framework works inside. **You do not need any of it to write an
+application.** It is here because it explains the rules the guide states without justifying them:
+why a component runs once, why a signal write settles at the end of a frame, and why changing a
+colour costs less than changing a width.
+
+It assumes the whole of [the guide](/docs/learn/views).
+
+## The shape of it
+
+zgui is **retained**. Nothing is rebuilt per frame that did not change: not the document, not the
+computed styles, not the box tree, not the shaped paragraphs, not the display list, and not the
+pixels. Every stage keeps its result and is handed a description of what became invalid.
+
+<FlowDiagram
+  label="The one-way architecture of zgui"
+  items={[
+    {
+      title: 'Components and signals',
+      code: 'zgui-view · zgui-view-macro · zgui-elements · zgui-reactive',
+      next: 'Create and update nodes through the Dom seam',
+    },
+    {
+      title: 'The document',
+      code: 'zgui-dom',
+      next: 'Invalidation, recorded as obligations on nodes',
+    },
+    {
+      title: 'The cascade',
+      code: 'zgui-style · zgui-css',
+      next: 'Computed styles plus the damage they imply',
+    },
+    {
+      title: 'The box tree and layout',
+      code: 'zgui-layout · zgui-text · zgui-text-parley',
+      next: 'Fragments: geometry, hit regions, and stacking order',
+    },
+    {
+      title: 'Paint',
+      code: 'zgui-paint',
+      next: 'A display list: primitives, batches, vector passes, and damage',
+    },
+    {
+      title: 'The renderer',
+      code: 'zgui-render · zgui-render-wgpu',
+      description: 'The renderer contract, a GPU implementation, and a vector rasteriser.',
+      next: 'Present',
+    },
+    {
+      title: 'A surface',
+      code: 'zgui-platform · zgui-platform-winit · zgui-platform-headless',
+    },
+  ]}
+/>
+
+The arrows are one way. A stage never reaches back up: layout does not mutate the document, paint
+does not consult the cascade, and the renderer knows nothing about elements.
+
+That rule is what makes each stage testable alone, and it is why every horizontal edge in the
+diagram is a value type rather than a shared object.
+
+## One frame
+
+`zgui-runtime` is the crate that runs the diagram. One frame, in order:
+
+<Steps>
+
+<Step>
+
+**Input.** The platform reports an event. The input system resolves what was under the pointer from
+the previous frame's fragments, and builds the capture, target and bubble path. The runtime calls
+the listeners on it.
+
+</Step>
+
+<Step>
+
+**Reactive settle.** Listener bodies write signals. Writing marks observers; it does not run them.
+Once dispatch is finished, the frame flushes the reactive graph, and the effects that run mutate the
+document through the same seam a view builds through.
+
+</Step>
+
+<Step>
+
+**Restyle.** The style engine walks only the elements that owe a restyle, computes their styles, and
+turns what changed into obligations for the stages below. A colour change is repaint damage; a width
+change is relayout.
+
+</Step>
+
+<Step>
+
+**Layout.** Box-tree patches are applied for the subtrees that changed, the layout algorithm runs
+over the dirty region, and paragraphs are shaped or re-broken only where their content or their
+available width moved. The result is a fragment tree.
+
+</Step>
+
+<Step>
+
+**Paint.** The stacking-order walk replays the display-list recording for fragments that did not
+change, re-emits only those that did, and culls against the damage rectangles.
+
+</Step>
+
+<Step>
+
+**Draw.** The renderer is handed the finished display list and the damage set, and composes into a
+target it keeps between frames. Outside the damage, the last frame's pixels are still correct and
+are not touched.
+
+</Step>
+
+<Step>
+
+**Publish.** The accessibility tree is diffed and published, and the frame probe — the seam the
+inspector attaches to — is called once with the window as it was left.
+
+</Step>
+
+</Steps>
+
+Then the loop parks. It burns nothing until one of exactly four things asks for another frame:
+
+- a document mutation;
+- an input event;
+- work completing on another thread;
+- a deadline, such as an animation or a timer.
+
+A frame that raises several of those inside itself costs one more frame, not several.
+[The frame](/docs/architecture/the-frame) takes this apart step by step.
+
+## Crates, by layer
+
+Dependencies can point within a layer or to a lower layer. They do not point to a higher layer. The
+layer of a crate is stated at the top of its manifest, and the manifest graph is checked
+mechanically.
+
+| Layer | Crates | What the layer is |
+|---|---|---|
+| L0 foundation | `zgui-geom`, `zgui-color`, `zgui-arena`, `zgui-interned`, `zgui-bits`, `zgui-profile` | Coordinate spaces, colour, storage whose addresses hold still, interned names, invalidation bits, counters. No policy. |
+| L1 contracts | `zgui-vocab`, `zgui-css`, `zgui-scene`, `zgui-render`, `zgui-atlas`, `zgui-platform`, `zgui-reactive` | The traits and value types the rest of the tree agrees on. Nothing here implements anything replaceable. |
+| L2 backends | `zgui-render-wgpu`, `zgui-render-vector-vello`, `zgui-render-vector-coverage`, `zgui-platform-winit`, `zgui-platform-headless` | Implementations of L1 contracts. Every one is replaceable, and every one has a sibling. |
+| L3 document | `zgui-dom` | One arena of nodes, safe to read from many threads while the cascade runs over it. |
+| L4 engines | `zgui-style`, `zgui-layout`, `zgui-text`, `zgui-text-style`, `zgui-text-parley`, `zgui-paint`, `zgui-svg` | The stages that turn a document into a display list. |
+| L5 systems | `zgui-input`, `zgui-scroll`, `zgui-a11y`, `zgui-anim`, `zgui-edit` | Behaviour over a laid-out document: hit testing and dispatch, scrolling, the accessibility projection, transitions, text editing. |
+| L6 frontend | `zgui-view`, `zgui-view-dom`, `zgui-view-macro`, `zgui-elements` | How an interface is described, and the three seams it is described against. |
+| L7 runtime and tooling | `zgui-runtime`, `zgui`, `zgui-testkit-scene`, `zgui-testkit-view`, `zgui-conformance` | The frame pipeline, the umbrella crate an application depends on, and the instruments. |
+| L8 product | `zgui-ui`, `zgui-ui-primitives`, `zgui-ui-tokens`, `zgui-ui-icons`, `zgui-devtools`, `zgui-bench`, `zgui-examples` | The component library, the inspector, the measurement harness, the worked applications. Ordinary consumers of the public API. |
+
+`zgui` is the crate an application depends on. Everything else is reachable through it, and an
+application that only describes an interface never names any of the others.
+
+[The crate map](/docs/architecture/crate-map) covers every crate and the rule that keeps the arrows
+pointing one way.
+
+## The seams
+
+A seam is a trait with an implementation on each side and no third party allowed to reach across it.
+These are the seams a consumer is most likely to meet.
+
+| Seam | Crate | What plugs in |
+|---|---|---|
+| `Renderer` | `zgui-render` | A device that puts a display list on a screen. |
+| `VectorRaster` | `zgui-render` | A path rasteriser whose output the renderer composites. |
+| `Surface`, `AppHandler`, `Clock`, `Waker`, `Clipboard` | `zgui-platform` | A windowing system, or the absence of one. |
+| `Dom`, `ViewHost`, `EventSink` | `zgui-view` | The node tree, the engine that laid it out, and where a handler's commands go. |
+| `SheetLoader`, `ReplacedContent`, `LinkResolver`, `PresentationalHints` | `zgui-dom` | The four things a document language brings that a document core cannot define for itself. |
+| `FontSource`, `FontMetricsSource`, `ParagraphShaper`, `GlyphRaster` | `zgui-text` | A font engine, or a fixed-metrics stand-in for tests. |
+| `HostBinding` | `zgui-runtime` | An embedded script engine's event, frame and shutdown hooks. |
+| `FrameProbe` | `zgui-runtime` | A reader of the window as each frame left it. |
+| `MeasureContent` | `zgui-layout` | The measurement of anything layout cannot size itself. |
+
+Most of these seams have two in-tree implementations. `HostBinding` is the exception: zgui provides
+the no-op binding, and a downstream script engine provides the active binding.
+
+## Windows
+
+An application owns one reactive scope above all its windows. Each window below it owns a separate
+document and frame pipeline. Application contexts and their signals can be shared; node handles and
+window-local contexts cannot cross document identities.
+
+Window creation and destruction are deferred to an event-loop turn that has a platform context.
+The default graphics factory gives each surface a renderer while sharing its device and compiled
+pipelines where the adapter supports that surface. Window-sized targets, buffers, and atlases stay
+per window.
+
+See [Multiple windows](/docs/building/windows) for the public API and
+[The frame](/docs/architecture/the-frame#more-than-one-window) for the lifecycle.
+
+## The three ideas the design turns on
+
+### Invalidation is a lattice, not a flag
+
+A node carries what it **owes** — restyle, relayout, repaint, and the subtree half of each — and
+every stage retires exactly the obligations it serviced as it walks. A stage never has to ask "did
+anything change?" globally; it is handed the set.
+
+[Invalidation](/docs/architecture/invalidation) has the exact bits and the propagation rules.
+
+### A description is a value
+
+The display list is a value with no renderer in it. A computed style is a shared pointer that two
+elements which cascaded alike hold the same copy of. A fragment tree is data.
+
+Everything crossing a stage boundary can be printed, compared and asserted on with no device and no
+window. That is why most of this framework's tests run headless, and it is what makes
+[testing an application](/docs/building/testing) practical.
+
+### Cost is proportional to change
+
+A signal write invalidates precisely its observers. A restyle visits the elements that owe one. A
+frame emits the primitives the damage rectangles reach.
+
+There is no per-frame full traversal anywhere in the pipeline, and the absence of one is measured
+rather than assumed. [Performance](/docs/performance/cost-model) gives the numbers.
+
+## Next
+
+<Cards>
+  <Card
+    title="The frame"
+    href="/docs/architecture/the-frame"
+    description="Every step of the loop, what it reads and writes, and exactly what wakes it."
+  />
+  <Card
+    title="The document"
+    href="/docs/architecture/the-document"
+    description="The node arena, and the seams a document language of your own plugs into."
+  />
+  <Card
+    title="Invalidation"
+    href="/docs/architecture/invalidation"
+    description="The bits, how obligations propagate and retire, and how damage rectangles merge."
+  />
+  <Card
+    title="Cost model"
+    href="/docs/performance/cost-model"
+    description="What each kind of change costs, measured."
+  />
+</Cards>

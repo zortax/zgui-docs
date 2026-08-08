@@ -1,0 +1,192 @@
+---
+title: Tokio integration
+description: Install Tokio as the background executor, await Tokio resources in UI tasks, and connect Tokio channels to reactive state.
+---
+
+zgui does not require Tokio. Its default background pool can run ordinary futures and blocking
+work. It cannot provide the runtime context required by `tokio::time`, `tokio::net`,
+`tokio::fs`, or libraries built on these APIs.
+
+Enable the optional integration when the application uses these APIs. This page assumes Tokio
+experience and [Background work](/docs/learn/background-work).
+
+## Enable and install Tokio
+
+Enable the zgui feature. Add Tokio as a direct dependency when application code names Tokio APIs.
+Select the Tokio features that the application uses.
+
+```toml
+[dependencies]
+zgui = { version = "0.1", features = ["tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "sync"] }
+```
+
+Install the runtime before the application opens its first window:
+
+```rust
+use zgui::prelude::*;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let _tokio = zgui::tokio::install()?;
+
+    app()
+        .with_title("Tasks")
+        .run(|| view! { App() })?;
+    Ok(())
+}
+```
+
+Keep the `Installed` guard for the complete application lifetime. Dropping it shuts down the
+runtime and abandons background work.
+
+Call `install` before the first call to `background` or `blocking`. The first background operation
+starts or selects an executor for the process. zgui rejects a later replacement with
+`SpawnerError::AlreadyRunning`.
+
+## What installation changes
+
+Installation makes two changes:
+
+1. `background` uses the Tokio runtime. `blocking` uses Tokio's blocking pool.
+2. Each UI-thread task poll enters the Tokio runtime context.
+
+The second change lets a UI task create and await Tokio resources directly:
+
+```rust
+use std::time::Duration;
+
+spawn(async move {
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    visible.set(false);
+});
+```
+
+The future still runs on the UI thread. Tokio supplies its drivers and wake mechanism. It does not
+move the zgui task to a Tokio worker.
+
+<Callout type="warn">
+Tokio integration does not change the frame budget. Waiting for a timer or socket on the UI thread
+is inexpensive. Parsing a large response on that thread delays the frame. Move CPU work to
+`background` or `blocking`.
+</Callout>
+
+Use `background` when a Tokio-based library must perform its work away from the UI thread:
+
+```rust
+spawn(async move {
+    let result = background(async move {
+        client.load_rows().await
+    })
+    .await;
+
+    rows.set(result);
+});
+```
+
+## Use an existing runtime
+
+Use `install_handle` when the process already owns a Tokio runtime.
+
+```rust
+let runtime = tokio::runtime::Runtime::new()?;
+let _tokio = zgui::tokio::install_handle(runtime.handle().clone())?;
+```
+
+The returned guard does not own or shut down this runtime. The application must keep the runtime
+alive.
+
+The background executor is process-wide. The runtime context for UI task polls is thread-local.
+If an application has another independent UI thread, call `enter_here` on that thread:
+
+```rust
+zgui::tokio::enter_here(runtime.handle().clone());
+```
+
+Call it after that thread installs its reactive runtime and before its first frame. Do not install
+a second background executor.
+
+## Tokio synchronization channels
+
+Tokio synchronization types do not require a Tokio runtime. A zgui UI task can await `mpsc`,
+`watch`, `broadcast`, and `oneshot` without calling `install`.
+
+The `zgui::tokio` module provides scoped receiver helpers. Each helper runs its receiver in a UI
+task and calls the callback on the UI thread.
+
+### `mpsc`
+
+```rust
+let task = zgui::tokio::spawn_receiver(receiver, move |message| {
+    messages.update(|items| items.push(message));
+});
+```
+
+The task ends when all senders are dropped. Disposing the current scope also cancels it.
+
+### `watch`
+
+```rust
+let status = zgui::tokio::watch_signal(status_receiver);
+```
+
+`watch_signal` returns a read-only signal. Its initial value is the value already stored in the
+channel. It then updates the signal for each change.
+
+Use `spawn_watch` when a callback is more suitable:
+
+```rust
+zgui::tokio::spawn_watch(receiver, move |value| {
+    apply_status(value);
+});
+```
+
+The callback receives the current value immediately and then receives each change.
+
+### `broadcast`
+
+```rust
+zgui::tokio::spawn_broadcast(receiver, move |event| {
+    latest.set(Some(event));
+});
+```
+
+If the receiver falls behind, Tokio removes old messages. zgui logs the number of missed messages
+at `warn` level and continues with the oldest available message. The task ends when the channel is
+closed.
+
+## API summary
+
+```rust
+pub fn install() -> Result<Installed, zgui::tokio::Error>;
+pub fn install_handle(handle: tokio::runtime::Handle)
+    -> Result<Installed, zgui::tokio::Error>;
+pub fn enter_here(handle: tokio::runtime::Handle);
+```
+
+| Requirement | Runtime installation needed |
+|---|---|
+| `background` with an ordinary future | no |
+| `blocking` | no |
+| `futures` channels | no |
+| Tokio synchronization channels | no |
+| Tokio time, network, or file APIs | yes |
+| `reqwest`, `sqlx`, `tonic`, or another runtime-dependent Tokio library | yes |
+
+Tokio does not replace zgui's UI executor. zgui keeps the process-wide `any_spawner` slot. The
+Tokio integration only supplies the background executor and the runtime context used while zgui
+polls UI tasks.
+
+## Next
+
+<Cards>
+  <Card
+    title="UI tasks and timers"
+    href="/docs/learn/async-and-timers"
+    description="Review UI task lifetime, cancellation, timers, and suspense."
+  />
+  <Card
+    title="The frame"
+    href="/docs/architecture/the-frame"
+    description="See where posted closures and ready tasks run in a frame."
+  />
+</Cards>

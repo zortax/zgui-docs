@@ -1,0 +1,161 @@
+---
+title: What zgui is
+description: What a user interface framework has to do, the two ways to do it, and which one zgui picks.
+---
+
+This page explains what a user interface framework is for, before any zgui-specific detail. If you
+have written user interfaces before, skim to [The choice zgui makes](#the-choice-zgui-makes).
+
+## The problem a UI framework solves
+
+An application with a window has to answer four questions, over and over, sixty times a second or
+more:
+
+1. **What is on the screen?** A tree of boxes, text, pictures and shapes.
+2. **Where is each thing?** Positions and sizes, computed from the window size and from the content.
+3. **What does each thing look like?** Colours, borders, fonts, shadows.
+4. **What did the user just do, and to which thing?** A click at pixel (412, 96) has to become "the
+   user pressed the Increment button".
+
+Doing this by hand means writing a layout algorithm, a text shaper, a hit tester, a damage tracker
+and a GPU submission path before you write any application logic. A UI framework is the code that
+answers those four questions so that you only describe the interface.
+
+The hard part is not answering them once. It is answering them again after something changes, fast
+enough that the window feels alive, without redoing work that is still correct.
+
+## Two ways to answer them again
+
+There are two families of answer, and the choice between them decides almost everything else about
+a framework.
+
+**Immediate mode.** Every frame, your code walks the whole interface and describes it from scratch:
+"a column, then a label saying 41, then a button". The framework compares nothing and keeps nothing.
+It is simple to reason about — the description is a pure function of your state — and it costs a
+full traversal per frame whether or not anything changed.
+
+**Retained mode.** Your code builds a tree of objects once. The framework keeps that tree. When
+state changes, something updates the affected objects in place, and the framework recomputes only
+what those objects invalidated. The tree, the computed styles, the layout and the pixels all
+survive between frames.
+
+Retained mode is more work to implement. It is what makes an interface with ten thousand nodes
+cost the same to idle as an interface with ten.
+
+## The choice zgui makes
+
+zgui is retained, all the way down.
+
+Nothing is rebuilt per frame that did not change: not the document, not the computed styles, not
+the box tree, not the shaped paragraphs, not the display list, and not the pixels. Each stage keeps
+its result and is handed a description of what became invalid.
+
+<FlowDiagram
+  label="How application state becomes a desktop window"
+  items={[
+    {
+      title: 'Components and signals',
+      description: 'The application state and the views that read it.',
+      next: 'Build and update nodes',
+    },
+    {
+      title: 'The document',
+      description: 'A retained tree of elements the framework owns.',
+      next: 'Only nodes that owe a restyle move on',
+    },
+    {
+      title: 'The cascade',
+      description: 'CSS in, computed styles out.',
+      next: 'Boxes that owe a relayout or repaint',
+    },
+    {
+      title: 'Layout and text',
+      description: 'Positions, sizes, and shaped glyphs.',
+      next: 'Fragments carry geometry, hit regions, and stacking order',
+    },
+    {
+      title: 'Paint',
+      description: 'A display list of drawing primitives.',
+      next: 'Primitives plus the damaged rectangles',
+    },
+    {
+      title: 'The renderer',
+      description: 'GPU work into a texture kept between frames.',
+      next: 'Present',
+    },
+    {
+      title: 'A window on your desktop',
+      description: 'Only the pixels that changed are replaced.',
+    },
+  ]}
+/>
+
+The arrows go one way. Layout never edits the document. Paint never asks the cascade a question.
+The renderer knows nothing about elements. Every horizontal edge in that diagram is a plain value —
+data you could print, compare or write to a file — which is why almost all of the framework can be
+tested with no window and no graphics device.
+
+You do not have to hold this diagram in your head to write an application. It is here because it
+explains the rules you will meet: why a component runs once, why writing a signal does not take
+effect until the end of the frame, and why changing a colour costs less than changing a width.
+
+## What updates the tree
+
+If a component runs once, something else has to update the document when state changes. That
+something is a **signal**.
+
+A signal is a value that records which pieces of code read it. When you write a new value into it,
+those pieces of code — and only those — run again. In a zgui view they are small closures that
+write one text node or one attribute.
+
+So the cost of a change is proportional to how much of the interface actually depends on it. A
+counter with one number on screen updates one text node, no matter how large the rest of the window
+is. [Signals](/docs/learn/signals) explains this from scratch.
+
+## What zgui is not
+
+**It is not a browser.** There is no webview, no HTML parser, no JavaScript engine and no DOM
+specification. zgui borrows browser-engine *libraries* where they are the best available — Stylo for
+CSS, Taffy for layout, Parley for text — and drives them itself.
+
+**It is not a wrapper over native widgets.** There is no `NSButton` and no GTK widget underneath.
+zgui draws everything you see onto a GPU surface, so an interface looks the same on every
+platform it runs on.
+
+**It does not implement the web platform.** The CSS support is chosen for application interfaces.
+Selectors, the cascade, flexbox, grid, gradients, shadows, filters and transforms are there.
+Floats, `contenteditable` and forms as a document language defines them are not the target.
+
+## What you write
+
+```rust
+use zgui::prelude::*;
+
+#[component]
+fn Greeting() -> impl IntoView {
+    view! {
+        column(class = "greeting") {
+            text {"Hello"}
+            text {"from a real window"}
+        }
+    }
+}
+```
+
+`#[component]` marks a function as a component. `view!` describes a piece of the document as nested
+calls with blocks of children. `column` and `text` are two of sixteen element names the framework
+defines. `class = "greeting"` is what a CSS rule selects.
+
+That is the whole shape of it. The rest of this guide fills it in.
+
+## Next
+
+Install the toolchain and get a window on the screen.
+
+<Cards>
+  <Card
+    title="Installation"
+    href="/docs/getting-started/installation"
+    description="Toolchain, system libraries, and the smallest application that opens a window."
+  />
+</Cards>

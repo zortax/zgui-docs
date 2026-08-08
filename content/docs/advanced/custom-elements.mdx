@@ -1,0 +1,123 @@
+---
+title: Custom elements
+description: Build retained widgets that measure children and paint with zgui render primitives.
+---
+
+A custom element is one retained widget that application code implements. It can measure and place
+ordinary children, and it can paint quads and vector paths through zgui's render pipelines.
+
+Use a custom element when composition would require many nodes or when built-in layout cannot
+place the children. Use a [`canvas`](/docs/building/vector-and-canvas#imperative-drawing-with-canvas)
+when only a mutable shape list is necessary. Use a [`surface`](/docs/advanced/surfaces) when another
+renderer already produces a texture.
+
+## Implement the trait
+
+`zgui::custom::custom` returns an ordinary element builder and a typed handle:
+
+```rust
+use zgui::canvas::zgui_color::Color;
+use zgui::geom::{DevicePx, Point, Rect, Size};
+use zgui::prelude::*;
+
+struct Meter {
+    value: f32,
+}
+
+impl CustomElement for Meter {
+    fn layout(&mut self, cx: &mut CustomLayoutCx<'_>) -> CustomMeasured {
+        CustomMeasured {
+            width: cx.known_width.unwrap_or(120.0 * cx.scale),
+            height: cx.known_height.unwrap_or(8.0 * cx.scale),
+            ..CustomMeasured::default()
+        }
+    }
+
+    fn paint(&mut self, painter: &mut ScenePainter<'_>) {
+        let size = painter.size();
+        let scale = painter.scale();
+        let color = painter.current_color();
+        let track = Rect::new(Point::new(DevicePx(0.0), DevicePx(0.0)), size);
+        painter.fill(track, 4.0 * scale, Color::srgb(0.2, 0.2, 0.25, 1.0));
+
+        let fill = Rect::new(
+            Point::new(DevicePx(0.0), DevicePx(0.0)),
+            Size::new(DevicePx(size.width.0 * self.value), size.height),
+        );
+        painter.fill(fill, 4.0 * scale, color);
+    }
+}
+
+let (meter, handle) = zgui::custom::custom(Meter { value: 0.4 });
+let view = meter.class("meter");
+```
+
+The returned view supports classes, inline styles, listeners, attributes, and children. The custom
+implementation lives on the UI thread and keeps its state between frames.
+
+## Layout contract
+
+`layout` returns the content size in device pixels. CSS owns the outer box. zgui applies width,
+height, min and max constraints, aspect ratio, padding, borders, and `box-sizing` around the custom
+answer.
+
+The context supplies:
+
+| Field | Meaning |
+|---|---|
+| `known_width`, `known_height` | A size that layout has already fixed; use it when present |
+| `available` | Definite, min-content, or max-content space on each axis |
+| `scale` | Device pixels per CSS pixel |
+| `style` | The computed style of the custom element |
+| `final_pass` | `true` when layout will keep this answer |
+| `access` | Measure, lay out, and place the element's children |
+
+Layout can call the implementation several times. Do not place children during a probe. On the
+final pass, use `layout_child` and then `place_child` for every child that the element owns. Use
+`measure_child` for a non-committing size probe. Repeated equivalent requests can use the normal
+layout cache.
+
+Child indices follow document order. Coordinates passed to `place_child` are device pixels from
+the custom element's border-box corner. `CustomMeasured` can also report first and last baselines.
+
+## Paint contract
+
+`paint` receives a constrained `ScenePainter`. Its coordinate origin is the content-box corner,
+and its units are device pixels. The painter applies the element's clip, transform, and inherited
+opacity.
+
+Use:
+
+- `fill` for a solid rounded rectangle through the quad pipeline;
+- `stroke` for a solid rounded-rectangle border;
+- `fill_path` for a solid path;
+- `shape` for the full vector shape vocabulary;
+- `current_color` for the element's computed CSS `color`.
+
+Prefer quads for rectangles. A quad has the same rendering cost as an ordinary background. Paths
+use the vector rasterizer. The painter does not expose group boundaries or custom clips because
+those operations must remain balanced with the surrounding scene. Put an inner child in
+`overflow: hidden` when it needs an additional clip.
+
+Custom primitives paint after the element's background and border and before its descendants.
+zgui records them. It replays an unchanged custom element without calling `paint` again.
+
+## Update and invalidate
+
+Use the typed handle from an event handler or effect:
+
+```rust
+handle.update(|meter| meter.value = 0.7);
+handle.repaint();
+```
+
+`update` only changes the retained state. It does not invalidate the element.
+
+- Call `repaint` when only emitted primitives changed.
+- Call `relayout` when the content size or child placement can change. `relayout` also repaints.
+
+The handle is cloneable, but it is UI-thread state. `layout` and `paint` also run on the UI thread
+during a frame. Do not block in either method and do not mutate the document from them.
+
+The standard `zgui::app()` wiring installs the custom layout and paint sources. Code that drives
+`zgui_runtime::App` directly must install `zgui_custom::sources()` with `App::with_custom`.

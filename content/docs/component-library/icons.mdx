@@ -1,0 +1,431 @@
+---
+title: Icons
+description: The zgui-ui-icons crate — twenty-two outlines as constants, one component over the vector element, and how size and colour reach them from CSS.
+---
+
+An icon is a small drawing that stands for an action or a state: a tick beside a saved row, a
+chevron on a control that opens. `zgui-ui-icons` is the set this repository ships and the one
+component that draws one. Like the rest of the component library it is optional, and it is built
+from the same `vector` element an application uses directly.
+
+## What the crate is
+
+One crate, one dependency, and that dependency is the umbrella crate an application already has.
+
+```toml
+[dependencies]
+zgui = { path = "../zgui/crates/zgui" }
+zgui-ui-icons = { path = "../zgui/crates/zgui-ui-icons" }
+```
+
+The manifest states the reason for the single edge: an icon is a drawing and a component, and an
+application author writes both with exactly this API, so a second edge here would be a hole in that
+API rather than a convenience (`crates/zgui-ui-icons/Cargo.toml`). It does not depend on
+`zgui-ui-tokens`, on `zgui-ui-primitives`, or on `zgui-ui`.
+
+The crate holds three things:
+
+| Module | Contents |
+|---|---|
+| `icon` | `IconData`, `IconSize`, `IconVariants` |
+| `set` | the icons, as constants, in five modules |
+| `view` | `Icon`, the component, and `IconStyle`, its sheet |
+
+`zgui_ui_icons::prelude` re-exports all of those. **The icons themselves are deliberately not in the
+prelude.** Their names are short and there are dozens of them, so an application names the ones it
+draws.
+
+```rust
+use zgui::prelude::*;
+use zgui_ui_icons::prelude::*;
+use zgui_ui_icons::set::{chevron::CHEVRON_RIGHT, mark::CHECK};
+```
+
+## The set
+
+Twenty-two icons, in five modules under `zgui_ui_icons::set`.
+
+| Module | Constants | `name()` |
+|---|---|---|
+| `arrow` | `ARROW_UP`, `ARROW_DOWN`, `ARROW_LEFT`, `ARROW_RIGHT` | `arrow-up`, `arrow-down`, `arrow-left`, `arrow-right` |
+| `chevron` | `CHEVRON_UP`, `CHEVRON_DOWN`, `CHEVRON_LEFT`, `CHEVRON_RIGHT` | `chevron-up`, `chevron-down`, `chevron-left`, `chevron-right` |
+| `mark` | `CHECK`, `MINUS`, `PLUS`, `CROSS`, `DISC`, `DOT` | `check`, `minus`, `plus`, `cross`, `disc`, `dot` |
+| `status` | `ALERT_CIRCLE`, `ALERT_TRIANGLE`, `INFO`, `CHECK_CIRCLE`, `CROSS_CIRCLE` | `alert-circle`, `alert-triangle`, `info`, `check-circle`, `cross-circle` |
+| `ui` | `SEARCH`, `SPINNER`, `ELLIPSIS` | `search`, `spinner`, `ellipsis` |
+
+Each one is a `const IconData`: a name, the side of the square its geometry is written in, and one
+outline in path notation.
+
+```rust
+/// A dash, which is what a checkbox in its mixed state shows.
+pub const MINUS: IconData = IconData::new("minus", 24.0, "M4 11 L20 11 L20 13 L4 13 Z");
+```
+
+Every shipped icon declares `24.0`. There is no image to decode, no XML to parse and no file to ship
+beside the binary.
+
+**Only what is named is linked.** A table of icons would be one value that every program references
+whole. A constant nothing names contributes nothing: not a string, not a symbol, not a byte
+(`crates/zgui-ui-icons/src/lib.rs`).
+
+### One outline, and holes
+
+Each icon is a single outline, filled with the non-zero rule. A counter — the empty middle of a
+ring, or the gap inside the letter `o` — is a subpath wound the other way **inside the same
+string**. Two separate outlines would be two filled shapes, and the second would cover the hole in
+the first.
+
+`IconData::path` returns the geometry as a `kurbo::BezPath` for measuring or testing it. Drawing
+does not go through it; the component hands the notation to the element unchanged.
+
+```rust
+use zgui::elements::kurbo::{Point, Shape};
+use zgui_ui_icons::set::status::INFO;
+
+let path = INFO.path();
+// Inside the ring's stroke: filled.
+assert_ne!(path.winding(Point::new(12.0, 4.0)), 0);
+// Between the ring and the glyph: a hole.
+assert_eq!(path.winding(Point::new(6.5, 12.0)), 0);
+```
+
+`path` panics if the notation does not parse. For a constant declared in this crate that is a defect
+in the crate; for one you declare yourself it is what a test catches.
+
+## Writing one in a view
+
+```rust
+use zgui::prelude::*;
+use zgui_ui_icons::prelude::*;
+use zgui_ui_icons::set::{chevron::CHEVRON_RIGHT, mark::CHECK};
+
+/// A row with a tick at one end and a chevron at the other.
+#[component]
+fn Item() -> impl IntoView {
+    view! {
+        row {
+            Icon(icon = CHECK, size = IconSize::Sm)
+            text {"Two-factor authentication"}
+            spacer()
+            Icon(icon = CHEVRON_RIGHT, label = "Open")
+        }
+    }
+}
+```
+
+| Prop | Type | Default | Notes |
+|---|---|---|---|
+| `icon` | a signal of `IconData` | required | takes a constant directly, or a closure |
+| `size` | `IconSize` | `Md` | `Sm`, `Md`, `Lg`, `Xl`; a plain value, not a signal |
+| `label` | a string | none | what a reader announces; see below |
+| `class` | `Classes` | none | merged **after** the component's own |
+| `attrs` | `Attrs` | none | anything else the caller spreads |
+
+`icon` is reactive. A disclosure chevron is one element with two values rather than two branches:
+
+```rust
+let open = RwSignal::new_local(false);
+view! {
+    Icon(icon = Signal::derive_local(move || {
+        if open.get() { CHEVRON_UP } else { CHEVRON_DOWN }
+    }))
+}
+```
+
+Changing the value rewrites the outline on the element that is already there. The repository asserts
+that the element is not replaced, because replacing it would lose its place in the tree
+(`crates/zgui-ui-icons/tests/view.rs`).
+
+### What a reader is told
+
+The accessibility tree is the parallel description of the interface that a screen reader reads (see
+[Accessibility](/docs/building/accessibility)). An icon beside a word repeats that word, and a tree
+holding both is one a reader says twice.
+
+| Written | Role | In the tree |
+|---|---|---|
+| `Icon(icon = CHECK)` | `Role::Image` | hidden |
+| `Icon(icon = CROSS, label = "Close")` | `Role::Image` | named `Close` |
+
+Those are two bindings rather than one with an empty string in it. A reader reads an empty name
+instead of falling through to whatever does have one.
+
+## What it is made of
+
+The whole component is one intrinsic element, one `variants!` table, one `style!` sheet, one
+`install_stylesheet` call and one `A11yBinding`. No signal of its own, no context, no primitive.
+
+```rust
+const SHEET: &str = "zui-icon";
+
+install_stylesheet(SHEET, IconStyle::CSS);
+let variants = IconVariants { size };
+let semantics = Attrs::new().a11y_from(match label {
+    Some(text) => A11yBinding::new(Role::Image).label(text),
+    None => A11yBinding::new(Role::Image).hidden(true),
+});
+
+view! {
+    vector(
+        class = variants.classes(),
+        class = IconStyle::CLASS,
+        attr:data-size = variants.data_attributes()[0].1,
+        attr:data-icon = move || Some(icon.get().name().to_owned()),
+        prop:d = move || PropValue::from(icon.get().path_data()),
+        prop:viewBox = move || {
+            let side = icon.get().view_box();
+            PropValue::from(format!("0 0 {side} {side}").as_str())
+        },
+        {..semantics},
+        {..attrs},
+        class = class
+    )
+}
+```
+
+Reading it in order:
+
+- `variants.classes()` yields `zui-icon` plus one size class. `IconVariants { size: IconSize::Lg }`
+  has the class list `zui-icon zui-icon--lg` and the attribute pair `("data-size", "lg")`.
+  `.zui-icon` is the stable public name; select on it from your own sheet.
+- `IconStyle::CLASS` is the generated class the component's own sheet is scoped to.
+- `data-icon` carries the icon's name, so a sheet can select one icon out of a set and a transcript
+  of a frame says which icon was drawn.
+- `prop:d` and `prop:viewBox` are the two drawing properties of the `vector` element. The path
+  notation crosses unchanged: the element carries the same string the constant holds, with no parse
+  and no re-serialisation on the way.
+- The caller's spread and the caller's `class` come **last**, so the caller wins.
+
+The sheet is installed once per window however many icons a program draws. Three `Icon` calls
+install one sheet (`crates/zgui-ui-icons/tests/view.rs`).
+
+## Size
+
+The `size` prop selects a variable. The variable resolves to a token, and the token has a literal
+fallback.
+
+```css
+:scope {
+    display: inline-block;
+    flex: none;
+    width: var(--zui-icon-size);
+    height: var(--zui-icon-size);
+    --zui-icon-size: var(--zui-icon-md, 16px);
+}
+:scope[data-size="sm"] { --zui-icon-size: var(--zui-icon-sm, 12px); }
+:scope[data-size="lg"] { --zui-icon-size: var(--zui-icon-lg, 20px); }
+:scope[data-size="xl"] { --zui-icon-size: var(--zui-icon-xl, 24px); }
+```
+
+| `size` | `data-size` | Reads | Falls back to |
+|---|---|---|---|
+| `Sm` | `sm` | `--zui-icon-sm` | 12px |
+| `Md` | `md` | `--zui-icon-md` | 16px |
+| `Lg` | `lg` | `--zui-icon-lg` | 20px |
+| `Xl` | `xl` | `--zui-icon-xl` | 24px |
+
+<Callout type="warn">
+Nothing defines `--zui-icon-sm` and its siblings. `zgui-ui-tokens` has no icon group, so the four
+fallbacks above are the effective defaults. An application that wants every icon larger declares the
+four itself, on `:root`.
+</Callout>
+
+`flex: none` is load-bearing. Without it an icon beside a growing label is stretched into an ellipse
+by the row it sits in.
+
+Three ways to change the size, from broadest to narrowest:
+
+```rust
+// Every icon in the window, from the application sheet:
+//   :root { --zui-icon-md: 18px }
+
+// Every icon under one element:
+view! { row(var:--zui-icon-size = "18px") { Icon(icon = CHECK) } }
+
+// One icon:
+view! { Icon(icon = CHECK, class = "tight") }
+//   .tight { --zui-icon-size: 12px }
+```
+
+`size` is a plain value, not a signal, so a size that changes at run time is a `var:` write or a
+class toggle rather than a new prop value. `zgui-ui` uses the narrow form for the marks inside its
+own controls: the checkbox sheet sets `--zui-icon-size: 12px` on its tick, and the radio sheet sets
+`8px` on its disc.
+
+## Colour
+
+**There is no colour prop.** The component declares no fill. A drawing with no fill of its own is
+filled with the element's own computed `color`, which is what
+[`currentColor`](/docs/learn/styling#currentcolor) means for text.
+
+So an icon in a destructive button is red because that button's text is red, and an icon in a
+disabled control is faded because the control is. Neither needed a prop or a variant. Re-colouring a
+whole family is one declaration:
+
+```css
+.zui-alert--destructive .zui-icon { color: var(--zui-color-destructive); }
+```
+
+The repository asserts the end of that path on a real graphics device. An icon is mounted in a
+window under a sheet that declares one colour and no size at all:
+
+```css
+:root { color: rgb(0, 128, 255) }
+.card { display: flex; padding: 8px }
+```
+
+The frame that comes back holds one shape, 20 device pixels on a side — `--zui-icon-lg`'s fallback,
+with no token sheet installed — filled with that blue
+(`crates/zgui-ui-icons/tests/window.rs`).
+
+<Callout type="error">
+`fill: red` in a style sheet does nothing at all. The vector-paint properties are gated to another
+engine in this build, so such a declaration is discarded while the sheet is parsed. Set `color`, or
+set `--zgui-fill` for a drawing that has to differ from the text around it.
+</Callout>
+
+## An icon of your own
+
+`IconData::new` is a `const fn`, so an icon of your own is written exactly like a shipped one.
+
+```rust
+use zgui_ui_icons::IconData;
+
+/// A square with a square hole in it.
+const FRAME: IconData = IconData::new(
+    "frame",
+    24.0,
+    "M2 2 L22 2 L22 22 L2 22 Z M6 6 L6 18 L18 18 L18 6 Z",
+);
+
+view! { Icon(icon = FRAME, label = "Crop") }
+```
+
+The rules the shipped set follows, and the reason for each:
+
+| Rule | Why |
+|---|---|
+| One outline, all subpaths in one string | a counter has to punch a hole in the outline it is inside |
+| Wind a counter the other way | same winding fills the middle instead of leaving it empty |
+| Close every subpath | an open polyline parses, measures and draws nothing |
+| Stay inside the square you declare | anything outside it is cropped when the outline is fitted |
+| Name it in kebab case | the name is written to `data-icon` for sheets and transcripts |
+| Draw it to read at sixteen pixels | that is the size it is used at, not ninety-six |
+
+Each of those is a test in the repository rather than a convention, and the same tests are what to
+write for your own set (`crates/zgui-ui-icons/tests/geometry.rs`):
+
+```rust
+use zgui::elements::kurbo::{Point, Shape};
+
+// Inside the square it declares.
+let bounds = Shape::bounding_box(&FRAME.path());
+assert!(bounds.x0 >= 0.0 && bounds.x1 <= 24.0);
+
+// The frame is solid where it is drawn, and the middle is a hole.
+assert_ne!(FRAME.path().winding(Point::new(4.0, 12.0)), 0);
+assert_eq!(FRAME.path().winding(Point::new(12.0, 12.0)), 0);
+```
+
+A `view_box` other than `24.0` is allowed. The component writes whatever the constant declares, so a
+32-unit icon and a 24-unit icon draw at the same pixel size beside each other.
+
+## Using an icon with no library at all
+
+`Icon` is a component over the `vector` element. Written by hand, one icon is one element and two
+properties:
+
+```rust
+view! {
+    vector(
+        class = "icon",
+        prop:viewBox = "0 0 24 24",
+        prop:d = "M20.5 7.1 L18.9 5.5 L9.6 14.8 L5.1 10.3 L3.5 11.9 L9.6 18.0 Z",
+        a11y:hidden = true,
+    )
+}
+```
+
+```css
+.icon { display: inline-block; flex: none; width: 16px; height: 16px; }
+```
+
+A whole vector document goes in through `prop:svg` instead. A document brings its own outlines, its
+own paints and its own space, so it replaces `prop:d` and `prop:viewBox` rather than adding to them.
+A document written with `fill="currentColor"` takes the element's own computed `color`; a document
+that names its own colours keeps every one of them.
+
+```rust
+view! {
+    vector(
+        class = "icon",
+        prop:svg = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">
+                        <path d="M2 8 L8 2 L14 8 L8 14 Z" fill="currentColor"/>
+                      </svg>"#,
+    )
+}
+```
+
+[Vector and canvas](/docs/building/vector-and-canvas) covers the element in full, including strokes,
+documents that fail to parse, and what SVG features are not read.
+
+What you take on by writing it yourself is the list above: the size rules, the class the sheet
+selects on, the `data-icon` name, and keeping the drawing out of the accessibility tree. That list
+is the whole of what the component adds.
+
+## What an icon costs
+
+An icon is one element, one box and one fragment. Its costs land in the rows of
+[the cost model](/docs/performance/cost-model) as follows.
+
+| What changed | Reaches | Proportional to |
+|---|---|---|
+| the surrounding `color` | restyle, paint, draw | the icon's own ink; **no re-place, no re-read** |
+| `--zui-icon-size`, or the `size` class | restyle, layout, paint, draw | the icon and the row it is in; the outline is fitted again |
+| which icon `icon` names | a property write, paint, draw | the icon's own ink; the element is rewritten, not replaced |
+| nothing | nothing | — |
+
+Three mechanisms behind that table:
+
+- **The notation is not parsed on the way in.** The constant's string is handed to the element and
+  crosses to the paint stage as itself.
+- **The parse and the fit are cached per node**, keyed on the source text and the six coefficients of
+  the placement matrix (`crates/zgui-paint/src/content/vectors/cache.rs`). Nothing about colour is in
+  that key, so a hover that re-colours an icon re-places nothing and re-reads nothing. Moving the
+  icon into a different box re-places it; changing the notation re-places it.
+- **A repaint is scissored to the drawing.** The repository renders one icon on a flat panel, damages
+  only its rectangle, and asserts the result is pixel-identical to a full repaint. The same tests
+  assert that a document with no drawing in it runs zero vector passes
+  (`crates/zgui-ui-icons/tests/rasterised.rs`).
+
+For a number: over the shipped component gallery at 1 851 boxes, on a real graphics device, the
+renderer's vector stage measures **0.1 µs on an idle frame and 0.12 µs on a click**
+(`docs/perf/gallery-scale.md`). That is the whole vector stage of the frame, not one icon.
+
+Binary size follows the same rule as everything else here: a program that draws three icons links
+three path strings.
+
+## Next
+
+<Cards>
+  <Card
+    title="Devtools"
+    href="/docs/component-library/devtools"
+    description="The inspector overlay, what each panel shows, and how it attaches."
+  />
+  <Card
+    title="Vector and canvas"
+    href="/docs/building/vector-and-canvas"
+    description="The vector element in full: paths, documents, strokes and hit shapes."
+  />
+  <Card
+    title="Styling"
+    href="/docs/learn/styling"
+    description="style!, variants!, custom properties and currentColor."
+  />
+  <Card
+    title="The cost model"
+    href="/docs/performance/cost-model"
+    description="What a colour change, a size change and a repaint each cost."
+  />
+</Cards>

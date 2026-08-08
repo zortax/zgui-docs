@@ -1,0 +1,990 @@
+---
+title: Invalidation and damage
+description: The fifteen obligation bits a node can owe, how a mark propagates and a walk retires it, and how damage rectangles are produced and merged.
+---
+
+This page is about how a frame decides what work it owes. It covers `zgui-bits`, the crate that
+holds the invalidation primitives, and the stages above it that raise and retire them. It assumes
+[the architecture overview](/docs/architecture/overview) and the whole of
+[the guide](/docs/learn/views).
+
+## Why a flag is not enough
+
+zgui is retained: every stage keeps its result between frames. **Invalidation** is the record that
+says which of those kept results are no longer correct. **Damage** is the last link of that chain —
+the rectangles of the surface whose pixels are no longer correct.
+
+The smallest possible record is one boolean per node. It does not work, because a frame does not
+ask one question. It asks these:
+
+| Stage | The question it asks of a node |
+|---|---|
+| The cascade | Must selector matching run again, or only the cascade? |
+| Box construction | Do different boxes exist here now? |
+| Layout | Is this box's measured size stale? |
+| Text | Must this paragraph be shaped again, or only broken again? |
+| Fragments | Did this piece move, or change where it stands? |
+| Paint | Which pixels of the surface are wrong? |
+| Accessibility | Does this node project differently? |
+
+One boolean cannot separate a colour change from a width change. Every stage would have to take the
+widest reading of every marked node. That failure is not hypothetical, and the framework has met a
+version of it: taking the style engine's own relayout bit at its word — a bit the engine sets for a
+border *colour* — rebuilt every box in the document, threw away every layout cache, renamed every
+fragment, and widened the damage to the whole surface. The module doc of
+`crates/zgui-dom/src/stylo/element/damage/mod.rs` records it.
+
+So a node carries a **set** of obligations rather than a flag. The set is a lattice under union: the
+order is set inclusion, the join is a bitwise or, and marking a node twice with the same bit changes
+nothing. Three properties follow, and each one is load-bearing.
+
+- **Marking is idempotent.** A second mark of a bit a node already owes is one atomic operation that
+  reports "nothing gained". That report is what stops the propagation walk.
+- **No bit implies an order over any other.** The order is the frame pipeline's, not the lattice's.
+- **Each bit is retired by exactly the stage that services it.** A stage never asks "did anything
+  change?" globally. It is handed the set it owns and clears exactly that.
+
+## The fifteen bits
+
+`crates/zgui-bits/src/dirty/bits.rs`:
+
+```rust
+bitflags::bitflags! {
+    #[derive(Copy, Clone, PartialEq, Eq, Hash, Default, Debug)]
+    pub struct Dirty: u32 { /* fifteen flags */ }
+}
+
+impl Dirty {
+    pub const fn is_clean(self) -> bool;
+}
+```
+
+| Bit | Value | What it means | Raised by |
+|---|---|---|---|
+| `RESTYLE` | `1 << 0` | Selector matching must run again for this element. | an attribute, class or interaction-state write; an insertion |
+| `RECASCADE` | `1 << 1` | Only the cascade must run again; the selector matches still hold. | a root font-metric change; an animation on the cascade tier |
+| `REBUILD_BOX` | `1 << 2` | The box tree rooted here must be built again. | `CONSTRUCT_BOX` or `CONSTRUCT_DESCENDANTS` damage; a first cascade; a generated-content style that moved |
+| `RELAYOUT` | `1 << 3` | Layout inputs changed; this box's measure and arrange are invalid. | any layout-affecting damage; a viewport or device change |
+| `RESHAPE` | `1 << 4` | Text content or a shaping-relevant style changed. | a text-node edit; a font change |
+| `REBREAK` | `1 << 5` | Only a break- or align-relevant style changed. | `text-align`, `word-break`, `letter-spacing` and their group |
+| `REPOSITION` | `1 << 6` | Absolute position changed; size and content did not. | the fragment pass, on a piece it found translated |
+| `REPAINT` | `1 << 7` | This node's paint output changed. | a paint-key change; the fragment pass; an animation tick |
+| `CHILDREN` | `1 << 8` | The child list changed: insert, remove or reorder. | a document mutation |
+| `A11Y` | `1 << 9` | The accessibility projection of this node changed. | a mutation, a listener change, a scroll, an accessibility-key change |
+| `REHIT` | `1 << 10` | The hit-test entry for this node changed. | any fragment change; a stacking or ink change |
+| `SCROLL` | `1 << 11` | A scroll offset under this node changed. | `zgui_scroll::mark::scrolled` |
+| `REFRAGMENT` | `1 << 12` | Transform, ink rectangle or scrollable overflow changed; size, position and content did not. | a corner radius, a box shadow, a transform |
+| `RESTACK` | `1 << 13` | Stacking-context membership or paint order changed. | a `z-index` change |
+| `ANIMATING` | `1 << 14` | A transition or animation is running here, so the next frame has a deadline. | the animation tick |
+
+Two terms in that table are worth stating plainly.
+
+**Ink** is the rectangle a fragment actually covers. It is not the border box: a box shadow and a
+blur reach outside the border box, and a corner radius cuts inside it. Damage is accumulated over
+ink, never over border boxes.
+
+**A stacking context** is a group of elements painted as one unit, at one place in the document's
+back-to-front order. Anything inside the group is painted between the group's own start and end,
+and nothing outside can be painted between them. `z-index` moves the whole group. `RESTACK` says an
+element started or stopped establishing one, or moved within the order.
+
+Two unit tests in the same file hold the packing: `the_lattice_has_fifteen_distinct_bits` asserts
+`Dirty::all().bits().count_ones() == 15`, and `every_flag_fits_the_low_half_of_a_word` asserts
+`Dirty::all().bits() & 0xffff_8000 == 0`. A sixteenth bit breaks the second one.
+
+## One word, two halves
+
+A node stores what it owes itself beside the union of what everything below it owes.
+`crates/zgui-bits/src/dirty/cell.rs`:
+
+```rust
+#[repr(transparent)]
+pub struct DirtyCell(AtomicU64);
+
+const SUBTREE_SHIFT: u32 = 32;
+```
+
+<BitFieldDiagram
+  label="The two halves of a DirtyCell"
+  fields={[
+    {
+      label: 'Subtree',
+      range: '63–32',
+      description: 'The union of what this node and everything below it owes.',
+    },
+    {
+      label: 'Own',
+      range: '31–0',
+      description: 'What this node owes itself.',
+    },
+  ]}
+/>
+
+The pairing is what makes the whole scheme cheap. Marking a node and telling one ancestor about it
+is one atomic read-modify-write per level. A phase walk dismisses a whole clean subtree by testing
+one word.
+
+| Method | Ordering | What it does |
+|---|---|---|
+| `clean() -> Self` | — | A cell owing nothing at or below itself. |
+| `new(own: Dirty, subtree: Dirty) -> Self` | — | Both halves exactly as given. `own` is **not** folded into `subtree`. |
+| `own(&self) -> Dirty` | `Acquire` | What this node owes. |
+| `subtree(&self) -> Dirty` | `Acquire` | The union at or below it. |
+| `get(&self) -> (Dirty, Dirty)` | `Acquire` | Both halves in one load. |
+| `is_clean(&self) -> bool` | `Acquire` | The whole word is zero. |
+| `mark(&self, bits: Dirty) -> bool` | `AcqRel` | Adds `bits` to both halves. Returns whether the **subtree union** gained a bit. |
+| `mark_subtree(&self, bits: Dirty) -> bool` | `AcqRel` | Adds to the union only. Returns whether it changed. |
+| `clear_own(&self, bits: Dirty)` | `AcqRel` | Removes `bits` from the own half, leaving the union alone. |
+| `retire_phase(&self, phase: Dirty, keep: Dirty)` | `AcqRel` | Clears `phase` from the union and re-adds `keep`, in one `fetch_update`. |
+
+Use `get` in a walk. Two separate loads can straddle a concurrent mark and disagree with each other.
+
+The boolean `mark` returns is the early stop of the whole propagation scheme. The union gains a bit
+at most once, so the ancestors are told at most once.
+
+```rust
+use zgui_bits::{Dirty, DirtyCell};
+
+let cell = DirtyCell::clean();
+assert!(cell.mark(Dirty::REPAINT));      // the union gained a bit: tell the parent
+assert!(!cell.mark(Dirty::REPAINT));     // it already had it: the walk stops here
+assert_eq!(cell.own(), Dirty::REPAINT);
+assert_eq!(cell.subtree(), Dirty::REPAINT);
+
+cell.clear_own(Dirty::REPAINT);
+assert_eq!(cell.own(), Dirty::empty());
+assert_eq!(cell.subtree(), Dirty::REPAINT);
+```
+
+The invariant that makes this safe to reason about: **the two halves never interfere.** No operation
+on the own bits can set or clear a subtree bit, and no operation on the union can touch the own bits.
+It is held by a property test that compares the packing against an independently written model
+(`the_halves_track_the_model_and_never_alias`, `crates/zgui-bits/src/dirty/cell/tests.rs`) and by a
+loom model check of the concurrent protocol (`crates/zgui-bits/tests/dirty_cell_loom.rs`).
+
+Every method takes `&self`. A cell can be marked from a worker thread while a walk reads it.
+
+<Callout type="info">
+`Dirty` and `DirtyCell` are re-exported from `zgui_dom::dirty` as well, because every consumer of
+them above `zgui-dom` already depends on the document. The umbrella crate exposes the whole crate as
+`zgui::bits`.
+</Callout>
+
+## Marking, and where it stops
+
+`crates/zgui-dom/src/dirty/propagate.rs`:
+
+```rust
+pub fn mark(store: &mut DocumentStore, node: NodeIndex, bits: Dirty);
+pub fn propagate(store: &mut DocumentStore, node: NodeIndex, bits: Dirty);
+```
+
+`mark` does three things, in this order:
+
+<Steps>
+
+<Step>
+
+**Read whether the node's own bits already contain `bits`.**
+
+</Step>
+
+<Step>
+
+**Add `bits` to both halves of the node's own word**, with one `fetch_or`. Then return if the answer
+to the first step was yes: an earlier mark of this node has already walked the ancestors.
+
+</Step>
+
+<Step>
+
+**Walk up.** At each ancestor, widen its dirty-child record to name the child descended from, then
+add the bits to its subtree union. Return at the first ancestor whose union already contained them,
+because everything above that ancestor contains them too.
+
+</Step>
+
+</Steps>
+
+That early stop is what makes marking `n` nodes cost `O(n + depth)` steps rather than
+`O(n · depth)`.
+
+Two details in it are not incidental.
+
+**The marked node is tested on its own bits, never on its subtree union.** The two are not the same
+test. A node's own bits are set by nothing but a mark, so finding them set proves an earlier mark
+walked the ancestors. The union is also raised by the style engine's descent flag, on elements no
+mark ever led to. A later mark tested against the union would return before telling a single
+ancestor, and the element would never be traversed again — keeping a stale style with nothing to
+notice it by. The regression test is
+`a_node_carrying_only_the_engines_descent_flag_still_marks_its_ancestors`.
+
+**The dirty-child record is widened before the early return.** An ancestor that already owes these
+obligations *for a different child* must still learn about this one, or the walk that eventually
+descends skips past it.
+
+`propagate` is the second half of `mark` on its own. It exists for one caller: a subtree built while
+detached recorded its obligations against nodes that had no parents, so nothing above them ever
+learned. `mark` cannot repair that, because it returns at the node's own word. Linking the subtree in
+calls `ancestors::splice`, which folds `own | subtree` into the new parent's chain
+(`crates/zgui-dom/src/mutate/ancestors.rs`).
+
+## Which children to descend into
+
+The subtree union skips a clean subtree in constant time. It does not skip a clean *sibling range*:
+a node with ten thousand children and one dirty child still probes ten thousand words. The
+dirty-child record is what narrows that (`crates/zgui-dom/src/dirty/children/`).
+
+```rust
+pub const EXACT: usize = 4;   // repr.rs
+pub const SCAN:  usize = 64;  // place.rs
+
+pub(super) struct Repr {
+    pub(super) slots: [OptIndex; EXACT],
+    pub(super) len: u32,      // or Repr::SPAN
+}
+```
+
+Four exact entries, then an inclusive span as the fallback. The exact list is the default, not the
+other way round: the commonest frame there is moves a pointer, which clears a state bit on one row
+and sets it on another far away. A span between them would cover every clean row in between and pay
+a probe for each. Four entries cover that, focus-out with focus-in, an edge pair and a single
+insertion. The fifth distinct child promotes to the span.
+
+| Decision | What it is | Why |
+|---|---|---|
+| Children named by identity | `NodeIndex`, never a position | Positions among element siblings are numbered lazily, so a mark between a structural change and the renumber that follows it names the wrong child. |
+| The span runs the plain child chain | not the element-only chain | Text nodes are marked too. A span stepping element to element could not name one, and the fifth mark on a list containing text would silently drop it. |
+| Placement is bounded | at most `SCAN` links either side | Past that the record widens to *every* child. That answer is a superset, so nothing marked is lost; it costs probes on children that turn out clean. |
+
+`Counter::DirtyChildSteps` counts the sibling links followed. `DirtyChildren` is not re-exported
+outside `zgui-dom`: it names nodes.
+
+## The walk
+
+Every stage of the frame descends the same way (`crates/zgui-dom/src/dirty/walk.rs`):
+
+```rust
+pub fn walk(
+    store: &mut DocumentStore,
+    root: NodeIndex,
+    phase: Dirty,
+    visit: &mut impl FnMut(&DocumentStore, NodeIndex),
+) -> Dirty;
+
+pub fn walk_in(
+    scratch: &mut Scratch,
+    store: &mut DocumentStore,
+    root: NodeIndex,
+    phase: Dirty,
+    visit: &mut impl FnMut(&DocumentStore, NodeIndex),
+) -> Dirty;
+```
+
+`visit` runs only for nodes whose **own** bits intersect `phase`. A node that merely has work below
+it is descended through and not visited. The return value is what still survives for `phase` at or
+below `root` — empty unless a callback marked something.
+
+The descent test, at the root and at every child, is one load:
+
+```text
+let (own, subtree) = cell.get();
+if !(own | subtree).intersects(phase) { skip this subtree entirely }
+```
+
+Three rules govern the order, and each looks like a detail and is not.
+
+<Steps>
+
+<Step>
+
+**The callback runs on the way down.** Every stage this drives produces output its descendants read,
+so a post-order visit would hand each child a parent that has not been computed yet.
+
+</Step>
+
+<Step>
+
+**The bits are retired on the way in, immediately before the callback runs.** A node that re-marks
+itself from inside its callback would otherwise have that mark erased on the unwind, and the
+surviving union would read empty with the obligation still on the node. Clearing before the callback
+separates an obligation that survived from one that was added again.
+
+</Step>
+
+<Step>
+
+**The dirty-child record is rebuilt over every bit, not over the phase being retired.** One record
+serves every stage. Rebuilding it from "which children still owe *this* phase" would drop a child
+that owes only accessibility work.
+
+</Step>
+
+</Steps>
+
+On the unwind, `leave` computes `surviving = children's surviving | (own & phase)` and calls
+`retire_phase(phase, surviving)` — one atomic step, so a concurrent reader never observes the union
+without what is still outstanding. Then it rewrites the record from the children that are still not
+clean.
+
+**The contract on `visit`:** a callback may mark the node it was called for, or a descendant this
+walk has not yet reached. Marking a sibling, an ancestor or an already-visited descendant leaves
+that node's obligations set with nothing leading back to it, so it is never serviced. A stage that
+needs to widen its own reach runs itself a second time instead.
+
+Cost is proportional to the marked paths, not to the document. `walk_in` borrows a `Scratch` so a
+frame's several walks allocate nothing; `const INLINE: usize = 64` sizes the inline buffers. Two
+counters watch it: `Counter::DirtyWalkSteps` counts steps including skips, and
+`Counter::NodesVisited` counts every node looked at, owing work or not. The second is the one that
+notices a traversal touching six thousand clean nodes to service one dirty one.
+
+## Retiring exactly what was serviced
+
+A phase is cleared by the stage that did the work, and by nothing else.
+
+| Phase | Retired by | File |
+|---|---|---|
+| `RESTYLE`, `RECASCADE` | the style engine, after its own traversal | `crates/zgui-style/src/engine/restyle.rs` |
+| `REBUILD_BOX`, then `CHILDREN` | `zgui_layout::boxtree::retire`, in two walks | `crates/zgui-layout/src/boxtree/build.rs` |
+| `RELAYOUT`, `REPOSITION`, `REFRAGMENT`, `RESTACK`, `SCROLL`, `REPAINT`, `REHIT`, `RESHAPE` | the fragment pass, as `diff::ENTERS`, after its walk | `crates/zgui-layout/src/fragment/diff/mod.rs` |
+| `A11Y` | the accessibility projection | `crates/zgui-a11y/src/build/pending.rs` |
+| `ANIMATING` | the animation tick, at its start | `crates/zgui-anim/src/frame/retire.rs` |
+
+Three of those deserve a note.
+
+**The box-tree walk returns a list, and the list is the point.** The obligation propagates to the
+root, so the root's word says only *whether* something owes a rebuild, never *what*. A caller reading
+the root rebuilds the document for a change to one element. `retire` returns two lists of elements —
+the ones that owe a rebuild and the ones whose child list changed — and `boxtree::patch::rebuild`
+splices in only the boxes those elements name. A rebuild
+from the root replaces every box, and a box's name is what fragment reuse, geometry diffing, the
+per-fragment paint record and damage scissoring are all keyed on — so a rebuild is a frame in which
+none of them hit and the damage collapses to the whole window.
+
+**`patch::retext` descends on `RESHAPE` and retires nothing.** It shares the bit with the fragment
+pass, which reads it to decide that a line holding different glyphs must be painted again where it
+stands. A descent that cleared it would take that decision away.
+
+**The fragment pass retires after its walk, not during it.** It reads a node's marks twice — once to
+decide whether the subtree settled, once to decide what a fragment that did not move nonetheless
+owes — and a phase cleared between the two reads would lose the second. Retiring afterwards also
+clears what the walk itself marked, which is deliberate: those marks record what the pass has just
+finished doing.
+
+<Callout type="warn">
+Leaving an obligation set is not a small bug. `FrameDirty::retire` states the consequence exactly:
+every box is asked about on every frame, no subtree is ever skipped, every fragment is treated as
+changed, and the damage grows to the root's ink — the whole window, for ever, whatever actually
+moved.
+</Callout>
+
+The general rule is stated in `crates/zgui-dom/src/stylo/flags.rs`: **a descent flag may only be
+consumed by the traversal that retires the bits it was raised for.** That is why the style engine's
+own "work below me" flag is not stored at all. It is answered from the subtree union, raising it is
+`mark_subtree`, and clearing it is a deliberate no-op.
+
+`REBREAK` is the one bit no phase walk retires today. It is raised by damage translation, and the
+frame reads it in `owes_further_work` (`crates/zgui-runtime/src/window/observe.rs`) to decide whether
+a delivery of geometry needs another restyle and layout pass.
+
+## Damage rectangles
+
+The renderer keeps its target between frames. Outside the damage, the previous frame's pixels are
+still correct and are not touched. So the damage set has to be a superset of everything that changed
+and should be as small as it can be.
+
+`crates/zgui-bits/src/damage_set/mod.rs`:
+
+```rust
+pub const MAX_DAMAGE: usize = 4;
+
+#[derive(Clone, Copy)]
+pub struct DamageSet<const N: usize = MAX_DAMAGE> {
+    rects: [Rect<i32, Device>; N],
+    len: usize,
+    full: bool,
+}
+```
+
+Two invariants:
+
+- **The rectangles are pairwise disjoint, always.** Disjointness is a requirement rather than
+  tidiness: each rectangle is redrawn in its own pass, so two overlapping rectangles clear and shade
+  the shared pixels twice and pay for two passes to do it.
+- **A full set holds no rectangles.** What the surface's bounds are is the caller's knowledge, not
+  the set's. A resize, a scale change, a device loss, a theme swap and the first frame all produce
+  one.
+
+| Method | What it answers or does |
+|---|---|
+| `new()`, `full()`, `for_frame()` | Empty, whole-surface, or empty unless `ZGUI_FULL_DAMAGE=1`. |
+| `absorb(rect)` | Unions `rect` in and merges every rectangle it touches. |
+| `absorb_set(&other)` | Absorbs every rectangle of `other`; becomes full if `other` is. |
+| `contains(rect)` | Whether one held rectangle covers the whole of `rect`. |
+| `intersects(rect)` | Whether `rect` shares a pixel with anything to be redrawn. |
+| `clip_to(surface)` | Cuts every rectangle to `surface`, dropping those wholly outside. |
+| `bounds()`, `area()` | `None` when full; `area` is a sum, because the rectangles are disjoint. |
+| `set_full()`, `is_full()`, `clear()`, `len()`, `rects()` | The rest of the state. |
+
+`PartialEq` is order-sensitive and documented as such. Compare `rects()` as a set, or `area()`, when
+coverage rather than representation is the question.
+
+### Where the rectangles come from
+
+Almost all of them come from one walk. The fragment pass composes each box's absolute geometry,
+compares the result against the fragment that was there, and absorbs what changed
+(`crates/zgui-layout/src/fragment/diff/mod.rs`).
+
+```rust
+pub enum Change { Identical, TranslatedOnly, Changed }
+
+const REPAINTS_IN_PLACE: Dirty = Dirty::REPAINT.union(Dirty::RESHAPE);
+```
+
+| Producer | What it absorbs | Where |
+|---|---|---|
+| `Change::Changed` | the previous ink and the new ink | `Pass::update` |
+| `Change::TranslatedOnly` | the previous ink and the new ink | `Pass::update` |
+| `Change::Identical` **and** the node owes `REPAINT` or `RESHAPE` | the fragment's ink | `Pass::update` |
+| a fragment being destroyed | its subtree ink, while it is still readable | `Pass::retire` |
+| a rigid translation | the subtree ink before and after, once for the whole subtree | `diff/rigid/mod.rs` |
+| `zgui_paint::vacated` | the ink of every subtree the frame removed | `zgui-paint/src/damage/accumulate.rs` |
+| `zgui_paint::expand` | the source region of every composite that reads outside what it writes | same file |
+| the caret plan | the caret's rectangle | `crates/zgui-runtime/src/window/frame.rs` |
+
+The `Identical` arm is the one that is easy to miss and cannot be dropped. A colour change moves
+nothing, and re-shaped text of the same extent moves nothing, so geometry comparison alone sees
+neither. Without that arm the two commonest frames there are — a hover repainting one button, and a
+counter whose digit changed width for width — put nothing in the damage set at all.
+
+Conversion to whole device pixels rounds **outwards** on every side (`diff::pixels`). Rounding to
+the nearest pixel leaves a hairline of the previous frame's content along an edge.
+
+`zgui_paint::vacated` must run **before** the box tree is patched. What compares this frame's output
+against the last only ever sees output that still exists, so the area a removed panel occupied is
+nobody's ink. It takes the removed roots rather than borrowing them, which makes it the one consumer:
+a second reader would find the list emptied and absorb nothing, silently.
+
+### The merge policy
+
+`absorb` is three steps:
+
+<Steps>
+
+<Step>
+
+**Early out.** If one held rectangle already contains `rect`, do nothing. This is not an
+optimisation of the loop below: it is the case a scroll produces thousands of times per frame, once
+for every piece of a list that moved inside a scrollport already damaged whole.
+
+</Step>
+
+<Step>
+
+**Merge everything it touches.** Union in each intersecting rectangle, remove it, and restart the
+scan from index zero — the union grew, so a rectangle already passed over may now meet it.
+
+</Step>
+
+<Step>
+
+**Push.** With room, append. At capacity, merge the pair whose union wastes the least area, then
+re-absorb the union so the merge is transitively closed.
+
+</Step>
+
+</Steps>
+
+Waste is the pixels a merge would newly cover, which is the pixels it would cause to be redrawn for
+nothing (`crates/zgui-bits/src/damage_set/merge.rs`):
+
+```text
+wasted(a, b) = area(a ∪ b) - area(a) - area(b)
+```
+
+`least_wasted_pair` compares every pair out of the held rectangles plus the incoming one. With
+`N = 4` that is ten pairs of integer arithmetic. The re-absorption terminates because each re-entry
+strictly decreases the rectangle count before growing it back by one.
+
+Four is a measurement, not an argument. Raising it lets a frame that changed several unrelated places
+redraw each separately instead of redrawing their bounding box — but every rectangle is its own
+render pass, with its own clear, its own scissor and its own state changes, and passes are paid on
+every frame whether or not the extra precision saved anything. Lowering it merges sooner, so a frame
+touching two corners redraws the whole surface. The rule for changing the number is in the
+repository's `CONTRIBUTING.md`.
+
+### Clipping, expansion and escalation
+
+Three things happen to the set between the fragment pass and the emit walk, in this order
+(`crates/zgui-runtime/src/window/frame.rs`).
+
+**Clip to the surface.** What a scroll absorbs is where every moved fragment was and is, which for a
+document taller than its window reaches far past the surface on both sides. Until it is cut, every
+test against the damage passes, so the emit walk descends the whole document and paints, into the
+void, everything hanging off the sides.
+
+**Expand over read extents.** A `backdrop-filter` samples the composite beneath it and a
+`filter: blur()` samples its own target, both over a region dilated well past the rectangle being
+written. Outside a damage rectangle those reads land on the previous frame's composite, which for a
+backdrop is a feedback loop: a caret-sized rectangle inside a frosted panel reads sixty pixels of the
+frame before it, and the panel smears further every frame. `zgui_paint::expand` walks the read-extent
+registry to a fixpoint, bounded by the number of registered fragments.
+
+**Escalate when it is not worth scissoring.** `FULL_DAMAGE_SHARE = 0.5`: once the covered area passes
+roughly half the surface, one full redraw costs less than the passes, the clears and the bookkeeping
+for a set of large overlapping rectangles. Exhausting the expansion bound escalates too, and logs.
+
+After that the set is frozen. The emit walk consults it and never adds to it. Its gate is
+**intersection, not a dirty bit** (`crates/zgui-paint/src/walk/mod.rs`): the renderer clears each
+rectangle before redrawing it, so everything intersecting one must be emitted whether it changed or
+not. The test runs at two granularities — a whole subtree whose union of ink misses the damage is
+skipped in constant time, and a fragment whose own cull rectangle misses it is skipped while its
+children are still visited, because a child can paint outside its parent. Two things are never
+skipped: the paired markers that bracket a group, which is content composited off screen as a unit
+for an opacity or a filter, and anything at all when the set is full.
+
+<Callout type="idea">
+`ZGUI_FULL_DAMAGE=1` forces `DamageSet::for_frame` to start every frame full, which turns off partial
+redrawing wholesale. The environment is read once (`full_damage_forced`). It exists so that "is this
+artefact a damage-tracking bug?" is one restart away from an answer, and it is the first thing to try
+when a visual artefact is reported.
+</Callout>
+
+## Classifying a style change
+
+The style engine that runs the cascade computes four damage bits of its own — repaint, rebuild the
+stacking context, recalculate overflow, relayout — and reserves the top twelve bits of the word for
+whoever is doing the layout. Those twelve describe zgui's stages
+(`crates/zgui-dom/src/stylo/element/damage/mod.rs`):
+
+```rust
+pub const CONSTRUCT_BOX:         RestyleDamage = RestyleDamage::from_bits_retain(1 << 4);
+pub const CONSTRUCT_FC:          RestyleDamage = RestyleDamage::from_bits_retain(1 << 5);
+pub const CONSTRUCT_DESCENDANTS: RestyleDamage = RestyleDamage::from_bits_retain(1 << 6);
+pub const RESHAPE_TEXT:          RestyleDamage = RestyleDamage::from_bits_retain(1 << 7);
+pub const REBREAK_TEXT:          RestyleDamage = RestyleDamage::from_bits_retain(1 << 8);
+pub const RECALCULATE_INK:       RestyleDamage = RestyleDamage::from_bits_retain(1 << 9);
+pub const RELAYOUT_BOX:          RestyleDamage = RestyleDamage::from_bits_retain(1 << 10);
+```
+
+The engine fills them by calling one hook while it compares two computed styles. The hook has no
+receiver and no context, so the only implementation that can exist lives beside the element type:
+
+```rust
+impl Node<'_> {
+    pub fn layout_damage(old: &ComputedValues, new: &ComputedValues) -> RestyleDamage {
+        match classify::cost(old, new) {
+            Cost::Repaint  => RestyleDamage::empty(),
+            Cost::Ink      => RECALCULATE_INK,
+            Cost::Geometry => RELAYOUT_BOX | RESHAPE_TEXT | REBREAK_TEXT,
+            Cost::Layout   => RestyleDamage::reconstruct() | ALL,
+        }
+    }
+}
+```
+
+### The four costs
+
+The classification asks three questions, widest first, and the first "yes, that moved" is the whole
+answer (`classify/mod.rs`):
+
+<DecisionDiagram
+  label="How a style change is assigned a cost"
+  checks={[
+    { question: 'Is structure unchanged?', no: 'Cost::Layout' },
+    { question: 'Is geometry unchanged?', no: 'Cost::Geometry' },
+    { question: 'Does the surface cover the same area?', no: 'Cost::Ink' },
+    { question: 'Are the surface colours unchanged?', no: 'Cost::Repaint' },
+  ]}
+  fallback="Cost::Layout"
+  fallbackDescription="Nothing known moved, so the changed property is one this classifier does not name."
+/>
+
+| Group | Decides | Examples |
+|---|---|---|
+| `structure` | which boxes exist and how they nest | `display`, `position`, `float`, `order`, generated-content strings, `grid-template-columns`, and every animation and transition declaration |
+| `geometry::boxes` | where those boxes are and how large | widths, margins, insets, alignments |
+| `geometry::text` | which glyphs exist and where the lines fall | the whole font group, `line-height`, `letter-spacing`, `text-align`, `word-break`, `writing-mode` |
+| `surface::covers` | the shape of the area covered | corner radii and shapes, `box-shadow`, `backdrop-filter`, `clip`, the mask properties, `image-rendering`, `color-scheme` |
+| `surface::colours` | the colours drawn into that area | the four border colours |
+
+The line between `structure` and `geometry` is drawn by asking what the box *builder* reads.
+`grid-template-columns` is structural because the builder resolves its line names into the container's
+box and nothing refreshes them afterwards. `grid-column-start` is not, because it is read from the
+style every time the grid is sized.
+
+Falling through to `Cost::Layout` is not "nothing changed". The engine calls the hook only after
+deciding something layout-affecting did, so finding no difference means the responsible property is
+one this classification does not name. The safe reading of an unknown property is the widest one, so
+an omission here costs time and never correctness.
+
+### The arms of the translation
+
+`crates/zgui-style/src/damage/translate.rs` turns one restyled element's damage into obligations:
+
+```rust
+pub fn translate(
+    store: &mut DocumentStore,
+    texts: &mut TextKeyStore,
+    record: &Restyled,
+    style: &ComputedStyle,
+    out: &mut DamageSink,
+);
+```
+
+| Condition | Marks |
+|---|---|
+| `record.initial` — a first-time cascade | `RELAYOUT` and `REBUILD_BOX` |
+| `record.damage.intersects(bits::ALL)` | `RELAYOUT` |
+| … and `CONSTRUCT_BOX` | `REBUILD_BOX` |
+| … and `CONSTRUCT_DESCENDANTS` | `REBUILD_BOX` on the node **and** on its subtree union |
+| … and `RESHAPE_TEXT`, once narrowed by the text keys | `RESHAPE` |
+| … and `REBREAK_TEXT`, once narrowed by the text keys | `REBREAK` |
+| `RECALCULATE_INK`, or overflow recalculation without a relayout | `REFRAGMENT`, `REHIT`, `REPAINT` |
+| a stacking-context rebuild without a relayout | `RESTACK`, `REHIT`, `REPAINT` |
+| the paint key moved | `REPAINT`, plus `REBUILD_BOX` when the generated-content styles moved |
+| the accessibility key moved | `A11Y` |
+
+Four things about that table are the design rather than the implementation.
+
+**A first-time cascade produces no engine damage at all.** The engine returns before accumulating any
+when there is no old style to compare against. Without the first arm a newly mounted subtree gets no
+relayout and no box, and never appears. It covers more than an insertion: a subtree coming back out
+of `display: none` has had its style data thrown away, so every element in it is styled for the first
+time again with no mutation at any of them.
+
+**The engine's four bits are a nested lattice**, not four independent flags. Relayout contains
+overflow recalculation, which contains a stacking rebuild, which contains repaint. So the arms are
+tested widest first and the narrower engine bits are excluded under a relayout. A flat sequence of
+tests fires every arm for every relayout; leaving the middle arms out gives an empty answer for
+`transform`, `rotate`, `scale`, `translate`, `perspective`, `isolation` and `z-index`.
+
+**A relayout is not a rebuild.** A width, a margin or an inset carries `RELAYOUT_BOX` alone and
+throws away a cached measurement. A `display`, a `position` or a generated-content string carries the
+construction bits and throws away boxes. Only the second reaches `mark_subtree`.
+
+**Obligations are collected before they are written.** `DamageSink` folds `(NodeIndex, Dirty)` pairs
+by hash lookup, one entry per node, and `apply` writes them all afterwards. Writing an obligation
+walks to the root, and doing that from inside the loop that reads the engine's data would interleave
+two kinds of access to the document. The fold is by lookup rather than by scanning, because a scan
+per obligation is quadratic in the size of the document — paid in full on the pass that styles a
+fresh one.
+
+## The paint key
+
+The engine's repaint bit is not the paint predicate and must not become one. Border colours, corner
+radii, visibility, masks and box shadows reach `translate` carrying **no bit any of its arms read**:
+the classification above answers `Cost::Repaint` for them, and `Cost::Repaint` is
+`RestyleDamage::empty()`. Left to the arms, a hover that changes a border colour would never repaint
+anything.
+
+What decides a repaint is a key comparison, and it is valid for every restyle rather than only for
+layout-affecting ones (`crates/zgui-dom/src/side/paint_key.rs`):
+
+```rust
+pub struct PaintStyleKey {
+    pub background: usize,
+    pub border: usize,
+    pub effects: usize,
+    pub outline: usize,
+    pub svg: usize,
+    pub inherited_ui: usize,
+    pub inherited_box: usize,
+    pub text: usize,
+    pub box_: usize,
+    pub position: usize,
+    pub inherited_text: usize,
+    pub pseudo_before: usize,
+    pub pseudo_after: usize,
+    pub custom: (usize, usize),
+}
+```
+
+Every field is the **address** of a shared, immutable group of computed values. The cascade hands out
+those groups by shared pointer, so two elements that cascaded to the same result hold the very same
+allocation. Equal addresses are therefore a proof of equal values, and the comparison is a handful of
+integer tests rather than a walk over properties.
+
+The converse does not hold and must not be assumed: two groups may hold equal values in separate
+allocations. So the key **over-fires and never under-fires** — a fresh allocation holding the same
+properties repaints an element that did not need it. Every field is chosen with that asymmetry in
+mind, including the custom-property maps, whose identity is derived from the address of the first
+entry and the length.
+
+`translate` reads the previous key out of a document column, writes the new one, and marks `REPAINT`
+when they differ. `PaintStyleKey::UNSTYLED` is all zeros, and a computed-value group's address is
+never null, so the first comparison after a node is styled always reports a change.
+
+One extra consequence: a generated-content style is **cloned into the box** that carries it, so a
+change to one has to rebuild that box rather than merely repaint the element it hangs off. That is
+what `paint_key::pseudos_moved` tests, and it is the one path from a key comparison to
+`REBUILD_BOX`.
+
+The accessibility key (`a11y_key.rs`) has the same shape and marks `A11Y`.
+
+## Text: reshape or rebreak
+
+Two operations turn characters into pixels. **Shaping** asks the font for the glyphs a run of
+characters produces and where each one sits relative to the last, applying kerning, ligatures and
+the font's features. **Line breaking** takes an already-shaped run and decides where it is cut into
+lines, and how each line is aligned in the space available.
+
+Shaping is the expensive half, and a shaped run can be re-broken and re-aligned many times without
+touching the shaper. Therefore, a width change or an alignment change must not cause a shape.
+
+The hook that fills the embedder's damage bits has two styles and no memory, so the only
+classification it can make is the conservative one: any layout-affecting change re-shapes. The memory
+is supplied one level up:
+
+```rust
+pub enum TextWork { None, Rebreak, Reshape }
+
+impl TextKeyStore {
+    pub fn record(&mut self, node: NodeKey, style: &ComputedStyle) -> TextWork;
+    pub fn retire(&mut self, store: &DocumentStore) -> bool;
+}
+```
+
+Each element's last text keys are kept and compared against the new style's:
+
+```rust
+Self {
+    shaping: ShapingKey(ShapingKey::of(&text).0 ^ ShapingKey::of_paragraph(&paragraph).0),
+    breaking: BreakingKey(BreakingKey::of(&text).0 ^ BreakingKey::of_paragraph(&paragraph).0),
+}
+```
+
+| Comparison | Answer |
+|---|---|
+| the shaping key moved | `TextWork::Reshape` |
+| only the breaking key moved | `TextWork::Rebreak` |
+| neither moved | `TextWork::None` |
+| no previous keys | `TextWork::Reshape` — nothing has been shaped, so nothing can be reused |
+
+The keys are hashed from exactly the properties each stage reads, and the classification and the hash
+are derived from one definition, so a property cannot be classified one way and hashed the other.
+
+Two rules bound the narrowing.
+
+**It applies only inside a relayout.** An element the engine gave no layout damage to is not being
+re-shaped or re-broken by this at all.
+
+**The widest damage escapes it.** `RestyleDamage::reconstruct()` means a generated-content box has
+started or stopped existing. The text laid out under the element changed without any property of the
+element's own style moving, so the keys cannot see it. Narrowed, generated content appears unshaped
+or one mutation late.
+
+The store sweeps elements that have left the document, but only once it has doubled since the last
+sweep left it, with a floor of 64 entries. Each sweep is then paid for by at least as many insertions
+as it examines.
+
+Text **content** changes take a different route. `edit.set_text` marks the text node
+`RESHAPE | A11Y` and nothing else. `boxtree::patch::retext` rewrites the characters into the box
+that already lays them out, drops the flattened form of the containing inline formatting context, and
+throws away the layout of the box and every ancestor. It refuses — and forces a rebuild — for the
+three changes a rewrite cannot express: text appearing where there was none, text disappearing
+entirely, and a font change on a non-text element. Before it existed, one keystroke rebuilt every
+box, so every fragment compared as changed and the damage grew to the whole window.
+
+### Paragraph reachability
+
+An `InlineResolution` retains the paragraph identifier that its lines name. Replacing or dropping
+the resolution releases that identifier. The layout store can therefore answer which
+`ParagraphKey`s still support current measurements.
+
+This reachability closes two invalidation holes:
+
+- a brush-slot split invalidates only the affected inline contexts, then forgets only keys that no
+  other current resolution still names;
+- paragraph identifiers are reclaimed only after fragment diffing, so a new paragraph cannot reuse
+  an old slot while an old fragment can still compare against it.
+
+The shaping budget uses the same active set as pins. It evicts inactive entries in
+least-recently-used order without invalidating layout. An explicit reset can still remove active
+shaping, so that path marks the whole tree dirty before any cached measurement can be served.
+
+## Scrolling restyles nothing and lays out nothing
+
+A scroll moves content. It changes no computed style, no size and no shape. What it owes is written
+down once, in `crates/zgui-scroll/src/mark/mod.rs`:
+
+```rust
+pub const SCROLLED: Dirty = Dirty::SCROLL.union(Dirty::A11Y);
+```
+
+That set is marked **on the container and on nothing else**. `SCROLL` is the bit the fragment pass is
+entered on, and it makes that pass descend through the container and recompose its descendants
+against the new offset. `A11Y` is one node's worth of work, because every descendant's bounds are
+published relative to the container. Marking the subtree would be marking, one node at a time,
+precisely what the pass is about to discover — and it would turn a scroll of a five-thousand-row list
+from one mark into five thousand marks. A unit test asserts that `SCROLLED` intersects none of
+`RESTYLE`, `RECASCADE`, `RELAYOUT`, `REBUILD_BOX`, `RESHAPE`, `REPAINT` or `RESTACK`.
+
+Inside the pass, each child takes one of three routes:
+
+```rust
+fn can_skip(&self, child: BoxKey, generator: Option<zgui_dom::NodeKey>) -> bool {
+    let owed = self.owed_by(child, generator);
+    !owed.own.intersects(ENTERS)
+        && !owed.subtree.intersects(ENTERS)
+        && !self.store.fragments_of_box(child).is_empty()
+        && self.store.state(child).is_some_and(|state| state.unrounded == state.composed)
+}
+```
+
+| Route | When | What it costs |
+|---|---|---|
+| `cached(child)` | the parent settled and the child is clean | reading four folded answers off the child's own fragments |
+| `translate(child, movement)` | the child is clean and its whole subtree is rigid | one offset applied down the subtree, plus two `absorb` calls for the whole subtree |
+| `visit(child, …)` | anything else | full composition |
+
+Being clean is not enough on its own for the first route, and the difference is a wrong frame rather
+than a slow one. A box is marked when its *own* content changes, not when a sibling's does — and a
+sibling that grew moves everything the flow places after it. So the layout result is compared as
+well: `state.unrounded == state.composed`.
+
+Rigidity is the extra claim translation needs. Three conditions, all folded up the fragment tree so
+that testing them costs one bool: no sticky box, whose shift is measured against a scrollport it does
+not travel with; no box positioned against the viewport, which takes none of the scroll offsets
+above it; no transform, whose matrix is composed against a border box that moved. The origin the
+subtree is snapped against must also be unchanged, because device-pixel snapping rounds cumulative
+absolute edges.
+
+The fragment pass reports rigid movement separately from other damage. `RigidMoves` records whether
+the pass stayed incremental, the common movement vector, how many subtrees moved, and damage caused
+by anything other than that movement. Reports from multiple fragment passes in one frame are
+combined.
+
+When one scroll container moved by a settled whole-pixel vector, the runtime can ask the renderer to
+shift pixels already stored in its composed target. The runtime first verifies that the port has an
+opaque backing and that no later-painted content overlaps it. It then replaces movement damage for
+the whole port with three things: damage that existed before layout, damage beyond the movement,
+and the bands exposed by the pixel copy. If a check fails, it keeps the full damage set.
+
+Measured on the maintainer's machine (`docs/performance.md`): `scroll.translation.restyles` is 0
+elements, `scroll.translation.relayouts` is 0 nodes, and `scroll.translation.hit_rebuilds` is 0. One
+translation frame is 44.18 µs (`scroll.translation`), against 1021.42 µs for a frame that recycles
+a row into view (`scroll.recycle`).
+
+### Boxes with no element
+
+One correction inside the pass is worth naming, because it is what keeps all of the above
+proportional. CSS requires anonymous boxes: a wrapper around a run of inline siblings, the box that
+establishes an inline formatting context, a run of text between two child elements. None of them came
+from an element, so none has marks of its own — and asking about no element at all answers
+`Dirty::all()`, everything owed, always.
+
+Nearly a fifth of a real document's boxes are anonymous. Because the subtree answer is consulted
+before a clean child is left alone, each of them made its entire subtree unskippable. `Owed::of`
+(`crates/zgui-layout/src/fragment/diff/dirty.rs`) asks about such a box under the name of the element
+it was **generated for**, which is the nearest box above it with a style of its own. Its own answer
+folds the generator's subtree in as well, because an anonymous box establishing an inline formatting
+context draws the lines its inline descendants' glyphs sit in.
+
+## Four traces
+
+### A colour change
+
+A `:hover` rule moves one element's `background-color`.
+
+```text
+interaction write        node: RESTYLE                 ancestors: subtree |= RESTYLE
+cascade                  the engine reports its own repaint bit; no arm of translate
+                         reads that bit, so no arm fires
+paint key                the background group's address moved  ->  node: REPAINT
+layout gate              held                          Counter::LayoutsHeld
+fragment pass            Change::Identical             own & REPAINTS_IN_PLACE -> absorb ink
+damage                   one rectangle
+emit walk                every subtree missing it is skipped in constant time
+retire                   RESTYLE by the engine, REPAINT with ENTERS by the fragment pass
+```
+
+One class toggled on one element in a document of 1 851 boxes measures 11.34 µs at the median
+(`kitchen.click`, `docs/performance.md`).
+
+### A width change
+
+```text
+attribute write          node: RESTYLE
+classify::cost           structure unchanged, geometry moved  -> Cost::Geometry
+                         -> RELAYOUT_BOX | RESHAPE_TEXT | REBREAK_TEXT
+translate                node: RELAYOUT
+                         text keys: neither moved -> TextWork::None
+                         -> no RESHAPE, no REBREAK
+                         paint key: the `position` group holds the width, so also REPAINT
+patch::style::restyle    the new style onto the box; the element owes RELAYOUT, so
+                         mark_dirty throws away its cached layout and every ancestor's
+layout gate              no longer stands; relayout_root runs over the dirty region
+fragment pass            Change::Changed here and Change::TranslatedOnly for what the
+                         flow moved; each absorbs previous ink and new ink
+damage                   merges towards the union of what moved
+```
+
+The width lives in the `position` group of computed values, whose address is a field of the paint
+key. The key over-fires here by design.
+
+### A text change
+
+A signal write replaces the characters of one text node.
+
+```text
+edit.set_text            text node: RESHAPE | A11Y
+cascade                  visits nothing: no style moved
+boxtree::retire          nothing owes REBUILD_BOX or CHILDREN
+patch::retext            descends on RESHAPE, retires nothing, rewrites the characters
+                         in place, drops the flattened inline formatting context, and
+                         invalidates the box's layout and every ancestor's
+layout                   the paragraph is shaped, then broken
+fragment pass            same-width string -> Change::Identical, and RESHAPE is in
+                         REPAINTS_IN_PLACE, so the line's ink is absorbed anyway
+retire                   ENTERS by the fragment pass; A11Y by the projection
+```
+
+One keystroke into a field measures 301.39 µs at the median: one edit, one paragraph reshaped, one
+box repainted (`kitchen.keystroke`, `docs/performance.md`).
+
+### An insertion
+
+A row is appended to a list.
+
+```text
+insert_before            parent: CHILDREN
+                         new node: RESTYLE | A11Y
+ancestors::splice        folds `own | subtree` of the new subtree into the new parent's
+                         chain, which a second `mark` could not do
+cascade                  every new element has Restyled::initial = true, so the engine
+                         accumulates no damage and translate marks
+                         RELAYOUT | REBUILD_BOX from the first arm alone
+boxtree::retire          returns Owed { rebuilt, children } — the lists, not a boolean
+patch::rebuild           splices the new boxes in where the old ones were; the whole tree
+                         is built only when the splice refuses
+layout                   the new boxes and the path to the root are invalid; the pass runs
+fragment pass            the new fragments have no previous fragment -> Change::Changed;
+                         the rows after the insertion point compare TranslatedOnly
+damage                   merges to the part of the list from the insertion point downwards
+```
+
+## Next
+
+<Cards>
+  <Card
+    title="Reactive internals"
+    href="/docs/architecture/reactive-internals"
+    description="How the graph is stored, how a write marks observers, and what the flush does."
+  />
+  <Card
+    title="The style engine"
+    href="/docs/architecture/style-engine"
+    description="The cascade, computed-style sharing, and the traversal that produces this page's damage."
+  />
+  <Card
+    title="The layout engine"
+    href="/docs/architecture/layout-engine"
+    description="The box tree, incremental patching, fragments and the measurement cache."
+  />
+  <Card
+    title="Cost model"
+    href="/docs/performance/cost-model"
+    description="What each kind of change costs, measured, with the numbers behind the traces above."
+  />
+</Cards>

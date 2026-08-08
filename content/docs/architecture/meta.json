@@ -1,0 +1,17 @@
+{
+  "title": "Architecture",
+  "pages": [
+    "overview",
+    "the-frame",
+    "the-document",
+    "invalidation",
+    "reactive-internals",
+    "style-engine",
+    "layout-engine",
+    "text-engine",
+    "paint-and-scene",
+    "renderer",
+    "platform-layer",
+    "crate-map"
+  ]
+}

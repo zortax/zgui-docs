@@ -1,0 +1,435 @@
+---
+title: Layout
+description: The box model, flexbox and grid taught from scratch, sizing, positioning, overflow, and the stacking order a document is painted in.
+---
+
+Layout decides where every box goes and how big it is. This page teaches the model from nothing —
+it assumes you have never used flexbox or grid — and states exactly which properties this build
+reads. It assumes [Styling](/docs/learn/styling) and [Elements](/docs/learn/elements).
+
+## The box
+
+Every element is a rectangle with four rings around its content.
+
+<BoxModelDiagram />
+
+- **content** — the text, the picture, the children.
+- **padding** — space inside the border. It takes the background.
+- **border** — a drawn edge.
+- **margin** — space outside the border. It takes nothing, and it separates this box from its
+  neighbours.
+
+```css
+.card {
+    padding: 16px;
+    border: 1px solid #2a3242;
+    margin: 8px;
+}
+```
+
+### `box-sizing`
+
+`width` normally sets the **content** width, and padding and border are added to it. A box declared
+`width: 200px` with `padding: 16px` and a `1px` border occupies 234 pixels.
+
+`box-sizing: border-box` makes `width` the width **including** padding and border, which is almost
+always what you meant.
+
+```css
+.card { box-sizing: border-box; width: 200px; padding: 16px }
+```
+
+<Callout type="info">
+There is no automatic `border-box` default. If you want it everywhere, write it once:
+`* { box-sizing: border-box }`.
+</Callout>
+
+## Formatting contexts
+
+A box lays its children out according to one **formatting context**, chosen by `display`. This is
+the single most important decision in a layout.
+
+| Context | `display` | How children are placed |
+|---|---|---|
+| Block | `block` | stacked down the block axis; vertical margins collapse; floats apply |
+| Flex | `flex` | along one axis, with rules for the leftover space |
+| Grid | `grid` | into rows and columns you declare |
+| Inline | `inline` | as a run of text and inline boxes, broken into lines |
+| Atomic inline | `inline-block`, `inline-flex`, `inline-grid` | a leaf to the line around it, a container inside |
+| Replaced | — | sized from content this engine does not own, such as a picture |
+| Table | `table` and the internal table displays | table layout |
+| Multi-column | — | column layout |
+| None | `none` | no box at all; the subtree is laid out at zero size and skipped |
+
+The [element vocabulary](/docs/learn/elements) already gives each element name one of these. `row`
+and `column` are flex containers, `box` is a block, `text` and `label` are inline. You change one
+with an ordinary declaration.
+
+<Callout type="warn">
+`display: none` is not "invisible". The box does not exist, so it takes no space, receives no
+events, and its subtree is skipped. To hide a box but keep its space, use `visibility: hidden`. To
+remove it from the document entirely, use [`if`](/docs/learn/control-flow), which is cheaper than
+either.
+</Callout>
+
+## Flexbox
+
+A flex container lays its children out along one axis and decides what to do with the space left
+over.
+
+### The two axes
+
+```css
+.bar { display: flex; flex-direction: row }
+```
+
+- The **main axis** is the one children are placed along. With `flex-direction: row` it runs left to
+  right; with `column` it runs top to bottom.
+- The **cross axis** is the other one.
+
+Everything in flexbox is named after those two, so the same properties work in both directions.
+
+| Property | Axis | What it does |
+|---|---|---|
+| `justify-content` | main | distributes leftover space along the main axis |
+| `align-items` | cross | places children across the cross axis |
+| `align-self` | cross | overrides `align-items` for one child |
+| `align-content` | cross | distributes leftover cross-axis space **between lines**, in a container that wraps |
+| `gap`, `row-gap`, `column-gap` | both | space between children, without margins |
+
+```css
+.bar {
+    display: flex;
+    flex-direction: row;
+    justify-content: space-between;   /* push the first left, the last right */
+    align-items: center;              /* centre them vertically */
+    gap: 12px;
+}
+```
+
+`row` and `column` are already flex containers, so in practice you write only the parts you are
+changing:
+
+```rust
+view! {
+    row(class = "bar") {
+        label {"Storage"}
+        spacer()
+        text {"41 GB"}
+    }
+}
+```
+
+```css
+.bar { align-items: center; gap: 12px }
+```
+
+<Callout type="info">
+`spacer` is a box declared `flex: 1 1 auto`, so it absorbs the leftover space and pushes whatever
+follows it to the far end. It is often clearer than `justify-content: space-between`, because it
+says at the call site where the gap is.
+</Callout>
+
+### Growing and shrinking
+
+Each flex child has three numbers:
+
+| Property | Meaning |
+|---|---|
+| Property | Default | Meaning |
+|---|---|---|
+| `flex-grow` | `0` | the share of **extra** space this child takes. `0` means none. |
+| `flex-basis` | `auto` | the size the child starts at, before growing. `auto` means its content size. |
+| `flex-shrink` | `1` | the share of the **overflow** this child gives up |
+
+The default that catches people is `flex-shrink: 1`. Every flex child gives up space when the line
+overflows, so a child shrinks below its own `flex-basis`, `width` or `height` unless you say
+otherwise. A fixed sidebar needs the third number as well as the first two:
+
+```css
+.sidebar { flex-grow: 0; flex-shrink: 0; flex-basis: 240px }
+.main    { flex-grow: 1; min-width: 0 }
+```
+
+`min-width: 0` on the growing child is the matching rule in the other direction. A flex item's
+automatic minimum size is its `min-content` size, so one long word can hold the item wider than its
+share and push the line out. Setting the minimum to zero lets the item shrink to its share and clip
+or wrap inside.
+
+### Wrapping and order
+
+```css
+.tags { display: flex; flex-wrap: wrap; gap: 8px; align-content: flex-start }
+.tag--pinned { order: -1 }   /* placed before its siblings */
+```
+
+`flex-wrap` and `order` are both read. `justify-items` and `justify-self` are read too.
+
+`align-content` applies only once the container wraps. It shares out the cross-axis space left over
+after the lines are stacked: `start` and `flex-start`, `end` and `flex-end`, `center`, `stretch`,
+`space-between`, `space-around` and `space-evenly` all work. With one line it does nothing, which is
+the usual reason a declaration appears to be ignored.
+
+## Grid
+
+A grid container places children into rows and columns that you declare in advance. Reach for it
+when the arrangement is two-dimensional; flexbox is for one axis at a time.
+
+```css
+.panels {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 16px;
+}
+```
+
+- **Tracks** are the columns and rows. `grid-template-columns` declares the columns,
+  `grid-template-rows` the rows.
+- **`fr`** is a unit meaning "one share of the leftover space". `repeat(4, 1fr)` is four equal
+  columns.
+- **`repeat(n, …)`** writes a track pattern `n` times.
+
+Sizes can mix:
+
+```css
+grid-template-columns: 240px 1fr 1fr;      /* fixed, then two equal */
+grid-template-columns: repeat(3, minmax(0, 1fr));
+```
+
+### Placing a child
+
+```css
+.panel--wide { grid-column-start: 1; grid-column-end: 3 }   /* spans two columns */
+.panel--tall { grid-row-start: 1; grid-row-end: 3 }
+```
+
+`grid-auto-flow` and `grid-auto-rows` control what happens to children you did not place.
+`align-content` and `justify-content` share out the space the grid has left over once its tracks are
+sized — `align-content` between the rows, `justify-content` between the columns.
+
+<Callout type="error">
+**`grid-template-areas` and `grid-auto-columns` are not read by this build.** They parse and are
+ignored. Place children with `grid-column-start` / `grid-column-end` and
+`grid-row-start` / `grid-row-end` instead.
+</Callout>
+
+## Sizing
+
+| Property | Meaning |
+|---|---|
+| `width`, `height` | the size, in any length unit or a percentage |
+| `min-width`, `min-height` | a floor the box never goes below |
+| `max-width`, `max-height` | a ceiling the box never goes above |
+| `aspect-ratio` | derives one dimension from the other |
+| `inline-size`, `block-size` | the logical forms of `width` and `height` |
+
+All of them, and every `min-` and `max-` form, are read. So are the logical `margin-*`,
+`padding-*` and `border-*-width` properties.
+
+### Intrinsic sizes
+
+Three keywords ask the content how big it wants to be:
+
+| Keyword | Meaning |
+|---|---|
+| `min-content` | the smallest the box can be without overflowing — for text, the longest word |
+| `max-content` | the size the content would take with no wrapping at all |
+| `fit-content` | `max-content`, clamped by the space available |
+
+```css
+.chip { width: fit-content }        /* as wide as its label, no wider */
+.cell { min-width: min-content }    /* never squeeze a word in half */
+```
+
+Computing one of these makes layout measure the content, which for text means shaping it. That is
+why an intrinsic size costs more than a fixed one. See
+[The layout engine](/docs/architecture/layout-engine).
+
+The box keeps its intrinsic answer across layout passes. Layout measures it again only after its
+content, style, device scale, or reserved scrollbar gutter changes.
+
+### `calc`
+
+Arithmetic across units is supported:
+
+```css
+.pane { width: calc(100% - 240px) }
+```
+
+## Positioning
+
+```css
+.thing { position: relative; top: 4px; left: 8px }
+```
+
+| Value | What it does | Positioned against |
+|---|---|---|
+| `static` | the default; `top`/`left` and friends are ignored | — |
+| `relative` | keeps its place in the flow, then shifts | its own normal position |
+| `absolute` | removed from the flow; the space closes up | the nearest positioned ancestor |
+| `fixed` | removed from the flow, pinned to the window | the window |
+| `sticky` | in flow until it would scroll out, then pinned | its scroll container |
+
+All five are read. `top`, `right`, `bottom`, `left` and the four `inset-*` forms are read.
+
+<Callout type="info">
+"The nearest positioned ancestor" means the nearest ancestor whose `position` is not `static`. This
+is why the usual pattern is `position: relative` on a container that does not itself move, purely to
+give an absolutely positioned child something to anchor to.
+</Callout>
+
+For content that has to escape a clipping or transformed ancestor entirely, positioning is not
+enough. Use [`Portal`](/docs/learn/control-flow).
+
+## Overflow
+
+`overflow` says what happens when content is larger than its box.
+
+| Value | Behaviour |
+|---|---|
+| `visible` | the content spills out and is still painted |
+| `hidden` | the content is clipped to the box |
+| `auto` | the content is clipped and the box scrolls |
+| `scroll` | the same, with the scrollbar always present |
+
+`overflow-x`, `overflow-y` and the logical `overflow-block` / `overflow-inline` are all read.
+
+A box with a scrolling overflow becomes a **scroll container**: it clips its content, tracks an
+offset, and handles wheel input. The `scroll` element is declared `overflow: auto` by the
+framework's own sheet, which is the only reason it is a separate element name.
+[Scrolling](/docs/building/scrolling) covers the rest.
+
+<Callout type="warn">
+`scrollbar-gutter` is not read. Reserve the space yourself with `padding-right` on the scrolling
+element, or the content will shift by the scrollbar's width when the bar appears.
+</Callout>
+
+## Painting order and stacking contexts
+
+Layout decides *where*. Something else decides *what is in front*. That something is the stacking
+order, and it is neither document order nor the box tree's order.
+
+A document is painted as a forest of **stacking contexts**. Inside one context, boxes are painted in
+six passes, in this order:
+
+<Steps>
+
+<Step>
+
+**Negative stacking** — child contexts with a negative `z-index`.
+
+</Step>
+
+<Step>
+
+**Block** — block-level boxes in the normal flow.
+
+</Step>
+
+<Step>
+
+**Float** — floated boxes.
+
+</Step>
+
+<Step>
+
+**Inline** — inline-level boxes in the normal flow.
+
+</Step>
+
+<Step>
+
+**Positioned** — positioned boxes and child contexts whose `z-index` is `auto` or `0`.
+
+</Step>
+
+<Step>
+
+**Positive stacking** — child contexts with a positive `z-index`.
+
+</Step>
+
+</Steps>
+
+A box that establishes a context of its own is painted **atomically**, wherever that context sits in
+its parent's sequence.
+
+### What establishes a stacking context
+
+- the root box;
+- a positioned box with a `z-index` that is not `auto`;
+- any box with `position: fixed` or `position: sticky`;
+- a flex or grid **item** that gave itself a `z-index`;
+- `opacity` below `1`;
+- `mix-blend-mode` other than `normal`;
+- `isolation: isolate`;
+- any `filter` or `backdrop-filter`;
+- any `clip-path`;
+- any `transform`, `rotate`, `scale` or `translate`.
+
+<Callout type="warn">
+This list has a consequence that surprises everyone once: putting `opacity: 0.99` on an ancestor
+makes that whole subtree composite as a unit, which can move it in front of content it used to sit
+behind. The same applies to adding a transform for an animation.
+</Callout>
+
+`z-index` only has an effect on a box that is positioned, or on a flex or grid item. On an ordinary
+static block it does nothing.
+
+The order computed here is the order the display list is emitted in, and therefore the order the hit
+test uses. A hit is the last thing painted under the point. Paint order and hit order cannot
+diverge.
+
+## CSS pixels and device pixels
+
+Every length you write is in **CSS pixels**. The window's **scale factor** — 1.0 on an ordinary
+display, 2.0 on a high-density one — converts those into device pixels at the last moment.
+
+```rust
+app().with_size(360.0, 300.0)    // CSS pixels
+```
+
+You do not multiply anything. A 16-pixel font is 16 CSS pixels on both displays and is drawn with
+twice as many device pixels on the second. When the scale factor changes mid-run — a window dragged
+to another monitor — the framework re-rasterises what it must and keeps the layout as it was.
+
+| Unit | Means |
+|---|---|
+| `px` | one CSS pixel |
+| `%` | a fraction of the containing block |
+| `em` | the element's own font size |
+| `rem` | the root element's font size |
+| `fr` | one share of a grid's leftover space |
+| `vw`, `vh` | a hundredth of the window's width or height |
+
+## What layout costs
+
+Layout is incremental. Box-tree patches are applied only for subtrees that changed, and the layout
+algorithm runs over the dirty region rather than the document.
+
+Two things widen that region, and both are worth recognising:
+
+- **A size change propagates.** Changing a width re-lays-out the box, its descendants, and its
+  ancestors up to the first one whose own size does not depend on it.
+- **An intrinsic size measures content.** `fit-content`, `min-content`, `max-content` and an `auto`
+  flex basis all ask the content how big it wants to be, which for text means shaping it.
+
+A change that alters only appearance — a colour, a shadow, a border colour — does not reach layout
+at all. It is classified as repaint damage by the style engine and goes straight to paint.
+[The cost model](/docs/performance/cost-model) has the measured numbers.
+
+## Next
+
+<Cards>
+  <Card
+    title="Effects and lifecycle"
+    href="/docs/learn/effects-and-lifecycle"
+    description="Side effects, cleanup, and reading a node after it is mounted."
+  />
+  <Card
+    title="Scrolling"
+    href="/docs/building/scrolling"
+    description="Scroll containers, scrollbars, programmatic scrolling and virtual lists."
+  />
+</Cards>

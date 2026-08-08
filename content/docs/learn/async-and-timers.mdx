@@ -1,0 +1,239 @@
+---
+title: UI tasks and timers
+description: Run futures on the UI thread, cancel them with their scope, schedule callbacks, and show pending views.
+---
+
+zgui runs reactive work on the UI thread. Use a UI task when a future must read signals, write
+signals, or use view state. Use a timer when work must start after a time interval. This page
+assumes [Signals](/docs/learn/signals), [Control flow](/docs/learn/control-flow), and [Effects and
+lifecycle](/docs/learn/effects-and-lifecycle).
+
+For work that uses significant CPU time or blocks a thread, see [Background
+work](/docs/learn/background-work).
+
+## Spawn a UI task
+
+`spawn` and `spawn_local` are in the prelude. Both functions queue a future on the UI thread.
+The next reactive flush polls the future.
+
+```rust
+use zgui::prelude::*;
+
+#[component]
+fn Answer() -> impl IntoView {
+    let answer = RwSignal::new(String::from("Waiting"));
+
+    spawn(async move {
+        answer.set(ask().await);
+    });
+
+    view! { text {{move || answer.get()}} }
+}
+```
+
+```rust
+pub fn spawn(future: impl Future<Output = ()> + Send + 'static) -> Task;
+pub fn spawn_local(future: impl Future<Output = ()> + 'static) -> Task;
+```
+
+Use `spawn` when the future is `Send`. Use `spawn_local` when the future holds a node handle,
+callback, or other local value. The `Send` bound does not move a `spawn` task to a worker. Both
+functions run the future on the UI thread.
+
+<Callout type="warn">
+A UI task can wait without blocking the frame. It must not do long CPU work or call a blocking
+function. One slow poll delays the complete frame.
+</Callout>
+
+## Task lifetime and cancellation
+
+A task belongs to the current scope. When the scope is disposed, zgui cancels the task and drops
+its captured values immediately. A task started in a component body or one of its listeners
+therefore stops when the component is unmounted.
+
+`spawn` returns a `Task` for early cancellation:
+
+```rust
+let current = RwSignal::new_local(None::<Task>);
+
+let start = move || {
+    let task = spawn_local(async move {
+        load_editor_state().await;
+    });
+    current.set(Some(task));
+};
+
+let cancel = move || {
+    if let Some(task) = current.get_untracked() {
+        task.cancel();
+    }
+    current.set(None);
+};
+```
+
+```rust
+impl Task {
+    pub fn cancel(&self);
+    pub fn is_finished(&self) -> bool;
+}
+```
+
+Dropping `Task` does not cancel the task. This permits the common form
+`spawn(async { /* ... */ });`. Keep the handle only when the interface needs a Cancel action or
+must inspect the task state.
+
+Use `zgui::reactive::spawn_detached` only when work must continue after its scope is disposed. A
+detached task must not depend on state that belongs to that scope.
+
+<Callout type="info">
+Cancellation stops the UI task. It cannot stop work that `background` or `blocking` already sent
+to a worker. zgui discards the worker result when it arrives.
+</Callout>
+
+## Task scheduling
+
+The reactive flush polls ready tasks. A wake requests the frame that runs the next poll. The task
+does not run at its spawn site.
+
+| Rule | Result |
+|---|---|
+| Spawn from the UI thread. | A debug build panics if `spawn` or `spawn_local` runs on another thread. |
+| Each task has a poll budget per flush. | A task that does not stall continues in the next frame. zgui logs its spawn site. |
+| A task panic reaches the frame loop. | zgui does not convert a panic to a task error. |
+| A wake from another thread requests a frame. | The event loop stays parked while no task is ready. |
+
+## Timers
+
+The prelude provides two timer functions:
+
+```rust
+pub fn set_timeout(after: Duration, callback: impl FnOnce() + 'static) -> TimeoutHandle;
+pub fn set_interval(every: Duration, callback: impl FnMut() + 'static) -> IntervalHandle;
+```
+
+Dropping the returned handle cancels the timer. Keep the handle in local storage when the
+component must own it.
+
+```rust
+use core::time::Duration;
+use zgui::prelude::*;
+use zgui::view::TimeoutHandle;
+
+#[component]
+fn Notice() -> impl IntoView {
+    let shown = RwSignal::new(true);
+    let timeout = StoredValue::new_local(Some(set_timeout(
+        Duration::from_secs(4),
+        move || shown.set(false),
+    )));
+
+    view! {
+        if move || shown.get() {
+            control(on:click = move |_| {
+                timeout.set_value(None);
+                shown.set(false);
+            }) {"Dismiss"}
+        }
+    }
+}
+```
+
+The window clock controls the timer. Tests can advance this clock without waiting for wall time.
+A due callback runs at the start of a frame, before reactive work. Its signal writes settle in the
+same frame.
+
+An interval schedules its next deadline from the current time. It does not run missed callbacks
+after a long pause. Timers with the same deadline run in registration order.
+
+### Schedule from a listener
+
+The free timer functions use the current window scope. A listener does not run in the component
+body's window scope. Obtain `Timers` in the component body and move it into the listener.
+
+In a multi-window application, a timer runs only in the window that scheduled it. Another window's
+frame leaves the callback in the timer heap for its owning window.
+
+```rust
+#[component]
+fn Tooltip() -> impl IntoView {
+    let open = RwSignal::new(false);
+    let timers = Timers::current().expect("the component is in a window");
+    let pending = StoredValue::new_local(None::<TimeoutHandle>);
+
+    view! {
+        box(
+            on:pointer_enter = move |_| {
+                pending.set_value(Some(timers.set_timeout(
+                    Duration::from_millis(700),
+                    move || open.set(true),
+                )));
+            },
+            on:pointer_leave = move |_| {
+                pending.set_value(None);
+                open.set(false);
+            },
+        ) {"More information"}
+    }
+}
+```
+
+A timer created through `Timers` does not bind itself to a component scope. Its handle controls
+its lifetime. Store the handle in the component.
+
+## Wait inside a view
+
+`Await` runs one future and builds a view from its output. `Suspense` and `Transition` provide a
+fallback for pending `Await` values below them.
+
+```rust
+view! {
+    {Suspense::new(
+        || AnyView::new(view! { label {"Loading…"} }),
+        || AnyView::new(Await::new(load_profile(), |profile: Profile| {
+            AnyView::new(view! { label {{profile.name}} })
+        })),
+    )}
+}
+```
+
+| Type | Behavior |
+|---|---|
+| `Await` | Renders nothing until its future resolves. Then it builds `children(value)`. |
+| `Suspense` | Shows its fallback whenever a child operation is pending. |
+| `Transition` | Shows its fallback only before the first result. It keeps the previous result during later loads. |
+| `SuspenseContext` | Counts the pending operations inside a boundary. |
+
+An `Await` task belongs to the scope that built it. Removing the boundary cancels the pending
+task. Its captured values are dropped during the unmount.
+
+Use `SuspenseContext::nearest()` when a component starts work without `Await`. Call `expect_one`
+before the work starts and `resolve_one` on the UI thread when it finishes.
+
+## Reactive async types
+
+`Action`, `AsyncDerived`, and `AsyncTransition` are available at `zgui::reactive`. They are not in
+the prelude.
+
+| Type | Use |
+|---|---|
+| `Action<I, O>` | Run an operation that starts from an input, such as Save or Send. |
+| `AsyncDerived<T>` | Recompute an async value when its reactive inputs change. |
+| `AsyncTransition` | Wait for the async derived values read in one operation. |
+
+Read all reactive inputs before you call `background`. Reads on a worker do not subscribe to the
+reactive graph.
+
+## Next
+
+<Cards>
+  <Card
+    title="Background work"
+    href="/docs/learn/background-work"
+    description="Move work off the UI thread and return results safely."
+  />
+  <Card
+    title="Tokio integration"
+    href="/docs/learn/tokio-integration"
+    description="Install a Tokio runtime and connect Tokio channels to signals."
+  />
+</Cards>

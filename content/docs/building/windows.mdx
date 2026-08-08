@@ -1,0 +1,249 @@
+---
+title: Multiple windows
+description: Open and control windows, share application state, handle close requests, and choose the application exit policy.
+---
+
+Each zgui window owns a document, a view scope, layout state, paint caches, and presentation state.
+Windows in the same application can share reactive state and use the same graphics device.
+
+The window passed to `App::run` is the **primary window**. Open more windows with `use_windows()`.
+
+## Open a window
+
+Call `use_windows()` in a component body. Capture the returned handle in a listener, effect, timer,
+or other UI-thread callback:
+
+```rust
+use zgui::prelude::*;
+
+#[component]
+fn Settings() -> impl IntoView {
+    view! { label() {"Settings"} }
+}
+
+#[component]
+fn Main() -> impl IntoView {
+    let windows = use_windows();
+
+    view! {
+        control(
+            tabindex = Focus::Sequential,
+            on:click = {
+                let windows = windows.clone();
+                move |_| {
+                    windows.open(
+                        WindowOptions::new("Settings")
+                            .with_size(480.0, 600.0)
+                            .with_resizable(false),
+                        || view! { Settings() },
+                    );
+                }
+            }
+        ) {"Open settings"}
+    }
+}
+```
+
+`open` returns a `WindowHandle` immediately. The platform creates the window on the next event-loop
+turn. `handle.is_open()` is false until that happens. Calls made on a pending or closed handle do
+nothing.
+
+Because creation is deferred, `open` cannot return a platform error. If an additional window cannot
+open, zgui logs the error under `zgui::app`, leaves its handle unopened, and keeps the other windows
+running. A failure to open the primary window is returned by `App::run`.
+
+The view argument is `FnMut`, not `FnOnce`. A platform suspension removes native surfaces. On
+resume, zgui creates the requested windows again and rebuilds their views.
+
+## Use the current window
+
+`use_window()` returns the window in which the calling component runs:
+
+```rust
+#[component]
+fn WindowStatus() -> impl IntoView {
+    let window = use_window();
+    let size = {
+        let window = window.clone();
+        move || {
+            let size = window.size().get();
+            format!("{:.0} × {:.0}", size.width.0, size.height.0)
+        }
+    };
+
+    view! {
+        label() {{size}}
+        control(
+            tabindex = Focus::Sequential,
+            on:click = {
+                let window = window.clone();
+                move |_| window.toggle_maximized()
+            }
+        ) {"Maximize or restore"}
+    }
+}
+```
+
+`try_use_window()` returns `None` instead of panicking when no window scope exists.
+`try_use_windows()` does the same for the application scope.
+
+### Reactive window state
+
+These `WindowHandle` methods return signals:
+
+| Method | Value |
+|---|---|
+| `size()` | content size in CSS pixels |
+| `scale()` | device pixels per CSS pixel |
+| `focused()` | whether this window has keyboard focus |
+| `occluded()` | whether the desktop says the whole window is hidden |
+| `maximized()` | whether the window is maximized |
+| `fullscreen()` | the current `FullscreenMode`, if any |
+
+Read a signal with `get()` when the view must update. A size request is not a size result. Call
+`request_size`, then read `size()` to learn what the desktop accepted.
+
+### Window commands
+
+The handle can change the title, size limits, position, resizability, decorations, maximized state,
+fullscreen mode, stacking level, icon, color scheme, cursor, focus, and attention request. It can
+also minimize or close the window.
+
+Platform support differs. Unsupported operations and operations on closed windows are no-ops. Use
+`WindowHandle::capabilities()` when the interface must hide an unsupported command. For example,
+Wayland compositors choose window positions, so `set_position` does nothing and `position()` returns
+`None` there.
+
+`WindowHandle` is a UI-thread handle. Do not send it to background work. Post the required action
+back to the UI thread.
+
+## Configure a new window
+
+`WindowOptions` configures a window before it opens:
+
+| Method | Sets |
+|---|---|
+| `new`, `with_title` | title |
+| `with_size`, `with_min_size`, `with_max_size` | CSS-pixel size constraints |
+| `with_resizable` | whether the user can resize the window |
+| `with_decorations` | desktop title bar and frame |
+| `with_transparent` | whether the surface can show transparent pixels |
+| `with_position` | requested desktop position |
+| `with_maximized`, `with_fullscreen` | initial display state |
+| `with_level` | requested stacking level |
+| `with_icon` | window icon where the desktop accepts one |
+| `with_theme` | light or dark preference for this window |
+| `with_stylesheet` | a stylesheet for this window only |
+
+The application stylesheet applies to every window. A window stylesheet is cascaded after it. Use
+the application stylesheet for shared components and a window stylesheet for local changes.
+
+The application identifier also applies to every window. Set it once with
+`App::with_application_id`; the desktop uses it for grouping, icons, and window rules.
+
+`ColorScheme` for `with_theme` is available as `zgui::platform::ColorScheme`; the prelude keeps that
+name for view theming.
+
+## Share state between windows
+
+A context provided inside a window belongs to that window. Other windows cannot resolve it. Put
+shared state in the application scope with `App::with_context`:
+
+```rust
+use zgui::prelude::*;
+
+#[derive(Clone, Copy)]
+struct SharedCount(RwSignal<i32>);
+
+fn main() -> Result<(), zgui::Error> {
+    app()
+        .with_context(|| provide_context(SharedCount(RwSignal::new(0))))
+        .run(|| view! { Main() })
+}
+```
+
+Every window is mounted below this scope, so `expect_context::<SharedCount>()` returns the same
+signal in all of them. A write in one window schedules frames for the other windows that read it.
+
+Each window has a separate document identity. A `NodeRef`, node identifier, or document-local
+context from one window cannot address another window. Share model state, not document handles.
+
+Application-scope state survives platform suspension. State created in a window scope does not;
+the window view is rebuilt after resume.
+
+## List and address windows
+
+`use_windows()` returns a `Windows` handle:
+
+| Method | Result |
+|---|---|
+| `open(options, view)` | a handle for the requested window |
+| `all()` | a snapshot of the open windows |
+| `watch()` | a signal containing the open windows |
+| `capabilities()` | the desktop's window capabilities |
+| `quit()` | an explicit application-exit request |
+
+`WindowHandle::id()` is stable for the window's whole requested life, including suspension and
+resume. Compare IDs when a command must exclude the current window.
+
+## Handle close requests
+
+A close request from the user consults every registered callback. If any callback returns
+`CloseResponse::Veto`, the window stays open.
+
+Register a window-wide callback while opening it:
+
+```rust
+use std::{cell::Cell, rc::Rc};
+
+let dirty = Rc::new(Cell::new(true));
+let check_dirty = dirty.clone();
+let editor = windows.open(
+    WindowOptions::new("Editor").on_close_request(move || {
+        if check_dirty.get() {
+            CloseResponse::Veto
+        } else {
+            CloseResponse::Close
+        }
+    }),
+    || view! { Editor() },
+);
+```
+
+Give the editor another clone of `dirty` so it can clear the flag after a save. The callback in
+`WindowOptions` is retained during suspension. It must not capture state that belongs only to the
+disposed window scope. An application-scope signal from `App::with_context` is also safe.
+
+Use `on_close_request` inside a component when the question exists only while that component is
+mounted. It returns a `CloseGuard`. Keep the guard in the component's scope; dropping it unregisters
+the callback.
+
+`WindowHandle::close()` is different. It is an application command and bypasses close callbacks.
+The application has already decided to close that window.
+
+## Choose when the application exits
+
+The default is `ExitPolicy::WhenAllWindowsClose`. Set another policy on the application builder:
+
+| Policy | Exit condition |
+|---|---|
+| `WhenAllWindowsClose` | the last requested window closes |
+| `WhenPrimaryCloses` | the window passed to `run` closes |
+| `Explicit` | code calls `use_windows().quit()` |
+
+Use `WhenPrimaryCloses` when inspectors or palettes must not outlive the main window. Use `Explicit`
+only when something outside the window set, such as a tray integration, can open a window or quit
+the application.
+
+## Draw custom window decorations
+
+When `with_decorations(false)` removes the desktop frame, the application must provide move,
+resize, minimize, maximize, and close controls.
+
+- Put `window.move_drag_handler()` on the title bar.
+- Put `window.resize_drag_handler(edge)` on each resize edge or corner.
+- Put `window.no_drag_handler()` on controls inside the draggable title bar.
+- Use `window.maximized()` and `window.fullscreen()` to hide resize grips when they cannot apply.
+
+These handlers ask the desktop to take over the gesture. They also work on Wayland, where an
+application cannot move itself by setting coordinates.

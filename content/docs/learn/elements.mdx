@@ -1,0 +1,720 @@
+---
+title: The element vocabulary
+description: The sixteen element names, what each one means, the layout the framework's own sheet gives it, and every attribute each one takes.
+---
+
+An element is the smallest thing an interface is built out of: one box, with a name, that can be
+styled, listened to and filled with children. zgui defines sixteen of them, the list is closed, and
+this page is all of it. It assumes [Views](/docs/learn/views).
+
+## Why these names
+
+The names say what an **interface** is made of, not what a **document** is made of.
+
+- There is no `div`. A container that means nothing in particular is `box`, which says so out loud.
+- There is no `span`. The two jobs a `span` does are two names here: `text` is a run of prose, and
+  `label` is text that names something else.
+- There is no `input`. A text field, a checkbox and a slider have nothing in common but a
+  specification's history. `field` is one value the user enters, `editor` is text the user changes,
+  and `control` is anything the user operates.
+
+Each name is a Rust function that starts a builder and a marker type that decides which attributes
+that name takes. `image().src("a.png")` compiles. `row().src("a.png")` does not, and the error names
+the trait the row does not implement.
+
+The vocabulary is closed on purpose. The framework's own style sheet is written against exactly
+these sixteen names. Use the [`CustomElement`](/docs/advanced/custom-elements) abstraction for a
+retained widget that owns layout and paint. Define a separate vocabulary only when you are building
+a different document language; the last section covers that case.
+
+## The sixteen
+
+<Callout type="info">
+The layout column below comes from a **user-agent sheet**: a style sheet the framework installs
+before any of yours. Rules arrive from three origins — this framework's sheet, a user's sheet, and
+your application's sheet — and at equal specificity the later origin wins. Your rule therefore
+beats the framework's, always. [Styling](/docs/learn/styling) covers the whole model.
+</Callout>
+
+| Written in a view | What it means | What the framework's sheet gives it |
+|---|---|---|
+| `box` | a container that means nothing in particular | `display: block` |
+| `row` | children in a line, left to right | `display: flex; flex-direction: row` |
+| `column` | children in a line, top to bottom | `display: flex; flex-direction: column` |
+| `stack` | children over one another, in the order they were written | `display: flex; flex-direction: column` |
+| `text` | a run of text | `display: inline` |
+| `label` | text that names something else | `display: inline` |
+| `image` | a picture, sized by what it is a picture of | `display: inline-block` |
+| `vector` | shapes, drawn from paths | `display: inline-block` |
+| `scroll` | content larger than the space there is for it | `display: block; overflow: auto` |
+| `canvas` | shapes that application code builds and mutates | `display: inline-block; width: 300px; height: 150px` |
+| `editor` | text the user changes | `display: block` |
+| `field` | one value the user enters | `display: block` |
+| `control` | something the user operates: a button, a switch, a slider's thumb | `display: block` |
+| `surface` | pixels that another wgpu renderer produces | `display: inline-block` |
+| `spacer` | the space between two things, which takes whatever is left over | `display: block; flex: 1 1 auto` |
+| `overlay_root` | where portalled content goes | `display: block; position: fixed; inset: 0; pointer-events: none` |
+
+That column is not a description. It is the sheet, verbatim, from
+`crates/zgui-style/src/sheets/ua.rs`:
+
+```css
+* { box-sizing: border-box; }
+
+:root {
+    display: block;
+    width: 100%;
+    height: 100%;
+    font-family: system-ui, sans-serif;
+    font-size: 16px;
+    line-height: 1.5;
+    color: var(--zgui-foreground);
+}
+
+box, field, control, editor  { display: block; }
+custom                       { display: block; }
+row                          { display: flex; flex-direction: row; }
+column, stack                { display: flex; flex-direction: column; }
+text, label                  { display: inline; }
+image, canvas, vector, surface { display: inline-block; }
+canvas                       { width: 300px; height: 150px; }
+scroll                       { display: block; overflow: auto; }
+spacer                       { display: block; flex: 1 1 auto; }
+
+overlay_root                        { display: block; position: fixed; inset: 0;
+                                      pointer-events: none; }
+overlay_root > [data-layer]         { position: absolute; inset: 0; pointer-events: none; }
+overlay_root > [data-layer] > *     { pointer-events: auto; }
+overlay_root > [data-layer=content] { z-index: 10; }
+overlay_root > [data-layer=popover] { z-index: 20; }
+overlay_root > [data-layer=modal]   { z-index: 30; }
+overlay_root > [data-layer=toast]   { z-index: 40; }
+
+:focus-visible { outline: 2px solid var(--zgui-ring); outline-offset: 2px; }
+:disabled      { pointer-events: none; }
+::selection    { background-color: var(--zgui-selection); color: var(--zgui-selection-text); }
+[hidden]       { display: none; }
+```
+
+Two things follow from that being ordinary CSS at the lowest origin.
+
+**Every rule is overridable.** `column { flex-direction: row }` works and means what it says. So
+does `text { display: block }`. The name gives you a starting layout and a selector; it does not
+lock either one down.
+
+**The `--zgui-*` names are referenced and never defined.** Your theme defines them. A document with
+no theme installed has no focus-ring colour rather than a wrong one.
+
+## Containers
+
+`box`, `row`, `column`, `stack` and `spacer` exist to place other things.
+
+```rust
+use zgui::prelude::*;
+
+const SHEET: &str = css!(
+    ".card { gap: 8px; padding: 16px; border-radius: 12px; background-color: #191d26; }
+     .card__row { align-items: center; gap: 8px; }
+     .card__value { color: #7d879b; }
+     .card__note { padding-top: 8px; border-top: 1px solid #262b36; }"
+);
+
+view! {
+    column(class = "card") {
+        label(class = "card__title") {"Storage"}
+        row(class = "card__row") {
+            text {"Used"}
+            spacer()
+            text(class = "card__value") {"41 GB"}
+        }
+        row(class = "card__row") {
+            text {"Backups"}
+            spacer()
+            text(class = "card__value") {"3"}
+        }
+        box(class = "card__note") {
+            text {"Last checked an hour ago."}
+        }
+    }
+}
+```
+
+- `row` and `column` are flex containers already. You never write `display: flex` for them, only the
+  properties that tune one: `gap`, `align-items`, `justify-content`, `flex-wrap`.
+- `box` groups and says nothing else. It is a block, so each child sits under the last and fills the
+  width, and flex properties such as `gap` do nothing on it.
+- `spacer` is `flex: 1 1 auto` and nothing else. It absorbs the free space, which pushes whatever
+  follows it to the far end. Inside a block container it does nothing at all, because there is no
+  free space to absorb.
+
+<Callout type="warn">
+<Status kind="partial">`stack`</Status> means "children over one another", and the sheet does not
+implement that yet. Today `stack` gets exactly the rule `column` gets. Write the positioning
+yourself until it does:
+
+```css
+.stack { position: relative; }
+.stack > * { position: absolute; inset: 0; }
+```
+</Callout>
+
+## Text
+
+`text` and `label` are both inline. A string literal is already a text child, so neither needs
+anything inside it but the string.
+
+```rust
+view! {
+    column(class = "field-row") {
+        label(class = "field-row__name") {"Display name"}
+        text(class = "field-row__value") {"Ada Lovelace"}
+    }
+}
+```
+
+`text` is prose: a paragraph, a value, a sentence. `label` is text that names something else: a
+field's caption, a control's title. The two are separate names so that a style sheet can address
+them separately, and so that a view can say which is which.
+
+The distinction is yours to use. Nothing in the framework reads the name `label` and announces the
+element differently. What an element means to a screen reader comes from `a11y:` attributes, which
+[Accessibility](/docs/building/accessibility) covers.
+
+## Media
+
+### `vector`
+
+`vector` is the content element that is wired end to end. It draws outlines, one path per line, in
+the notation a vector image uses.
+
+```rust
+view! {
+    vector(
+        class = "icon",
+        prop:viewBox = "0 0 24 24",
+        prop:d = "M20.5 7.1 L18.9 5.5 L9.6 14.8 L5.1 10.3 L3.5 11.9 L9.6 18.0 Z",
+    )
+}
+```
+
+A `viewBox` is the square of coordinates the outlines are written in. With one, the outlines are
+scaled uniformly to fit the element's content box and centred in what is left, so one path constant
+draws at every size an icon is asked for. Without one, the outlines are already in CSS pixels from
+the content box's top-left corner, which is what a chart mark wants.
+
+The builder methods carry the same three things with types instead of strings:
+
+```rust
+use zgui::elements::kurbo::{Rect, Shape};
+use zgui::elements::vector;
+
+let square = Rect::new(0.0, 0.0, 16.0, 16.0).to_path(0.1);
+let drawing = vector().paths([square]).view_box(0.0, 0.0, 16.0, 16.0);
+```
+
+`kurbo` is re-exported at `zgui::elements::kurbo`, because a path crosses from a view all the way to
+the rasteriser as the same type.
+
+A whole vector document goes in instead:
+
+```rust
+let icon = vector().document(
+    r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">
+         <path d="M2 8 L8 2 L14 8 L8 14 Z" fill="currentColor"/>
+       </svg>"#,
+);
+```
+
+A document replaces `paths` and `view_box` rather than adding to them, because it brings its own
+space with it. A document written with `fill="currentColor"` takes the element's own computed
+`color`, so one asset is dark on a light button and light on a dark one. A document that names its
+own colours keeps every one of them.
+
+Colour comes from three custom properties, and they inherit, so setting one on an ancestor themes
+every drawing below it:
+
+| Property | Default |
+|---|---|
+| `--zgui-fill` | the element's own computed `color` |
+| `--zgui-stroke` | nothing; the outlines are not stroked |
+| `--zgui-stroke-width` | `1` |
+
+<Callout type="error">
+`fill: red` in a style sheet does nothing. The whole family of vector-paint properties is gated to
+another engine in this build, so a declaration using one is discarded while the sheet is parsed.
+Write `--zgui-fill: red`, or set `color` and let the drawing follow it.
+</Callout>
+
+### `image`
+
+```rust
+view! {
+    image(src = "avatar.png", a11y:label = "Ada Lovelace")
+}
+```
+
+`src` names a local file. zgui decodes PNG, JPEG, WebP, and GIF data off the UI thread. The decoded
+pixel dimensions become the natural size in CSS pixels. CSS can override that size, and the image
+scales to the full content box. A reactive `src` closure changes the picture.
+
+`alt` remains an ordinary attribute. Use `a11y:label` for an accessible name.
+[Images](/docs/building/images) covers file and memory sources, decode limits, and caching.
+
+### `canvas`
+
+`canvas` is the imperative sibling of `vector`. Rust code pushes retained shapes into a scene. The
+element draws those shapes through the same vector pipeline as SVG content.
+
+Use `.draw(|cx| ...)` for a closure that follows signals and the element's size. Use a
+`CanvasHandle` and `.scene(&handle)` when event handlers mutate a retained scene. An unstyled canvas
+is 300 by 150 CSS pixels. [Vector and canvas](/docs/building/vector-and-canvas) covers both forms.
+
+## Interaction
+
+### `control`
+
+`control` is anything the user operates. It is one of the three names that are focusable without
+saying so, and the framework gives it real behaviour before you write a listener.
+
+```rust
+#[component]
+fn Toggle() -> impl IntoView {
+    let (on, set_on) = signal(false);
+
+    view! {
+        control(
+            class = "toggle",
+            a11y:role = Role::Button,
+            state:checked = on,
+            on:click = move |_| set_on.update(|value| *value = !*value),
+        ) {
+            {move || if on.get() { "On" } else { "Off" }}
+        }
+    }
+}
+```
+
+What the framework does on its own account, none of it a listener and all of it cancellable:
+
+| Input | What happens |
+|---|---|
+| a press | focus moves to the nearest focusable element on the hit path. A press on something unfocusable clears focus. |
+| a release over the element that was pressed | that element is activated. A press that slid off before being let go is not an activation. |
+| `Enter` or `Space` | the **focused** element is activated. Key repeats are dropped. |
+| activation | a click event is delivered to that element. |
+
+That is the whole of it. A `control` has no role, no appearance, no pressed state and no ripple. Say
+what it is with `a11y:role` and how it looks with CSS. The last row is wider than it looks: `Enter`
+and `Space` activate whatever holds focus, whatever its element name. Nothing in that rule is
+specific to `control`.
+
+### `field` and `editor`
+
+<Status kind="partial">The editing model is real. The `value` and `placeholder` attributes are
+not connected to it.</Status>
+
+`field` is one value the user enters. `editor` is text the user changes. Both carry a full editing
+model, attached the first time a key or an input method reaches the element:
+
+- typing, <kbd>Backspace</kbd> and <kbd>Delete</kbd>;
+- arrow keys, <kbd>Home</kbd> and <kbd>End</kbd>, with <kbd>Shift</kbd> to extend;
+- undo and redo;
+- input-method composition, with the surface told where the caret is;
+- clipboard text;
+- caret placement and drag selection with the pointer.
+
+The caret and the selection band are painted by the framework from that model, and both take the
+element's own computed `color`. Moving `color` on the field moves the caret with it.
+
+The two names differ in exactly one place. Only `editor` accepts a line break. In a `field`,
+<kbd>Enter</kbd> is refused by the model and left to whatever is around it, which is what lets a
+form submit on it.
+
+```rust
+view! {
+    field(class = "field", a11y:role = Role::TextInput) {"Ada"}
+}
+```
+
+The initial text is an ordinary text child, written once. Do not rewrite it afterwards: that node is
+the very text the editing model is typing into.
+
+<Callout type="warn">
+Editing is a **default action**. It runs after every listener on the path, and only if none of them
+took responsibility for the event. A `field` with an `on:key_down` handler that calls
+`prevent_default` types nothing — which is how a numeric-only field is written.
+</Callout>
+
+Be precise about what the typed attributes do today:
+
+| Attribute | What it does |
+|---|---|
+| `disabled = …` | sets the state `:disabled` matches. This works: it removes the element from the focus order, from what a pointer can reach, and from editing. |
+| `value = …` | writes a property named `value` on the node. **The editing model does not read it.** |
+| `placeholder = …` | writes a plain `placeholder` attribute. **Nothing renders it.** |
+
+To put text into a field from your own state, use `NodeRef::set_value`, which reaches the model
+rather than the property. See [Effects and lifecycle](/docs/learn/effects-and-lifecycle). To show a
+prompt while a field is empty, generate it with `::before` and a custom property, and select the
+empty case with `:empty`.
+
+## Structure
+
+### `scroll`
+
+`scroll` is `display: block; overflow: auto`. That is the entire element-level story, and it is
+enough, because everything else keys on the used `overflow` rather than on the name: any element
+with `overflow: auto` or `overflow: scroll` scrolls, and `scroll` is the one that has it already.
+
+```rust
+const SHEET: &str = css!(".log { height: 240px; } .log__lines { gap: 4px; }");
+
+view! {
+    scroll(class = "log") {
+        column(class = "log__lines") {
+            text {"one"}
+            text {"two"}
+            text {"three"}
+        }
+    }
+}
+```
+
+A scrolling element reserves 15 CSS pixels for a scrollbar (`SCROLLBAR_SIZE`,
+`crates/zgui-style/src/sheets/ua.rs`). A wheel or trackpad gesture scrolls the nearest scrolling
+ancestor of whatever it landed on, and hands the remainder outwards when that container reaches its
+end. [Scrolling](/docs/building/scrolling) covers offsets, momentum and programmatic scrolling.
+
+### `surface`
+
+`surface` is a replaced element whose pixels come from another wgpu renderer. Bind a
+`SurfaceRenderer` when zgui must drive the work. Bind a `SurfaceHandle` when a producer has its own
+thread or cadence. CSS supplies the final box and applies clipping, transforms, and opacity.
+
+Use `box` for a card, sheet, dialog, or menu body. [GPU surfaces](/docs/advanced/surfaces) covers the
+two rendering models and texture lifetime.
+
+### `overlay_root`
+
+An **overlay** is content that has to escape the box it was written inside: a menu that must not be
+clipped by a scrolling ancestor, a dialog that must paint over everything.
+
+The framework creates one `overlay_root` per window, plus four layer nodes under it carrying a
+`data-layer` attribute. Portalled content is always a grandchild of the overlay root. That shape is
+what the `>` selectors in the sheet above are written against, and it is why the four bands stack in
+a fixed order rather than in mount order.
+
+<Callout type="warn">
+`overlay_root()` is callable from a view, and must not be called. There is already one per window.
+Reach a band with `Portal`, which [Control flow](/docs/learn/control-flow) covers.
+</Callout>
+
+## The attribute matrix
+
+This is the reference half of the page. [Attributes](/docs/learn/attributes) documents what each
+namespace does; here is which element takes what.
+
+### Universal — every element takes these
+
+They are declared `impl<T: Tag> Element<T>`, so they are available on all sixteen names and on any
+vocabulary of your own.
+
+| Written in a view | Builder method | Takes |
+|---|---|---|
+| `class = v` | `.class(impl Into<Classes>)` | names added to the class list, merged and deduplicated. **Not reactive.** |
+| `class:name = v` | `.class_toggle(ClassName, bool)` | one class on or off, leaving the rest alone |
+| `style = v` | `.style_text(Option<String>)` | the whole inline style text |
+| `style:gap = v` | `.style_property(impl Into<String>, Option<String>)` | one inline declaration |
+| `var:--brand = v` | `.custom_property(CustomPropertyName, Option<String>)` | one custom property |
+| `attr:data-x = v` | `.attribute(AttrName, Option<String>)` | one attribute, which selectors can match |
+| `state:disabled = v` | `.state(UiState, bool)` | one of the eight interaction states a view may assert |
+| `custom_state:picked = v` | `.custom_state(Ident, bool)` | a state of your own, matched by `:state(picked)` |
+| `prop:key = v` | `.property(PropKey, PropValue)` | an imperative property: not an attribute, invisible to selectors |
+| `on:click = h` | `.on(E, handler)` | a listener |
+| `on:click:capture = h` | `.on_with(E, ListenerOptions, handler)` | a listener, saying which leg of dispatch it runs in |
+| `a11y:label = v` | `.a11y(A11yBinding)` | what the element means to something reading the interface |
+| `node_ref = h` | `.node_ref(NodeRef)` | fills the handle in once the node exists |
+| `tabindex = v` | `.tabindex(Focus)` | makes the element focusable, and says how it is reached |
+| `hidden = v` | `.hidden(bool)` | writes `hidden=""` when true, which the sheet turns into `display: none` |
+| `{..bundle}` | `.attrs(Attrs)` | replays a bundle a caller forwarded, at the position it is written |
+
+Everything above except `class`, `node_ref`, the two `on:` rows and the spread accepts a constant
+**or** a signal **or** a closure. Which you pass decides whether the value is written once or kept
+up to date; there is no keyword that marks one as dynamic. A listener is attached once, and a
+spread's entries each keep whatever the caller wrote.
+[Reactivity in views](/docs/learn/reactivity-in-views) covers the rule.
+
+<Callout type="warn">
+`style = …` replaces the element's **whole** inline style text, including anything `style:` set
+before it. The two are not usually mixed on one element.
+</Callout>
+
+There is no `id` builder. Write `attr:id = "main"`. `#main` selectors match it.
+
+### Typed — attributes that belong to one name
+
+Three traits decide who gets what, and each has a fixed set of implementors.
+
+| Trait | Implemented by | Adds |
+|---|---|---|
+| `Sourced` | `image` | `src`, `alt` |
+| `Valued` | `field`, `editor` | `value`, `placeholder` |
+| `Operable` | `control`, `field`, `editor` | `disabled` |
+
+<Callout type="info">
+The three traits live in a private module of the element crate, so a vocabulary of your own cannot
+implement one yet. <Status kind="partial">The typed families are closed to outside
+vocabularies.</Status> Everything in the universal set is open to them.
+</Callout>
+
+`vector` has seven of its own, on `Element<Vector>` directly:
+
+| Attribute | Takes | Reactive |
+|---|---|---|
+| `paths` | `impl IntoIterator<Item = BezPath>` | no |
+| `document` | `&str`, a whole vector document | no |
+| `view_box` | `(f32, f32, f32, f32)` — **builder only** | no |
+| `hit_shape` | `BezPath` | no |
+| `fill` | `Option<String>` | yes |
+| `stroke` | `Option<String>` | yes |
+| `stroke_width` | `Option<String>` | yes |
+
+The whole matrix, then:
+
+| Element | Beyond the universal set |
+|---|---|
+| `box`, `row`, `column`, `stack`, `text`, `label`, `scroll`, `spacer`, `overlay_root` | nothing |
+| `image` | `src`, `alt` |
+| `vector` | `paths`, `document`, `view_box`, `hit_shape`, `fill`, `stroke`, `stroke_width` |
+| `canvas` | `scene`, `view_box`, `draw` |
+| `surface` | `source`, `renderer` through `SurfaceElementExt` |
+| `field`, `editor` | `value`, `placeholder`, `disabled` |
+| `control` | `disabled` |
+
+That is the whole typed surface. There is no `checked`, `open`, `read_only` or `required` method —
+those are interaction states, written `state:checked`, `state:open` and so on.
+
+Writing a typed attribute on the wrong name is a compile error, not an attribute nobody reads:
+
+```rust
+row().src("picture.png");      // does not compile: a row has no source
+row().placeholder("Search");   // does not compile: nothing is entered into a row
+text().disabled(true);         // does not compile: a run of text is not operated
+```
+
+Three notes on `vector`:
+
+- `view_box` takes four numbers, and the `name = value` grammar cannot express that. In a view,
+  write `prop:viewBox = "0 0 24 24"`.
+- `paths`, `document`, `view_box` and `hit_shape` take plain values, so they are written once. To
+  change a drawing as state changes, write `prop:d` with a closure.
+- <Status kind="planned">`hit_shape` is written and never read.</Status> A drawing's hit area is its
+  whole box today.
+
+## Focus and `tabindex`
+
+Focus is which element the keyboard is talking to. `tabindex` says whether an element can hold it,
+and takes a `Focus` rather than a number.
+
+| Value | Written as | Means |
+|---|---|---|
+| `Focus::Sequential` | `tabindex="0"` | reached by tabbing, in the order the element appears |
+| `Focus::Programmatic` | `tabindex="-1"` | focusable, but only when something focuses it deliberately |
+
+Two values and not an integer, deliberately: a tab order that is a number is a tab order nobody
+maintains. Every positive value has to be kept consistent with every other one across a whole
+application, and the result is reliably worse than the order the elements are already in.
+
+`control`, `field` and `editor` are focusable without declaring anything. Any other name needs
+`tabindex`.
+
+An element can be focused when all of these hold:
+
+1. it is an element, not a text node;
+2. it does not carry `:disabled`;
+3. it declares `tabindex`, or it is one of those three names;
+4. once laid out, it generates a box whose `visibility` is `Visible`.
+
+`tabindex` takes a value like any other attribute, so it can follow state. That is not a refinement:
+a control disabled while it holds focus has to leave the sequential order, and a composite control
+moves the one sequentially reachable item between its children as the arrow keys travel.
+
+```rust
+control(tabindex = move || {
+    if disabled.get() { Focus::Programmatic } else { Focus::Sequential }
+})
+```
+
+`Focus` is the one element-crate item the prelude exports, so `use zgui::prelude::*;` has it.
+
+<Callout type="info">
+The framework's focus order still honours an arbitrary integer written by hand with
+`attr:tabindex`. A positive value queue-jumps, in increasing order, ahead of everything in document
+order. A negative value stays focusable but leaves the sequence. A value that does not parse is no
+`tabindex` at all rather than a zero, because a typo that silently made an element a tab stop would
+be worse than one that did nothing. `Focus` narrows what a view can say to the two values worth
+saying. [Keyboard and focus](/docs/building/keyboard-and-focus) covers traversal in full.
+</Callout>
+
+The sheet draws the ring for you:
+
+```css
+:focus-visible { outline: 2px solid var(--zgui-ring); outline-offset: 2px; }
+:disabled      { pointer-events: none; }
+```
+
+Define `--zgui-ring` in your theme, or the ring has no colour.
+
+## Building an element by hand
+
+`view!` is a shorthand for a builder, and the builder is public. Every method takes the element and
+gives it back, so an element is one expression. Nothing is created while it is being described: the
+node, its attributes and its children come into existence when the view is built. An `Element<T>`
+can therefore be stored in a variable, passed to a function and returned from one.
+
+```rust
+use zgui::prelude::*;
+use zgui::elements::control;
+
+/// A button, without `view!`.
+fn button(caption: &'static str, press: impl Fn() + 'static) -> impl IntoView {
+    control()
+        .class("button")
+        .a11y(A11yBinding::new(Role::Button))
+        .on(events::CLICK, move |_| press())
+        .child(caption)
+}
+
+// Both spellings mix freely: a hand-built element is a value, and a value is a braced child.
+view! {
+    row(class = "actions") {
+        {button("Cancel", move || dismiss.set(true))}
+        {button("Save", move || save.set(true))}
+    }
+}
+```
+
+The element names are **not** in the prelude. Sixteen short function names in every application's
+namespace would shadow more than they help, and `view!` resolves them itself. Import the ones you
+build by hand from `zgui::elements`. One is a Rust keyword, so the function is `r#box`.
+
+Children go on with two methods:
+
+| Method | Takes |
+|---|---|
+| `.child(impl IntoView)` | one child, after the ones already added |
+| `.children(impl IntoIterator<Item = AnyView>)` | every child of an iterator, in order |
+
+```rust
+use zgui::elements::{label, row};
+
+fn chips(names: Vec<String>) -> impl IntoView {
+    row().class("chips").children(
+        names
+            .into_iter()
+            .map(|name| AnyView::new(label().class("chip").child(name))),
+    )
+}
+```
+
+<Callout type="error">
+A listener bound to a name **first** does not compile. The compiler settles the closure's argument
+type before anything has said which event it is for, and the call is then rejected as
+`implementation of Fn is not general enough`, which says nothing about what to do. Supply the event
+at the binding with `handler`:
+
+```rust
+use zgui::elements::control;
+
+let pick = handler(events::CLICK, move |_| { /* … */ });
+let button = control().on(events::CLICK, pick);
+```
+
+A closure written inline at `on:` or `.on(…)` needs none of this, because the event is already known
+when the compiler reads it.
+</Callout>
+
+Two ordering rules are worth knowing, because both are observable.
+
+**At build**, the class list goes on first, then each attribute in the order it was written, then the
+accessibility description. Everything in between may add to either of those two, which is why they
+bracket the rest.
+
+**At rebuild**, the node is never re-created — it is the same element, described again. What an
+earlier description wrote and this one does not mention **stays written**. Listeners are the
+exception, and have to be: they are replaced rather than added to, or an element described inside a
+closure would gain one extra handler per change.
+
+## A vocabulary of your own
+
+`Tag` is the whole extension point. A marker type implements it to say what an element is called,
+and the name is what selectors match and what a style sheet gives layout defaults to.
+
+```rust
+pub trait Tag: 'static {
+    fn name() -> ElementName;
+}
+```
+
+One name of your own is a struct, an impl and a function:
+
+```rust
+use zgui::elements::{Element, Tag};
+use zgui::view::ElementName;
+
+/// One name from a document language of your own.
+pub struct Div;
+
+impl Tag for Div {
+    fn name() -> ElementName {
+        ElementName::new("div")
+    }
+}
+
+/// The function a view calls.
+pub fn div() -> Element<Div> {
+    Element::new()
+}
+```
+
+A view reaches it by path, and the case of the last segment is what decides an element from a
+component:
+
+```rust
+view! {
+    html::div(class = "page") {
+        html::span() {"hello"}
+    }
+}
+```
+
+It joins the same machinery on the same terms. Every universal attribute is there already, because
+each one is `impl<T: Tag> Element<T>`. `class`, `on:`, `a11y:`, `state:`, `attr:`, `style:`,
+`node_ref` and the spread all work on `Div` exactly as they work on `row`. So does the whole
+`view!` grammar, the cascade, hit testing and event dispatch.
+
+Four things do not come along, and each is a literal list somewhere in the framework:
+
+| What is missing | What to do |
+|---|---|
+| **Layout.** A foreign name matches no rule in the sheet above, so it lays out as an inline run of nothing. | Install a sheet of your own at the user-agent origin. That is where a document language's display defaults belong. |
+| **Focus by nature.** The three focusable names are the literal strings `control`, `field` and `editor`. | Write `tabindex` on anything of yours that takes focus. |
+| **The editing model.** The two editable names are the literal strings `editor` and `field`. | Nothing of yours is typed into. |
+| **Typed attributes.** `Sourced`, `Valued` and `Operable` are not reachable outside the element crate. | Write `attr:src` and `prop:value` by hand. |
+
+Neither vocabulary knows about the other, and a view can mix them freely.
+
+## Next
+
+<Cards>
+  <Card
+    title="Signals"
+    href="/docs/learn/signals"
+    description="Reactive state, so that an element can change after it is built."
+  />
+  <Card
+    title="Attributes"
+    href="/docs/learn/attributes"
+    description="Every attribute namespace in full: what each lowers to and which are reactive."
+  />
+</Cards>

@@ -1,0 +1,237 @@
+---
+title: Reactivity in views
+description: Which parts of a view update and which do not — the reactive hole, reactive attributes, and how the framework decides.
+---
+
+A view is built once. The parts of it that change afterwards are the ones whose value is a closure
+or a signal. This page explains exactly how that decision is made. It assumes
+[Views](/docs/learn/views) and [Signals](/docs/learn/signals).
+
+## The rule
+
+**Whether a piece of a view is static or dynamic is decided by its type, not by how it was
+written.** There is no keyword, no attribute and no annotation.
+
+```rust
+text {{count.get().to_string()}}          // a String   — written once, never again
+text {{move || count.get().to_string()}}  // a closure  — written again on every change
+```
+
+Both compile. The first reads the signal while the view is being built, gets a `String`, and writes
+it into a text node. Nothing subscribed, so nothing ever updates it.
+
+The second passes a closure. A closure is what the framework recognises as a **reactive hole**: it
+runs the closure inside a tracking context, so the reads inside it subscribe, and re-runs it when
+they change.
+
+<Callout type="warn">
+This is the framework's most common bug, and its symptom is always the same: the interface renders
+correctly once and then never changes. When something will not update, check for a missing
+`move ||`.
+</Callout>
+
+## Reactive holes as children
+
+A closure child is a hole in the document that the framework keeps filled.
+
+```rust
+use zgui::prelude::*;
+
+#[component]
+fn Status() -> impl IntoView {
+    let count = RwSignal::new(0);
+
+    view! {
+        column {
+            text {{move || count.get().to_string()}}
+            text {{move || if count.get() % 2 == 0 { "even" } else { "odd" }}}
+            control(on:click = move |_| count.update(|n| *n += 1)) {"+"}
+        }
+    }
+}
+```
+
+Two holes, both reading the same signal, and nothing wires them together. Writing `count` re-runs
+both and nothing else in the window.
+
+What happens on a run:
+
+<Steps>
+
+<Step>
+
+**The first run is synchronous.** It happens while the view is being built, so the view is complete
+before it is mounted. There is no empty first frame.
+
+</Step>
+
+<Step>
+
+**Every later run waits for the flush.** A write marks the hole; the frame runs it once, however
+many writes arrived.
+
+</Step>
+
+<Step>
+
+**An unchanged value writes nothing.** A text node remembers the last string it was given. If the
+closure produces the same string, the document is not touched, so nothing below is invalidated
+either.
+
+</Step>
+
+<Step>
+
+**The node is reused, not replaced.** Rebuilding a hole cancels the old effect and starts a new one
+in place. No node moves, and nothing below the hole is disturbed.
+
+</Step>
+
+</Steps>
+
+### A hole may produce anything
+
+The closure's return type only has to be a view. That includes whole subtrees:
+
+```rust
+text {{move || format!("{} of {}", done.get(), total.get())}}
+
+box {{move || {
+    if let Some(user) = user.get() {
+        view! { label {{user.name.clone()}} }
+    } else {
+        view! { label {"Signed out"} }
+    }
+}}}
+```
+
+<Callout type="info">
+For a two-way branch, prefer [`if`](/docs/learn/control-flow). It compares the **answer**, so
+writing a signal that does not flip the boolean swaps nothing. A closure hole re-runs whenever any
+signal it read changed, and rebuilds what it produced.
+</Callout>
+
+## Reactive attributes
+
+The same rule applies inside the parentheses. An attribute value that is a constant is written once
+with no effect behind it. A value that is a signal or a closure gets exactly one effect.
+
+```rust
+// Static: written at build time, no effect created.
+box(class = "panel")
+box(style:width = "200px")
+
+// Dynamic: one effect each.
+box(class:open = move || open.get())
+box(style:width = move || format!("{}px", width.get()))
+box(state:disabled = move || busy.get())
+```
+
+A signal handle may be passed directly, with no closure:
+
+```rust
+let width: Signal<String> = /* … */;
+
+box(style:width = width)     // the signal itself is a reactive value
+```
+
+Both are accepted, and both create one effect. A closure is needed only when there is a computation
+between the signal and the value.
+
+<Callout type="info">
+Because a constant creates no effect, a view full of static attributes costs nothing to keep. The
+framework knows an attribute is constant from its type and skips the machinery entirely.
+</Callout>
+
+### What may be a reactive value
+
+| You pass | Meaning |
+|---|---|
+| a literal, or anything `Into<T>` | constant |
+| a closure `Fn() -> T` | dynamic |
+| a signal, memo, or anything readable as a `T` | dynamic |
+
+That last row is what lets a component declare a prop once and accept all three from its callers.
+See [Derived state](/docs/learn/derived-state).
+
+## Common shapes
+
+### A class that follows a condition
+
+```rust
+row(
+    class = "todo",
+    class:done = move || item.done.get()
+)
+```
+
+`class` sets the fixed part of the class list. `class:done` adds and removes one class as the
+closure's answer flips. The two do not conflict; the fixed part is never rewritten.
+
+### Text assembled from several signals
+
+```rust
+label {{move || format!("{} of {} done", done.get(), total.get())}}
+```
+
+One hole, two subscriptions. Writing either signal re-runs the hole once.
+
+### A value that is expensive to compute
+
+```rust
+let summary = Memo::new(move |_| expensive(rows.get()));
+
+view! {
+    text {{move || summary.get()}}
+}
+```
+
+A memo computes once per change and caches. Several holes reading the same memo share the one
+computation. See [Derived state](/docs/learn/derived-state).
+
+## What is not reactive
+
+These are static, and it is worth recognising them:
+
+```rust
+// The element name. There is no "reactive element name"; use `if` or `Dynamic`.
+column { … }
+
+// A value read outside a closure, even if it came from a signal.
+let label = count.get().to_string();
+view! { text {{label}} }
+
+// A listener. It is attached once and never re-attached.
+control(on:click = handler)
+
+// Anything inside a `_untracked` read.
+text {{move || count.get_untracked().to_string()}}   // runs once, subscribes to nothing
+```
+
+The last one is worth a second look: the closure makes it a hole, but the read inside subscribes to
+nothing, so the hole is never marked. It runs once and then sits idle. Use `_untracked` only where
+not subscribing is the point.
+
+## Where the effect lives
+
+A reactive hole is an effect, and an effect's lifetime is the scope that owns it. Because the hole
+was created inside the view, the view keeps it. When the surrounding component or branch is
+removed, the effect is disposed of in the same frame, and any timers under it stop that frame.
+
+You do not have to store anything. This is only worth knowing because it is different if you create
+an effect by hand — see [Effects and lifecycle](/docs/learn/effects-and-lifecycle).
+
+## Next
+
+<Cards>
+  <Card
+    title="Derived state"
+    href="/docs/learn/derived-state"
+    description="Closures, memos, and the Signal<T> prop type that accepts all of them."
+  />
+  <Card
+    title="Components"
+    href="/docs/learn/components"
+    description="Reusable pieces of interface, with named props and compile-time checks."
+  />
+</Cards>

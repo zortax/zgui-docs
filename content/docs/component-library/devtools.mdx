@@ -1,0 +1,656 @@
+---
+title: Devtools
+description: "The zgui-devtools inspector: how to attach it, what each of its six tabs shows, and what it costs when it is attached."
+---
+
+`zgui-devtools` is an inspector. It shows a panel beside the window that it inspects. The panel shows
+the document as a tree, what the last frame did, where the time of that frame went, what the reactive
+graph holds, what the style engine supports, and what the renderer holds.
+
+Read [the cost model](/docs/performance/cost-model) first. The inspector is the instrument that you
+read those numbers with.
+
+## What the crate is
+
+The crate is on layer L8, above the framework. No crate in `zgui` depends on it. An application that
+does not name the crate contains no part of it: no panel, no probe and no sampling.
+
+The crate names `zgui`, `zgui-css`, `zgui-dom`, `zgui-layout`, `zgui-style`, `zgui-text-style`,
+`zgui-view-dom` and `zgui-profile`. It reads the parity data directly from the crates that declare
+it. A copy of that data can report an old state of the build.
+
+The crate also switches on the `instrument` feature of `zgui`. This feature records the boundary of
+each component instance. The Elements tab and the Reactivity tab read these boundaries. See
+[Component boundaries](#component-boundaries).
+
+<Callout type="info">
+The panel uses the same vocabulary as an application: `column`, `row`, `text`, `control`, `box` and
+`vector`. It uses `class:` for the on-states, a keyed `for` for each list, and `if` or `Show` for
+content that is not always present.
+</Callout>
+
+## How to attach the inspector
+
+The inspector needs two connections:
+
+| Connection | Type | Function |
+|---|---|---|
+| `Inspector`, around the root view | a view | It draws the panel. It also receives key events before the application. |
+| `tools.probe()`, given to `App::with_probe` | a `FrameProbe` | It reads each frame. A view can read the document, but only a probe can read the frame. |
+
+<Steps>
+
+<Step>
+
+Add the dependency.
+
+```toml title="Cargo.toml"
+[dependencies]
+zgui = { path = "../zgui/crates/zgui" }
+zgui-devtools = { path = "../zgui/crates/zgui-devtools" }
+```
+
+</Step>
+
+<Step>
+
+Make one `DevTools`. Give its probe to the application. Put `Inspector` around the root view.
+
+```rust
+use zgui::prelude::*;
+use zgui_devtools::{DevTools, Inspector, InspectorProps};
+
+fn main() -> Result<(), zgui::Error> {
+    let tools = DevTools::new();
+    app()
+        .with_probe(tools.probe())
+        .run(move || view! { Inspector(tools = tools) {Body()} })
+}
+```
+
+</Step>
+
+</Steps>
+
+The panel installs its own style sheet. Do not add a sheet for the panel. The style sheet of the
+application stays unchanged, and a change to that sheet cannot remove the styling of the panel.
+
+`DevTools` is `Copy`. Each field is a signal, and a signal is a handle. The probe, the panel and each
+tab hold the same inspector. No value moves between the probe and the panel. Therefore the panel
+cannot show a frame that the probe has already replaced.
+
+Without a probe, the panel opens and the tabs work, but each value that comes from a frame is empty.
+The Parity tab is the exception. It reads the register of the style engine and needs no frame.
+
+## How to open the panel
+
+| Key | Function |
+|---|---|
+| `F12` | Opens or closes the panel. |
+| `Ctrl`+`Shift`+`C` | Opens the panel and starts or stops **pick mode**. |
+| `Escape` | Stops pick mode. |
+| `F8` | Freezes the panel on the frame that it shows, or lets it follow again. |
+
+In pick mode, the pointer aims. Each pointer move points the panel at the element below the pointer
+and outlines that element. A press keeps that element and stops pick mode. The panel does not send
+the press to the application.
+
+The listeners are capture listeners on the wrapper. Therefore the inspector receives its own key
+combinations before the application, and it claims them. The inspector claims `Escape` only in pick
+mode. All other keys go to the application.
+
+The inspector never picks itself. A pointer move across the panel does not change the selection.
+
+<Callout type="warn">
+A key event goes to the element that has focus. In a window where no element has focus, the event
+does not reach the `Inspector` wrapper, and `F12` does nothing. Click once, or press `Tab` once, to
+give focus to the window. Use `DevTools::set_open` for a method that does not need focus.
+</Callout>
+
+## The handle
+
+| Method | Function |
+|---|---|
+| `DevTools::new()` | Makes a closed inspector with no selection. |
+| `probe()` | Gives the `Rc<dyn FrameProbe>` for `with_probe`. |
+| `is_open()`, `set_open(bool)` | Reads or sets the visibility of the panel. |
+| `set_picking(bool)` | Starts or stops pick mode. |
+| `set_frozen(bool)` | Stops or starts the probe. |
+| `tab()`, `show(Tab)` | Reads or sets the tab that shows. |
+| `pick(NodeId)` | Selects a node and opens the panel. |
+| `picked()` | Gives the selected node. |
+| `picked_component()` | Gives the component that built the selected node. |
+| `tree_mode()`, `set_tree_mode(TreeMode)` | Reads or sets the tree that the Elements tab shows. |
+| `set_expanded(NodeId, bool)` | Opens or closes one row of the tree. |
+| `set_highlighted(Option<NodeId>)` | Outlines a node in the application, or removes the outline. |
+| `width()`, `set_width(f64)` | Reads or sets the width of the panel, in CSS pixels. |
+
+`Tab` has six values: `Elements`, `Frame`, `Timeline`, `Reactivity`, `Parity` and `Memory`.
+`Tab::ALL` gives them in the order of the tab strip. `TreeMode` has two values: `Components` and
+`Full`.
+
+## The panel
+
+The panel is at the right side of the window. The application keeps the remaining width.
+
+The panel is 560 CSS pixels wide when it opens. To change the width, drag the divider between the
+application and the panel. You can also give focus to the divider and press the left arrow key or the
+right arrow key. Each key press moves the divider 16 pixels.
+
+The width has two limits. The panel is never less than 280 pixels wide. The application always keeps
+at least 160 pixels. The width stays the same when you close and open the panel again.
+
+## The Elements tab
+
+The tab shows the document as a tree. When you select a node, a second pane opens below the tree and
+describes that node.
+
+To change the height of the two panes, drag the rule between them. You can also give focus to the
+rule and press the up arrow key or the down arrow key. Each pane keeps a minimum height of 80 pixels.
+Each pane scrolls separately.
+
+### The two trees
+
+Two chips at the top of the tab select the tree:
+
+| Chip | Content |
+|---|---|
+| `Components` | One row for each component instance. |
+| `All nodes` | One row for each element and each run of text, with the component boundaries between them. |
+
+The tree starts at the content of the application. It does not show the document root, the overlay
+root, the overlay layers or the wrapper elements of the inspector. Portalled content — a dialog, a
+menu or a toast — is at the top level of the tree.
+
+A component row shows the short name of the component and the file and line of its declaration. An
+element row shows the element name, the `id` and the classes. A row of text shows the first 80
+characters.
+
+Click the chevron of a row to close that row or to open it again. Rows are open when the tree first
+shows. The tab draws a maximum of 400 rows at one time. To reach more rows, close the rows that you
+do not read.
+
+### Selection and the outline
+
+Move the pointer over a row to outline that node in the application. Click a row to select the node.
+The lower pane then describes it.
+
+Selection also works in the other direction. When you pick a node with the pointer, the tree opens the
+path to that node and selects it. In the `Components` tree there is no row for an element. Therefore
+the tree selects the component that built that element, and the lower pane still describes the
+element.
+
+The outline is a rectangle above the application. For a component, the outline covers everything that
+the component built.
+
+### The lower pane
+
+The pane shows four things:
+
+1. The node, written as a selector: `box#save.button.button-primary`.
+2. `fragments` — the number of boxes of the element. Text that wraps makes several fragments of one
+   box. The pane shows the first fragment and gives the count.
+3. The box model, as three boxes: `border`, `padding` and `content`. Each box shows
+   `width x height at x, y`.
+4. The computed style: 24 layout properties always, then each longhand whose computed value is not
+   its initial value. A value that is equal to the initial value is dim. A value that is one colour
+   has a colour sample beside it.
+
+The three boxes come from the fragment that the layout made. They do not come from the declarations
+in the style sheet. An element with a width of 120, a padding of 7 and a border of 3 shows
+`border 120.0 x 48.0`, then `padding 114.0 x 42.0`, then `content 100.0 x 28.0`.
+
+<Callout type="info">
+There are three boxes, not four. A fragment carries no margin box. The layout uses the margin to
+position the box, and the margin leaves no rectangle. The computed `margin-*` values are in the list
+below the diagram.
+</Callout>
+
+These are the 24 properties that the pane always shows:
+
+```text
+display  position
+width  height  min-width  min-height  max-width  max-height
+flex-grow  flex-shrink  flex-basis  flex-direction
+align-items  justify-content  gap
+overflow-x  overflow-y  box-sizing
+font-size  font-family  line-height
+color  background-color  opacity
+```
+
+Each value after these 24 comes from a declaration that somebody wrote, directly or through a rule
+that matched. Read this list when a box does not have the shape that you expect.
+
+The numbers are **device pixels**. A window with a scale factor of 2 shows two times the value that
+its style sheet gives in CSS pixels.
+
+## The Frame tab
+
+The tab shows what the last frame drew, what it damaged and what it computed again.
+
+| Line | Content |
+|---|---|
+| `primitives` | The number of primitives in the display list. |
+| `batches` | The number of batches of the scene. |
+| `vector passes` | The number of rasterisation passes for the vector content. |
+| `damage` | The number of rectangles that the frame drew, or `the whole surface`. |
+| `of the surface` | That damage as a percentage. |
+| The next 12 lines | The first 12 damage rectangles, as `w x h at x, y`. |
+| `what this frame redid` | Each counter that moved, largest first. |
+
+Read the counters first. The time of a frame is a property of the machine. The counters of a frame
+are a property of the work that the framework did again.
+
+The tab shows each counter as a **difference**, not as a total. There is no frame number. A total
+gives the time since the window opened. The difference gives the cost of one action.
+
+When a frame repeats the last frame, no counter moves. The tab then shows
+`no counter moved: this frame repeated the last one`.
+
+### The counters to know
+
+`crates/zgui-profile/src/counter/table.rs` declares the full set.
+
+| Counter | Content | Read it when |
+|---|---|---|
+| `elements_restyled` | Elements that matched selectors again. | A class changed, or the pointer entered an element. |
+| `selector_matches` | Single tests of one selector against one element. | A restyle costs too much. |
+| `nodes_visited` | Nodes that a traversal examined. | A stage walks the document. |
+| `boxes_rebuilt` | Boxes made again from their element. | A row entered or left a list. |
+| `nodes_relaid_out` | Nodes with a new size or position. | A width changed. |
+| `text_shaped` | Runs of text that were shaped. | A text value changed. |
+| `fragments_diffed` / `fragments_rebuilt` | Fragments compared / computed again. | Content moved. |
+| `repaints` | Fragments painted again instead of replayed. | A colour changed. |
+| `chunks_translated` | Cached ranges of primitives moved by an offset. | The user scrolls. |
+| `hit_index_rebuilds` | Rebuilds of the hit index. | The user scrolls. This must stay at 0. |
+| `primitives_emitted` / `primitives_culled` | Primitives added to the scene / removed before it. | Each frame. |
+| `glyphs_placed` / `glyphs_rasterised` | Glyphs positioned / made into pixels. | Text is painted again. The second must be 0. |
+| `atlas_tiles_evicted` | Cached rasters removed to obey the atlas limit. | The Memory tab shows a large atlas. |
+| `wakes` | Times that the event loop started again after a wait. | An idle application draws frames. |
+
+Three counters — `draw_calls`, `damage_px` and `bytes_uploaded` — come from the GPU renderer. They
+are 0 with a renderer that draws nothing.
+
+## The Timeline tab
+
+The tab shows the cost of recent frames, and the stages of the last frame.
+
+### The frame-time graph
+
+The graph shows one point for each frame of the last 30 seconds. The vertical scale is fixed. The top
+of the graph is four refresh intervals. A rule crosses the graph at one refresh interval, which is
+16.7 ms at 60 Hz. A line above that rule is a frame that was longer than its refresh interval.
+
+The scale beside the graph gives the value of the top, of the rule and of the bottom. A line below
+the graph gives the cost of the worst frame.
+
+The graph keeps 1800 frames. When there are more frames than columns, each column shows the **worst**
+frame of that column. An average hides a single slow frame, which is the frame that you look for.
+
+### The stages
+
+The frame loop writes a **mark** at each stage boundary: `f.begin`, `f.drain`, `f.timers`,
+`f.scroll`, `f.gestures`, `f.reconfigure`, `f.device`, `f.animate`, `f.flush`, `f.commands`,
+`f.restyle`, `f.boxes`, `f.layout`, `f.enter`, `f.observe`, `f.rehit`, `f.paint`, `f.a11y`,
+`f.recycle` and `f.end`.
+
+A mark is an **instant**, not a duration. The tab shows the interval between two marks that follow
+each other. Therefore each interval is visible, also an interval that has no name.
+
+The tab shows a strip first, then a list. The strip gives the shape: one stage that fills most of the
+width is a different problem from twenty equal stages. A stage that is more than one quarter of the
+frame has a red border.
+
+Each colour of the strip is one part of the pipeline: events, style, layout, paint, render, gpu or
+other. Chips below the strip give the colours.
+
+The list gives one line for each stage. Each line has the words for the stage, then the name of the
+mark in parentheses, then the cost. Example: `Recompute styles (f.restyle) 209.0 us`. A mark that
+this build has no words for keeps its own name.
+
+Two facts about the content:
+
+- The tab shows the frame **before** the frame that draws it. The marks of the current frame are not
+  complete when the strip is built.
+- The marks are in a ring of 4096 records, which is some hundreds of frames. `DevTools::new()` starts
+  this ring. Therefore the first frame after the panel opens already has a timeline.
+
+The probe reads the frame time on each frame, but publishes the graph and the stages only at the
+publication interval. It publishes them only when this tab shows.
+
+## The Reactivity tab
+
+The tab shows what the reactive graph holds.
+
+| Line | Content |
+|---|---|
+| `instances alive` | The number of component instances that exist now. |
+| `instances built` | The number of component instances since the program started. |
+| `deepest scope` | The depth of the deepest scope. |
+
+Below these lines is one row for each component with an instance. Each row gives the short name of
+the component, the file and line of its declaration, the number of instances, and the depth or the
+range of depths of those instances. The row with the most instances is first.
+
+Each signal, memo and effect belongs to the scope that was current when the program made it. Each
+component instance is one scope. Use the first two numbers together:
+
+- A view that uses its instances again keeps `instances alive` constant while `instances built`
+  increases.
+- A view that does not release its scopes increases both numbers together. This is a leak.
+
+<Callout type="warn">
+The tab cannot show which effects subscribe to a signal. `reactive_graph` keeps the subscriber sets
+private. Its public traits add and remove subscribers, but they do not list them. No crate outside
+`reactive_graph` can read those edges. The tab states this limit.
+</Callout>
+
+## The Parity tab
+
+The tab shows the properties that this build of the style engine supports. Use this tab when a
+declaration has no effect.
+
+The tab reads the register that the crates declare. It does not read a copy.
+
+| Line | Content |
+|---|---|
+| `longhands` | Each property name that the engine generates. |
+| `implemented` | Parsed, cascaded and read by a module. |
+| `parsed and ignored` | Parsed and cascaded, but not read. |
+| `absent` | Not available from the style engine. |
+
+Below these lines is the register of known gaps. Each row gives a subject, **the property to write
+instead**, and the reason for the gap.
+
+Each row of the register has a probe. The probe asks the engine whether the row is still correct. A
+row that is not correct makes the build fail.
+
+## The Memory tab
+
+The tab shows what the renderer holds on the device, what the document costs on the host, and what
+each cache holds.
+
+A bar at the top of the tab gives the parts of the report of the renderer. Below the bar is one line
+for each part:
+
+| Line | Content | A large value means |
+|---|---|---|
+| `fixed` | Memory held from construction. | Nothing. |
+| `targets` | The target that a frame composes into. | The surface is larger. |
+| `scratch` | Scratch textures. | A larger surface, or more content at one time. |
+| `atlases` | Textures with cached raster content. | Glyphs or images that eviction does not remove. |
+| `buffers` | Vertex, instance and uniform buffers. | A display list that the frame does not use again. |
+| `total` | All five values. | — |
+
+Two lines give the cost of the document on the host: `nodes` gives the number of nodes, and
+`document` gives the bytes of records, arena slots, key tables and columns. Text and attribute values
+hold more memory that these lines do not count.
+
+Below these lines is one line for each cache with a limit. Each line gives the content of the cache,
+the limit, the quantity that is pinned, and the excess above the limit. A bar below each line shows
+the pinned part and the resident part. The bar is red when the cache is above its limit.
+
+| Cache | Unit |
+|---|---|
+| `glyph atlas` | bytes |
+| `decoded images` | bytes |
+| `paragraph shaping` | entries |
+| `vector resources` | entries |
+| `render targets` | bytes |
+
+Each cache carries its own unit. Do not add two caches with different units. Three caches hold
+texture memory. Two caches hold objects, and a value in bytes for those objects is an estimate, not a
+measurement.
+
+A cache above its limit is a cache where eviction is too slow. A cache with **no level** has no limit
+for a reason: either the content cannot be made again, or a lower cache limits it.
+
+## Component boundaries
+
+The `instrument` feature of `zgui` records the boundary of each component instance. `zgui-devtools`
+switches this feature on. An application that does not use `zgui-devtools` does not switch it on.
+
+With the feature on, each `#[component]` instance puts two marker nodes in the document. The markers
+enclose the content of the instance. A registry records the name of the component, the file, the
+line, and the scope. A marker takes part in the order of the child list only. It has no box, it
+matches no selector, and it changes no layout.
+
+With the feature off, the program makes no marker and records nothing. The only remaining cost is one
+`&'static` record for each component type, which is data in the binary.
+
+<Callout type="info">
+The feature is a Cargo feature, and Cargo unifies features across one build. Therefore `cargo test
+--workspace` switches the feature on for each crate in the workspace. A test that counts the children
+of a node must ignore the markers.
+</Callout>
+
+## How to read the numbers
+
+<Steps>
+
+<Step>
+
+**Read a count before a duration.** A count is a property of the design. It has the same value on a
+slow machine, on a fast machine and below a debugger. See
+[the cost model](/docs/performance/cost-model).
+
+</Step>
+
+<Step>
+
+**Compare the counters against the change that you made.** A change of colour must move `repaints`
+and leave `nodes_relaid_out` at 0. A scroll frame must move `chunks_translated` and leave
+`elements_restyled` and `hit_index_rebuilds` at 0. A new row must rebuild the boxes of that row only.
+
+</Step>
+
+<Step>
+
+**Read the damage percentage beside the primitive count.** A large count of primitives with a small
+damage percentage means that the frame makes primitives for content that the damage does not
+contain.
+
+</Step>
+
+<Step>
+
+**Press `F8` before you read a value that exists for one frame.** `F8` stops the probe. The panel
+then keeps its values, and the inspector stops the frames of the window.
+
+</Step>
+
+</Steps>
+
+The probe publishes at the end of a frame, and the next frame draws the panel. Therefore the Frame
+tab describes the frame before the frame on the screen. The Timeline tab describes one more frame
+before that.
+
+## The cost of the inspector
+
+Four rules control the probe:
+
+1. **The probe samples nothing while the panel is closed.** A closed inspector writes no signal.
+   Therefore it asks for no frame.
+2. **The probe writes no value that did not change.** The probe compares each signal before it sets
+   the signal. It publishes no total and no frame number.
+3. **The probe reads the computed style only when the selection changes**, or when the frame made a
+   restyle. To serialise some hundreds of longhands is the largest cost in the probe.
+4. **The probe reads the tree and the reactive counts only when the document changes.** A revision
+   counter in the document gives the answer in one comparison.
+
+| State | The probe | The window |
+|---|---|---|
+| The crate is not linked. | It does not exist. | As if the crate did not exist. |
+| Linked, panel closed. | It returns immediately. | **0 frames in 120 refresh intervals.** |
+| Open. | It samples and publishes. | It draws when a value changes. |
+| Open, frozen with `F8`. | It returns immediately. | **0 frames in 120 refresh intervals.** |
+
+Both values of 0 are assertions. `a_closed_inspector_leaves_the_window_idle` and
+`freezing_returns_the_window_to_idle` in `crates/zgui-devtools/tests/inspector.rs` advance a headless
+window 120 refresh intervals and require 0 frames.
+
+An open panel is the live case. Its content changes when the window does work. Therefore a window
+with an open panel and with activity does not become idle. A frame that repeats the last frame
+changes no published value and does not change the panel.
+
+`crates/zgui-devtools/tests/idle.rs` makes the stronger assertion. It shows each of the six tabs on a
+document that does not change, and requires 0 frames in 300 refresh intervals.
+
+Two costs remain when the panel is closed:
+
+- `DevTools::new()` calls `zgui_profile::latency::retain(4096)`. This starts the ring of marks for
+  the process. Each mark then takes a clock reading, an allocation and a mutex. Before this call, a
+  mark costs one relaxed atomic load.
+- The crate uses `zgui-profile` with its `counters` feature. Cargo unifies features across a build.
+  Therefore the frame counters stay active in a release build that links the inspector. One active
+  counter costs one relaxed atomic addition.
+
+Both costs are small. Both costs go away with the dependency.
+
+## A probe of your own
+
+`FrameProbe` is a public seam. No crate in the framework implements it.
+
+```rust
+pub trait FrameProbe {
+    /// A frame has finished on `window`.
+    fn frame_ended(&self, window: &Window);
+
+    /// What to call this probe in a diagnostic rendering of the window's options.
+    fn describe(&self) -> &str {
+        "a frame probe"
+    }
+}
+```
+
+The runtime calls the method one time, at the end of each frame. The window is in the state that the
+frame made: the scene, the damage, the layout and the report of the renderer are the values of that
+frame.
+
+The seam has one method, no return value and no method that changes the window. A probe that changed
+the window would change its own measurement. A probe that could refuse a frame would be a second
+frame loop. `frame_ended` takes `&self`, because the caller borrows the window. A probe that keeps
+data writes through a cell or a signal. Therefore one probe can serve several windows.
+
+### To write a log
+
+```rust
+use std::cell::Cell;
+use std::rc::Rc;
+use zgui::prelude::*;
+use zgui::runtime::{FrameProbe, Window};
+
+/// One line for every frame that drew anything.
+#[derive(Default)]
+struct Trace {
+    frames: Cell<u64>,
+}
+
+impl FrameProbe for Trace {
+    fn frame_ended(&self, window: &Window) {
+        let count = self.frames.get() + 1;
+        self.frames.set(count);
+
+        let damage = window.damage();
+        if damage.rects().is_empty() && !damage.is_full() {
+            return;
+        }
+        eprintln!(
+            "frame {count}: {} primitives, {} damaged rectangles, {} bytes on the device",
+            window.scene().primitives.len(),
+            damage.rects().len(),
+            window.renderer().memory().total(),
+        );
+    }
+
+    fn describe(&self) -> &str {
+        "a one-line-per-frame trace"
+    }
+}
+
+fn main() -> Result<(), zgui::Error> {
+    app()
+        .with_probe(Rc::new(Trace::default()))
+        .run(|| view! { column() })
+}
+```
+
+### To test
+
+Keep a typed handle to the probe, and also give one handle to the application. Read what the probe
+collected after the script runs.
+
+```rust
+use std::cell::RefCell;
+use std::rc::Rc;
+use zgui::runtime::{FrameProbe, Window};
+
+/// What each frame of a scripted run produced.
+#[derive(Default)]
+struct Recorded {
+    frames: RefCell<Vec<(usize, usize)>>,
+}
+
+impl FrameProbe for Recorded {
+    fn frame_ended(&self, window: &Window) {
+        self.frames
+            .borrow_mut()
+            .push((window.scene().primitives.len(), window.damage().rects().len()));
+    }
+}
+
+let probe = Rc::new(Recorded::default());
+let app = zgui::runtime::App::new().with_probe(probe.clone());
+// drive the window with it, then read what the probe kept:
+// assert_eq!(probe.frames.borrow().len(), 3, "a click runs move, press, release");
+```
+
+To make assertions about counters instead of the scene, use `zgui-profile` directly with its
+`counters` feature. Call `counter::exclusive()` first, because the counters are one set of atomics
+for the process. Then read `counter::snapshot()` before the action and after the action, and use
+`Counters::delta`. [Testing](/docs/building/testing) describes how to drive the window.
+
+<Callout type="warn">
+**One seam, one occupant.** `WindowOptions::probe` is an `Option`, and `with_probe` replaces the
+previous value. You cannot install the inspector and your own probe together. To feed two consumers,
+write a probe that calls both:
+
+```rust
+struct Both(Rc<dyn FrameProbe>, Rc<dyn FrameProbe>);
+
+impl FrameProbe for Both {
+    fn frame_ended(&self, window: &Window) {
+        self.0.frame_ended(window);
+        self.1.frame_ended(window);
+    }
+}
+```
+
+The frame loop holds one probe only. A list of probes needs a rule for their order, and a rule for a
+slow probe that delays the frame.
+</Callout>
+
+## Next
+
+<Cards>
+  <Card
+    title="The cost model"
+    href="/docs/performance/cost-model"
+    description="What each kind of change costs, measured. The numbers that you read the tabs against."
+  />
+  <Card
+    title="Measurements"
+    href="/docs/performance/measurements"
+    description="Bands, budgets, the reference workloads, and how to run the suite."
+  />
+  <Card
+    title="The frame"
+    href="/docs/architecture/the-frame"
+    description="The loop that writes the marks of the Timeline tab, step by step."
+  />
+  <Card
+    title="Testing"
+    href="/docs/building/testing"
+    description="How to drive an application headless, which is where your own probe goes."
+  />
+</Cards>

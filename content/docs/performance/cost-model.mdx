@@ -1,0 +1,338 @@
+---
+title: The cost model
+description: What each kind of change costs, what that cost is proportional to, and the measured numbers behind every claim.
+---
+
+The framework's central claim is that cost follows change. This page states what each kind of change
+costs, why, and what the repository measures it at. It assumes [the guide](/docs/learn/views) and
+reads better after [Architecture overview](/docs/architecture/overview).
+
+## How to read the numbers
+
+Every figure here comes from `docs/performance.md` in the repository, which is **generated** by
+`cargo xtask perf` rather than typed in. A number that moved moved that document with it.
+
+<Callout type="warn">
+That file is regenerated on every run, so the exact figures below drift by a few per cent from one
+run to the next. Read them as the order of magnitude and the shape of the cost. **The band and the
+budget are the stable part**, and the generated file is always the current answer.
+</Callout>
+
+Unless a row says otherwise, a measurement was taken headless, on a virtual clock, with a null
+renderer, over the gallery document at 1 851 boxes and 2 363 fragments.
+
+Each measurement carries a **band** and, sometimes, a **budget**.
+
+- A **band** is a baseline and a tolerance. A duration is a property of the machine as much as of
+  the code, so a band has to be wide.
+- A **budget** is what the design was supposed to cost. It does not move with the measurement. It is
+  the statement a band cannot make: that a number is not merely no worse than it was.
+- A **count** band has no tolerance at all, because a count is a property of the design. It reads
+  the same on a slow machine, a fast one and under a debugger.
+
+<Callout type="info">
+The counts are the sharper half of the suite. Every defect these cases exist for was the same kind
+of thing: a stage doing the whole document's work for one element's change. That shows up in a
+count long before it shows up in a time.
+</Callout>
+
+## The table
+
+| What changed | Measured | Band | Budget |
+|---|---:|---:|---|
+| Nothing, one turn of a parked loop | 0.07 µs | 2.00 | — |
+| Nothing, frames drawn | 0.00 | 0.00 | 0.00 met |
+| One pointer crossing, 1 000-row table | 207.78 µs | 266.00 | 500.00 met |
+| …primitives emitted by it | 41.56 | 200.00 | 200.00 met |
+| One class toggled on one element | 11.34 µs | 15.12 | — |
+| One keystroke: one edit, one paragraph, one box | 301.39 µs | 407.40 | — |
+| One turn over an untouched but animating window | 23.31 µs | 30.80 | — |
+| One scroll translation frame | 44.18 µs | 61.60 | 1000.00 met |
+| …restyles, relayouts, hit-index rebuilds | 0 / 0 / 0 | 0 each | 0 met |
+| One scroll recycle frame, 10 000-row virtual list | 1021.42 µs | 1442.00 | 1500.00 met |
+| One frame of the framework's own scroll animation | 973.26 µs | 854.00 | — |
+| One window resize step | 7.36 ms | 10.25 | — |
+| Cold start to first frame | 103.31 ms | 140.00 | 250.00 met |
+
+Every measurement with a budget met it.
+
+## Idle
+
+**Zero frames.** A still document draws nothing. `idle.frames` has a ceiling of zero, so one frame
+here is the whole defect.
+
+A *turn* of the parked loop — the loop waking, finding nothing to do, and parking again — is
+0.07 µs.
+
+An animating window is a different thing. A CSS animation keeps the loop at the output's refresh
+rate, and one such turn over an otherwise untouched 1 851-box document is **23.31 µs**.
+
+The loop parks with one of three policies: block until something arrives, block until a deadline, or
+spin. A deadline already in the past collapses to a plain block, because installing it would produce
+a loop that wakes instantly and repeats for ever.
+
+## Hover, and any single class toggle
+
+**Cost: proportional to the ink of the elements whose style changed.**
+
+The path, in order:
+
+<Steps>
+
+<Step>
+
+The input system finds two elements: the one the pointer left and the one it entered.
+
+</Step>
+
+<Step>
+
+Those two are restyled. Nothing else owes a restyle.
+
+</Step>
+
+<Step>
+
+The paint key moves, so each owes `REPAINT` and nothing more. No relayout is implied.
+
+</Step>
+
+<Step>
+
+The fragment pass enters those two boxes.
+
+</Step>
+
+<Step>
+
+Damage is their ink. The emit walk reaches only fragments that intersect it.
+
+</Step>
+
+</Steps>
+
+Measured over a 1 000-row table at 120 Hz crossings: **207.78 µs** per crossing, emitting **41.56
+primitives** per frame against a ceiling of 200.
+
+A control measurement over the 1 851-box gallery is sharper still: one element restyled, **11 of
+2 363 fragments diffed**, 0 rebuilt, 2 relaid out, 2 primitives emitted, damage of **2 628 pixels —
+0.16 % of the surface** — and one frame
+(`docs/perf/gallery-interactions.md`).
+
+No box is rebuilt. No glyph is rasterised. A click that toggles one class on one element is
+**11.34 µs**.
+
+## A signal write that changes one text node
+
+**Cost: one paragraph reshaped, one box repainted.**
+
+Measured as `kitchen.keystroke` at **301.39 µs** over 1 851 boxes. The work is exactly what the name
+implies: one edit, one paragraph shaped again, one box painted again.
+
+The dominant term is text shaping, not the document mutation. Changing a number from `41` to `42`
+costs a paragraph shape; changing a colour does not.
+
+"One paragraph" is not a constant cost. Shaping is proportional to the generated text bytes, and
+line construction and glyph placement are proportional to the paragraph's output. A large text
+replacement can therefore dominate one frame even though only one paragraph needs shaping.
+`TextBytesShaped` records that input volume beside `TextShaped`.
+
+The flattened context computes its `ParagraphKey` once, so layout probes at several widths do not
+hash the large string again. The old shaped version remains an inactive cache entry until LRU
+eviction needs space. Crossing the shaping-cache level removes inactive versions and does not cause
+a whole-document reshape or relayout.
+
+<Callout type="info">
+A hole that produces the **same** string writes nothing. Text nodes remember their last value, so
+the document is not touched and nothing below is invalidated. A closure that runs and produces an
+unchanged result costs the closure and no more.
+</Callout>
+
+## A colour change
+
+**Cost: repaint only. Layout is not entered.**
+
+A declaration classified as a repaint cost yields empty layout damage, so the element owes `REPAINT`
+from the paint-key comparison and nothing else. The box tree, the layout, the fragment geometry and
+the shaped text are all still valid and are all kept.
+
+This is why the guide keeps saying that changing a colour costs less than changing a width. It is
+not a rule of thumb; the style engine classifies the two differently and the second one reaches two
+more stages.
+
+## A size change
+
+**Cost: relayout of the box, its descendants, and its ancestors up to the first whose size does not
+depend on it.**
+
+A geometry cost yields `RELAYOUT_BOX`, plus text bits narrowed by the element's own shaping key. The
+box tree is **kept**. Marking throws away cached layouts along the path to the root, the layout gate
+then fails, and a pass runs over the dirty region.
+
+No box is rebuilt. The difference between "relayout" and "rebuild" is the whole distinction here.
+
+## Adding or removing a list row
+
+**Cost: the boxes of that element, spliced. Not the document.**
+
+A structural change marks `REBUILD_BOX` on that element and on its subtree, and the box builder
+splices *that element's* boxes rather than rebuilding the tree.
+
+Measured through the scroll scenario's recycle frames: **one row shift rebuilds 8 boxes, relays out
+29 nodes, and emits 404 primitives.** The 8 and the 29 are the row that arrived. The 404 are the
+viewport, and they are what a recycle frame's remaining cost is.
+
+A recycle frame over a 10 000-row virtualised list is **1021.42 µs**.
+
+## Scrolling
+
+There are two kinds of scroll frame, and they cost very different things.
+
+### A translation frame
+
+**Cost: 0 restyles, 0 relayouts, 0 hit-index rebuilds.** All three are ceiling-zero gates, so any one
+of them becoming non-zero fails the suite.
+
+Moving content changes no computed style and changes no size. Four mechanisms service the frame:
+
+- the fragment differ **offsets** a moved subtree instead of composing it again;
+- the hit index is **carried** with the content and settled once, never rebuilt from it.
+- the runtime verifies that one opaque, unobscured port moved rigidly by whole device pixels;
+- the renderer copies valid pixels in its persistent target and draws only exposed bands and other
+  damage.
+
+If the port cannot be shifted safely, the same frame uses normal damage and drawing. Measured at
+**44.18 µs** when the shift path applies.
+
+The per-box cost of the offsetting walk has been split (`docs/perf/glide-split.md`, on an
+unvirtualised probe): the whole glide pass is **107.6 ns per box**, of which the fused walk is 73.1 —
+traversal 12.4, memory faulted in 39.3, rectangle and clip arithmetic 21.6, hit entries and moved
+marks 13.6 — plus a deferred hit-index settle at 35.5 ns per box. The verdict was **0.30 arithmetic
+to 0.70 index**, stable to ±0.01 over five runs.
+
+### A recycle frame
+
+A frame in which rows enter or leave the viewport. That is the 1021.42 µs case above.
+
+### An animated scroll
+
+One frame of the framework's own glide over the gallery is **973.26 µs**.
+
+## Resizing the window
+
+**Cost: everything. A resize genuinely invalidates every box and damages the whole surface.**
+
+Measured at **7.36 ms** over 1 851 boxes. This is the one interaction the design does not make
+cheap, because there is nothing to keep.
+
+Two mitigations exist:
+
+**Pacing.** A configure that arrives less than one frame of the output after the last resize frame
+is recorded and not answered. The obligation stays pending and is discharged at the merged deadline.
+Measured on a real desktop (`docs/perf/resize.md`):
+
+| | 75 Hz output, before | after | 240 Hz output, before | after |
+|---|---:|---:|---:|---:|
+| configures delivered per second | 400 | 314 | 403 | 529 |
+| frames drawn per second | 400 | **75.1** | 402 | **233** |
+| surface configures per second | 400 | **75.1** | 403 | 234 |
+| frames drawing a superseded size | 0 | 0 | 0 | 0 |
+| command to the frame that drew it, p50 | 2.3 ms | 6.4 ms | 2.8 ms | 3.0 ms |
+
+The added latency is bounded by one frame of the output, and it buys back four fifths of the
+pipeline runs, swap-chain rebuilds and buffer commits on a 75 Hz output.
+
+**Idempotence.** A resize that repeats the extent runs no frame at all. The repository asserts this
+by name.
+
+## Cold start
+
+**103.31 ms** to the first frame, headless. On screen with a real graphics device it is 216–247 ms;
+the difference is the device, deliberately excluded from the gated number.
+
+What is inside it: font enumeration, sheet parsing, the first cascade, the first layout with no
+cached measurement, and the first emission of every primitive.
+
+## A scale-factor change
+
+**Cost: misses in both caches that are keyed on device size.**
+
+A glyph key carries the size it was rasterised at, and a paragraph key carries the ratio it was
+shaped at. Moving a window to a display with a different scale factor therefore misses both, and
+every box's cached layout is thrown away.
+
+Measured on the gallery (`docs/perf/scale.md`): its 483 placed glyphs cost **218–230 rasterisations**
+on every move to a ratio it had not been at before, and **zero** on the move back to 1.0, because
+the entries for 1.0 were still there.
+
+## Where a frame's cost actually is
+
+Primitive counts per scenario, from the same generated document:
+
+| Scenario | Emitted | Culled | Bounds-tree inserts |
+|---|---:|---:|---:|
+| idle | 0 | 0 | 0 |
+| hover storm | 9 975 | 241 916 | 9 975 |
+| scroll | 121 020 | 29 242 | 121 020 |
+| cold start | 844 | 4 575 | 844 |
+| kitchen sink | 114 169 | 171 683 | 114 169 |
+
+The hover row is the one to read twice. Over the whole storm, **96 % of primitives considered were
+culled** against the damage rectangles before reaching the renderer.
+
+## Wall-clock budgets
+
+A second suite runs in release, behind a feature flag, and asserts absolute durations against
+generous ceilings. Its purpose is not to detect a machine two times slower; it is to detect a stage
+going back to doing the whole document's work.
+
+| Interaction | Ceiling | Measured on the maintainer's machine |
+|---|---|---|
+| a click | 3 ms | 0.058 ms, over a 136-box document with 28 lines of text |
+| a hover pair | 3 ms | 0.066 ms |
+| a resize step | 8 ms | 0.78 ms |
+
+The ceilings are roughly fifty times the measurement, because what they are looking for is the
+regression that took a click back to 36 ms by rebuilding the box tree.
+
+Counts are asserted beside the times:
+
+- a click places **zero** glyphs and rasterises **zero**;
+- a hover places zero and rasterises zero;
+- a resize re-places the whole document, as it must, and rasterises fewer than a tenth of the
+  document's glyphs over 32 full repaints;
+- a click runs exactly **three** frames — move, press, release — and not more.
+
+## The one-line summary
+
+| Change | Reaches | Proportional to |
+|---|---|---|
+| nothing | nothing | — |
+| a colour, a shadow, a border colour | restyle, paint, draw | the ink of the changed elements |
+| a class toggle | restyle, paint, draw | the same |
+| a text value | restyle, text, layout, paint, draw | that paragraph's bytes, lines and glyphs |
+| a width, a padding, a gap | restyle, layout, paint, draw | the subtree, up to the first fixed ancestor |
+| a row inserted or removed | box tree, layout, paint, draw | that row, plus the viewport |
+| a scroll | fragment offset, paint replay | the boxes in the viewport |
+| a window resize | everything | the whole document |
+| a scale-factor change | everything, plus both device-keyed caches | the whole document |
+
+## Next
+
+<Cards>
+  <Card
+    title="Caches"
+    href="/docs/performance/caches"
+    description="Every cache in the pipeline: what fills it, what invalidates it, what a miss costs."
+  />
+  <Card
+    title="Writing fast interfaces"
+    href="/docs/performance/writing-fast-interfaces"
+    description="The practical rules that follow from this page."
+  />
+  <Card
+    title="Invalidation"
+    href="/docs/architecture/invalidation"
+    description="The bits behind every row of the table above."
+  />
+</Cards>
