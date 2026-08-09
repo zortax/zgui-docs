@@ -106,15 +106,17 @@ fn main() -> Result<(), zgui::Error> {
 | Builder | What it sets | What reads it |
 |---|---|---|
 | `with_title` | the window title | the title bar, the window list, a screen reader |
-| `with_application_id` | the Wayland toplevel's `app_id`, and the general class of the X11 `WM_CLASS` with the instance part beside it | window rules, the icon, task-bar grouping |
+| `with_application_id` | the Wayland toplevel's `app_id`, and the general class of the X11 `WM_CLASS` with the instance part beside it | Linux window rules, icons, and task-bar grouping |
 
-The identifier is set through both display servers' extensions, because which one the binary ends up
-on is decided when the event loop is built and the same binary runs under either
-(`crates/zgui-platform-winit/src/surface/attributes.rs`).
+On Linux, the identifier is set through both display servers' extensions because the event loop
+selects Wayland or X11 at run time (`crates/zgui-platform-winit/src/surface/attributes.rs`). Windows
+takes application identity from its Application User Model ID. macOS takes it from the bundle
+identifier in `Info.plist`. Those identities are fixed by packaging, so `with_application_id` has no
+window attribute to set on those systems.
 
-An application that sets none carries an empty class. It has no icon of its own, no compositor rule
-can select it, and its windows group under nothing. That is the default: `with_application_id` is
-not called for you.
+On Linux, an application that sets none carries an empty class. It has no icon of its own, no
+compositor rule can select it, and its windows group under nothing. That is the default:
+`with_application_id` is not called for you.
 
 ### The convention
 
@@ -178,13 +180,10 @@ The window is created hidden and made visible by its first painted frame, never 
 what stops a flash of empty window at launch, and it is also what makes an accessibility adapter
 attachable — the adapter refuses a window that has already been shown.
 
-<Callout type="warn">
-The title and the starting size are set once, at build time. `zgui::App` exposes no way to change
-either while the application runs, and no way to set a minimum size, a maximum size, decorations or
-full screen. The platform layer has all of those; the umbrella crate does not publish them.
-</Callout>
+The application builder configures the primary window. During a run, `use_window()` changes that
+window and `use_windows()` opens or addresses others. See [Multiple windows](/docs/building/windows).
 
-## Libraries the machine needs at run time
+## Linux libraries needed at run time
 
 Most of what a window needs is opened at run time rather than linked. Check the binary you built:
 
@@ -214,6 +213,9 @@ it — see [Text and fonts](/docs/building/text-and-fonts).
 A missing run-time library is not a link error. It is a failure at the moment the window is opened,
 which is why the four checks below are worth running on a clean machine rather than on the one you
 built on.
+
+The following checks apply to a Linux release. Windows and macOS use their native window, input,
+accessibility, and graphics stacks.
 
 <Steps>
 
@@ -252,8 +254,14 @@ technology running, so a broken tree is invisible until you start one. See
 
 ## The graphics device
 
-zgui opens a device through wgpu. Vulkan and OpenGL are both enumerated by default: a machine that
-has only GL is a machine that would otherwise be shown a black window.
+zgui opens a device through wgpu. It tries the native backend first and uses OpenGL as a fallback
+where the platform provides it.
+
+| Platform | Default backends |
+|---|---|
+| Apple | Metal |
+| Windows | Direct3D 12, then OpenGL |
+| Other desktops | Vulkan, then OpenGL |
 
 Adapters are sorted, then each is **tried in turn**. A device is created from the candidate and a
 surface is configured for it under a validation error scope, because the capabilities an adapter
@@ -263,11 +271,11 @@ The sort order is:
 
 1. the device id named in `ZGUI_DEVICE_ID`, if one was named;
 2. discrete, then integrated, then virtual, then software;
-3. Vulkan before GL.
+3. a native backend before OpenGL.
 
 | Variable | Value | Effect |
 |---|---|---|
-| `ZGUI_BACKENDS` | `vulkan`, `gl`, both comma-separated, `all`, or `none` | restricts which backends are enumerated at all |
+| `ZGUI_BACKENDS` | `metal`, `dx12` or `d3d12`, `vulkan`, `gl`, `all`, or `none`; lists are comma-separated | restricts which backends are enumerated at all |
 | `ZGUI_DEVICE_ID` | a decimal or `0x`-prefixed PCI device id | a preference in the sort, not a filter |
 
 An unrecognised word contributes nothing, so `ZGUI_BACKENDS=nonsense` asks for the same thing as

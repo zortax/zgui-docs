@@ -3,6 +3,7 @@
   "pages": [
     "text-and-fonts",
     "keyboard-and-focus",
+    "clipboard",
     "scrolling",
     "overlays-and-portals",
     "windows",

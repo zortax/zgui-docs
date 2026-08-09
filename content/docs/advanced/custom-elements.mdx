@@ -92,6 +92,7 @@ Use:
 - `stroke` for a solid rounded-rectangle border;
 - `fill_path` for a solid path;
 - `shape` for the full vector shape vocabulary;
+- `glyphs` for a pre-shaped glyph run from the application's font collection;
 - `current_color` for the element's computed CSS `color`.
 
 Prefer quads for rectangles. A quad has the same rendering cost as an ordinary background. Paths
@@ -101,6 +102,59 @@ those operations must remain balanced with the surrounding scene. Put an inner c
 
 Custom primitives paint after the element's background and border and before its descendants.
 zgui records them. It replays an unchanged custom element without calling `paint` again.
+
+## Shape and draw glyph runs
+
+Use the glyph seam when the custom element owns text layout, such as a terminal grid or a code view
+that positions one line at a time. Resolve `Fonts` in the component body and keep its `Shaper` in
+the retained element:
+
+```rust
+use zgui::app::LineRequest;
+use zgui::custom::{PaintSlot, ShapedRunOwned};
+use zgui::view::Ident;
+
+let fonts = expect_context::<Fonts>();
+let scale = use_window().scale().get_untracked();
+let mut shaper = fonts.shaper();
+let families = [Ident::new("JetBrains Mono")];
+let request = LineRequest {
+    families: &families,
+    weight: 400,
+    italic: false,
+    size_device_px: 14.0 * scale,
+    letter_spacing: 0.0,
+    ligatures: false,
+};
+let runs: Vec<ShapedRunOwned> = shaper.shape_line("cargo check", &request);
+```
+
+`shape_line` never wraps. It returns owned, style-uniform runs in visual order. Font fallback can
+produce several runs. Each glyph also records the source byte of its cluster, which lets a cell
+view place a caret without shaping the line again.
+
+Store the runs in the custom element and draw each at the same line-box origin:
+
+```rust
+for run in &self.runs {
+    painter.glyphs(
+        &run.as_run(PaintSlot(0)),
+        self.origin,
+        painter.current_color(),
+    );
+}
+```
+
+The brush slot is supplied when the owned run is borrowed; `glyphs` uses the explicit colour
+argument. A colour glyph keeps its embedded colours and uses only that argument's alpha.
+
+`LineRequest` uses device pixels. Reshape when the text, requested style, registered fonts, or
+window scale changes. Keep the shaper and the owned runs between frames. The shaper owns reusable
+scratch space, and `paint` must not shape the same unchanged line again.
+
+The `FaceId` values in a run belong to the `Fonts` collection that shaped it. The application
+provides that same collection to every window and to the frame's glyph rasterizer. Do not draw a
+run after replacing its font collection with another one.
 
 ## Update and invalidate
 

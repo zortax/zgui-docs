@@ -126,7 +126,7 @@ back to the UI thread.
 | `new`, `with_title` | title |
 | `with_size`, `with_min_size`, `with_max_size` | CSS-pixel size constraints |
 | `with_resizable` | whether the user can resize the window |
-| `with_decorations` | desktop title bar and frame |
+| `with_decorations` | `Decorations::Full`, `None`, or `NoTitleBar` |
 | `with_transparent` | whether the surface can show transparent pixels |
 | `with_position` | requested desktop position |
 | `with_maximized`, `with_fullscreen` | initial display state |
@@ -237,8 +237,19 @@ the application.
 
 ## Draw custom window decorations
 
-When `with_decorations(false)` removes the desktop frame, the application must provide move,
-resize, minimize, maximize, and close controls.
+`Decorations` selects how much chrome the desktop draws:
+
+| Value | Desktop result | What the application supplies |
+|---|---|---|
+| `Full` | title bar and frame | nothing |
+| `None` | no title bar or frame | title bar, move and resize gestures, and window controls |
+| `NoTitleBar` | the macOS frame, shadow, resize edges, and window buttons, without its title bar | a draggable title bar around the desktop buttons |
+
+Non-macOS desktops cannot keep only the frame. They treat `NoTitleBar` as `None`.
+Request `NoTitleBar` in `WindowOptions`; macOS cannot apply it after a window opens. A later
+`set_decorations(Decorations::NoTitleBar)` request therefore becomes `Full` there.
+
+When the application supplies chrome:
 
 - Put `window.move_drag_handler()` on the title bar.
 - Put `window.resize_drag_handler(edge)` on each resize edge or corner.

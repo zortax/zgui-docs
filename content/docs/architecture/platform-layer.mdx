@@ -128,7 +128,7 @@ pub trait Surface: Send + Sync + 'static {
     fn pre_present_notify(&self);
     fn set_title(&self, title: &str);
     fn set_visible(&self, visible: bool);
-    fn set_decorated(&self, decorated: bool);
+    fn set_decorations(&self, decorations: Decorations);
     fn set_resizable(&self, resizable: bool);
     fn set_maximized(&self, maximized: bool);
     fn set_minimized(&self, minimized: bool);
@@ -214,11 +214,12 @@ Call `set_visible(true)`.
 </Steps>
 
 The runtime performs the last step at the end of the first frame that presented
-(`crates/zgui-runtime/src/window/frame.rs`). That ordering is also what prevents a flash of empty
-window at launch.
+(`crates/zgui-runtime/src/window/frame.rs`). If a hidden macOS layer reports that first frame as
+occluded because it provides no drawable, the runtime shows the already-composed window and asks
+for another frame. This breaks the hidden-layer deadlock without exposing an empty surface.
 
-`SurfaceAttributes::new(title)` sets `resizable: true, decorated: true`, while the derived
-`SurfaceAttributes::default()` leaves both `false`.
+`SurfaceAttributes::new(title)` sets `resizable: true, decorations: Decorations::Full`. The derived
+`SurfaceAttributes::default()` keeps `Decorations::Full` but leaves `resizable` false.
 
 ### SurfaceEvent
 
@@ -291,9 +292,9 @@ impl WakeReason { pub fn surfaces(&self) -> &[SurfaceId]; }
 non-empty answer is a restriction, and a caller must honour it: an image finishing its decode for
 one window is not a reason to redraw another.
 
-`AppWork` is the control-plane wake. It tells the handler to drain deferred open, close, and quit
-commands on a turn that has a `PlatformCx`. It does not by itself mean that an existing window needs
-a frame.
+`AppWork` is the control-plane wake. It tells the handler to drain deferred open, close, quit, and
+clipboard requests on a turn that has a `PlatformCx`. It does not by itself mean that an existing
+window needs a frame.
 
 The contract does depend on `accesskit`. AccessKit is the interchange vocabulary for accessibility
 and is deliberately not abstracted behind a trait of the framework's own.
@@ -347,9 +348,11 @@ a still document runs **zero** frames (`idle.turn` and `idle.frames`, `docs/perf
 ## The winit backend
 
 `crates/zgui-platform-winit` is the only crate in the tree that names a windowing library. It is
-`#![allow(unsafe_code)]` and contains exactly one `unsafe` block: constructing the Wayland clipboard
-from a raw `wl_display` pointer. Its dependencies are `winit`, `accesskit`, `accesskit_winit`,
-`arboard`, `smithay-clipboard`, `raw-window-handle`, `tracing` and four zgui crates.
+`#![allow(unsafe_code)]` and contains exactly one `unsafe` block on Linux and BSD: constructing the
+Wayland clipboard from a raw `wl_display` pointer. Its common dependencies include `winit`,
+`accesskit`, `accesskit_winit`, `arboard`, `raw-window-handle`, and `tracing`.
+`smithay-clipboard` is compiled only on systems that can run the Wayland backend. Windows and macOS
+compile no Unix windowing or clipboard code.
 
 ```rust
 pub fn event_loop() -> Result<EventLoop<UserEvent>, PlatformError>;
@@ -384,9 +387,9 @@ Numbers the surface `SurfaceId::new(next)`, starting at 1 and never reused.
 
 <Step>
 
-Attaches the accessibility adapter,
-`accesskit_winit::Adapter::with_event_loop_proxy(event_loop, &window, proxy.clone())`. Here and
-nowhere else.
+Creates the accessibility adapter with
+`accesskit_winit::Adapter::with_event_loop_proxy(event_loop, &window, proxy.clone())` and stores it
+in the event-loop thread's adapter registry under the new `SurfaceId`.
 
 </Step>
 
@@ -398,13 +401,12 @@ Pushes the surface into the loop's shared state.
 
 </Steps>
 
-The application identifier is set through **both** display-server extensions unconditionally
+On Linux and BSD, the application identifier is set through both display-server extensions
 (`crates/zgui-platform-winit/src/surface/attributes.rs`): `WindowAttributesExtWayland::with_name`
-and then `WindowAttributesExtX11::with_name`. Which display server the binary ends up on is not
-known when the attributes are built. On Wayland the identifier becomes the toplevel `app_id`; on X11
-it becomes the general class and the instance name of `WM_CLASS`. The instance name is the
-identifier again, not `argv[0]`, because a name taken from the executable path changes with how the
-program was started.
+and `WindowAttributesExtX11::with_name`. The run-time backend decides which one consumes it. On
+Wayland it becomes the toplevel `app_id`; on X11 it becomes the general class and instance name of
+`WM_CLASS`. Windows and macOS take application identity from package metadata and drop this window
+attribute.
 
 ### The event translation table
 
@@ -616,10 +618,11 @@ Only `ClipboardFormat::Text` crosses this boundary. `Html`, `FileList` and `Imag
 opposite things to a caller deciding whether to offer a paste command. An empty string read is
 reported as `Empty(kind)`, not as `Ok("")`.
 
-<Status kind="partial">The runtime writes to the clipboard and does not read from it. Cut and copy
-are bound in `crates/zgui-edit/src/editor/keys.rs` and reach `cx.clipboard().write(...)` from
-`Runtime::surface_event`. `Command::Paste(String)` exists in the editing model, but nothing calls
-`Clipboard::read`, and `WakeReason::ClipboardRead` falls into the runtime's catch-all arm.</Status>
+The runtime exposes application reads through `use_clipboard()`. It assigns each request a
+`ClipboardSerial`, stores its callback, and routes `WakeReason::ClipboardRead` back to that callback
+on the UI thread. Writes, clears, and reads are queued until a handler turn has a `PlatformCx`.
+The built-in editor still has no automatic Paste binding; application code can read text and apply
+it through the editing API. See [Clipboard](/docs/building/clipboard).
 
 ## The headless backend
 
@@ -676,6 +679,11 @@ An accessibility tree is a second, much smaller description of the interface, pu
 reader or another assistive technology. It says what each control **is** — a button, a checkbox, a
 text field — what it is called, what value it holds, and where it was drawn. AccessKit is the library
 that carries that description to each operating system's own accessibility service.
+
+The adapters are thread-local to the event loop, not fields of `WinitSurface`. A surface can be
+shared so another thread can request a frame. Windows accessibility handles and macOS Objective-C
+objects must stay on the thread that created them. The surface therefore names its adapter by
+`SurfaceId`; destroying a window releases the adapter on the loop thread at the same time.
 
 ### Publication, once per frame
 

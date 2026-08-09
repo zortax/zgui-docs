@@ -94,6 +94,10 @@ that must survive suspension. A context provided by a component belongs to that 
 and is not visible in another window. On resume, each window root and its view are built again below
 the retained application root.
 
+The runtime provides `Fonts`, `Windows`, and `Clipboards` in that application scope before your
+setup runs. Their hooks resolve those same handles from every window. `App::with_context` can also
+resolve `Fonts` when shared setup needs the application's font collection.
+
 <Callout type="info">
 A listener runs in the scope it was **written** in, not in no scope at all. An event arrives from
 the platform, not from the reactive graph, so the owner current when the `on:` binding was created

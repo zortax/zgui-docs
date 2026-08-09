@@ -237,6 +237,16 @@ Attributes written before the spread apply first and attributes after it apply l
 decides who wins. At most one prop per component may be `#[prop(attrs)]`; the setter is always
 called `attrs`.
 
+Repeated `class` props merge instead of replacing one another. Each value can be a string or an
+existing `Classes` list. Names keep their first position and duplicates are removed:
+
+```rust
+control(class = "button", class = classes_from_caller) {"Save"}
+```
+
+`Classes::merged` accepts the same values directly, so `base.merged("button--primary")` needs no
+temporary conversion.
+
 ## Naming and files
 
 A component is a normal Rust item. Put one per file, or several in a module — whatever suits. The

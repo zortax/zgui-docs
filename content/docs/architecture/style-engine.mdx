@@ -418,12 +418,11 @@ Without one, the engine re-matches the changed element and *only* the changed el
 selector that reached the element sideways keeps the answer it had, and `.item:hover + .label` never
 lights up with nothing reporting a problem.
 
-There are two record widths, and the cheaper one is the default:
-
-| Mutation | Record |
-|---|---|
-| A state write — hover, focus, checked | The previous state word, and no attributes at all. Hovering a row of a large table does not copy that row's class list. |
-| A class, identifier or attribute write | Widened to carry the previous values, inside the write that needs them. |
+Every record carries the previous state word and the element's attributes. A state change does not
+normally need the attributes, but a style sheet can be installed before the next traversal. The
+style engine then reads classes from the existing snapshot while invalidating the new sheet, so an
+attribute-free state record would make that valid sequence panic. Attribute writes additionally
+mark which class, identifier, or named attribute changed.
 
 One record per element per batch: the record describes the element as the last restyle left it, so
 the first change in a batch is the one worth recording.
@@ -789,35 +788,21 @@ As committed, that file reports:
 | Property names the engine generates | 322 |
 | Distinct longhands behind them | 250 |
 | Classified | 250 |
-| Implemented | 128 |
-| Parsed and cascaded, not yet implemented | 122 |
-| Out of reach: register rows | 6 |
+| Implemented | 176 |
+| Parsed and cascaded, not yet implemented | 74 |
+| Shown by probe to change what a frame produces | 157 |
+| Out of reach: register rows | 7 |
 | Not yet implemented: register rows | 0 |
 
-<Callout type="warn">
-**The register under-reports painting, and the reason is structural.**
-`zgui_conformance::registrations()` names five sources: `zgui-style`, `zgui-text-style`,
-`zgui-layout`, the inherited-SVG gap rows and `zgui-css`'s own backlog. **`zgui-paint` is not one of
-them, and is not a dependency of `zgui-conformance` at all.** So the placeholder rows in
-`crates/zgui-css/src/parity/backlog/visual.rs`, whose note reads `"nothing paints yet, so nothing
-reads it"`, win uncontested.
+`zgui_conformance::registrations()` includes declarations from style, text style, layout, paint,
+runtime, inherited-SVG gaps, and the remaining CSS backlog. Evidence compares fragment geometry,
+hit testing, clip shapes, and paint lowering. A separate timed survey advances animations and
+transitions, so a property whose effect appears only on a later frame is still measured.
 
-`zgui-paint` declares 38 longhands `Support::Implemented`. **Seventeen of those are printed as
-*unread* in `docs/parity.md`**, among them `background-color`, `background-image`, four
-`border-*-color`, three `border-*-radius`, `outline-color`, `text-shadow` and all three
-`text-decoration-*`. The evidence probe cannot catch the mistake either: it compares **fragment
-trees**, and a background colour moves no fragment.
-
-Read `docs/parity.md` for the layout and text story and for the six out-of-reach rows. Read the
-`register_properties!` blocks in `crates/zgui-paint/src/lower/` for what is actually painted.
-</Callout>
-
-The eighteen rows noted `"nothing animates yet, so nothing reads it"`
-(`crates/zgui-css/src/parity/backlog/motion.rs`) carry the same shape of error. Transitions and
-keyframe animations are the engine's own machinery — it decides when one starts from the difference
-between two cascade results — and `crates/zgui-style/src/driver/animations/` drives it every frame.
-The register counts declarations made by *zgui* modules, and the probe looks for an immediate
-fragment-tree change, which an animation by construction does not produce.
+Some consumers need an environment the deterministic fixture does not have. Font selection needs
+real faces; `cursor`, `caret-color`, and `user-select` need a window and interaction state. These
+rows remain implemented only with a specific reason in the report. An unexplained declaration with
+no observable consequence fails the build.
 
 ## What it costs, measured
 

@@ -711,30 +711,20 @@ test suite:
 |---|---:|
 | Property names the engine generates | 322 |
 | Distinct longhands behind them | 250 |
-| Implemented | 128 |
-| Parsed and cascaded, not yet implemented | 122 |
-| Shown by probe to change what layout produces | 111 |
-| Out of reach: register rows | 6 |
+| Implemented | 176 |
+| Parsed and cascaded, not yet implemented | 74 |
+| Shown by probe to change what a frame produces | 157 |
+| Out of reach: register rows | 7 |
 | Not yet implemented: register rows | 0 |
 
 A property counts as **implemented** there only when some module declares that it reads the value
-*and* setting it on a fixture visibly changes the fragment tree or the answer hit testing gives.
+*and* setting it on a fixture changes a fragment tree, hit-test answer, clip shape, paint lowering,
+or timed animation result. A small stated list covers consumers that need a real font or window and
+cannot be observed by the deterministic harness.
 
-<Callout type="warn">
-`docs/parity.md` **under-reports painting**. The conformance harness collects parity declarations
-from `zgui-style`, `zgui-text-style`, `zgui-layout` and `zgui-css`'s own backlog. It does not link
-`zgui-paint`. So every row in that file reading "nothing paints yet, so nothing reads it" is wrong:
-`zgui-paint` declares those properties implemented. The same applies to the `animation-*` and
-`transition-*` rows, which the probe cannot settle because an animation by construction produces no
-immediate change. Read the tables below rather than that file for what paints.
-
-It under-reports two flex properties for a related reason. `flex-shrink` and `align-content` are
-both read by the layout adapter (`crates/zgui-layout/src/style/flex.rs`), but the one fixture the
-probes share cannot move either: nothing in it overflows, so `flex-shrink: 0` changes no edge, and
-its wrapped lines already fill the cross axis, so `align-content` has no free space to hand out.
-A probe that shows nothing is recorded as a property nothing reads. The tables below say what the
-engine reads.
-</Callout>
+The harness includes the style, text, layout, paint, runtime, and timed-animation consumers. A
+declared implementation with no observed consequence fails the suite unless its register row gives
+a reason that the harness cannot construct that environment.
 
 ### Implemented, by area
 
@@ -746,7 +736,13 @@ engine reads.
 | painting | `color`, `visibility`, `background-color`, `background-image`, all four `border-*-color`, all four `border-*-style`, all four `border-*-radius`, `outline-color`/`-style`/`-width`/`-offset`, `box-shadow`, `text-shadow` |
 | compositing | `opacity`, `filter`, `backdrop-filter`, `mix-blend-mode`, `isolation`, `z-index`, `pointer-events`, `clip-path` |
 | transforms | `transform`, `translate`, `rotate`, `scale`, `transform-origin`, `perspective`, `transform-style`, `backface-visibility` |
-| text | `font-size`, `font-family`, `font-weight`, `font-style`, `font-stretch`, `font-variation-settings`, `font-feature-settings`, `font-kerning`, `font-optical-sizing`, every `font-variant-*`, `letter-spacing`, `word-spacing`, `line-height`, `text-align`, `text-indent`, `text-wrap-mode`, `word-break`, `overflow-wrap`, `text-decoration-line`/`-color`/`-style`, `direction` |
+| text | `font-size`, `font-family`, `font-weight`, `font-style`, `font-stretch`, `font-variation-settings`, `font-feature-settings`, `font-kerning`, `font-optical-sizing`, every `font-variant-*`, `letter-spacing`, `word-spacing`, `line-height`, `text-align`, `text-indent`, `text-wrap-mode`, `white-space-collapse`, `tab-size`, `word-break`, `overflow-wrap`, `text-transform`, `text-overflow`, `text-decoration-line`/`-color`/`-style`, `direction` |
+| interaction | `cursor`, `caret-color`, `user-select` |
+
+`cursor` uses the computed keyword of the innermost element under the pointer. `auto` becomes a
+text cursor over editable content and the default arrow elsewhere. `caret-color: auto` uses the
+editable element's text colour. `user-select: none` prevents a pointer press from placing or
+dragging a text selection; it does not disable keyboard selection in an editable element.
 
 `linear-gradient` and `radial-gradient` work as `background-image` values. A gradient between
 colours outside sRGB is densified along the true curve rather than interpolated in a straight line.
@@ -760,7 +756,7 @@ failure mode to recognise: no warning is printed, because the declaration was va
 |---|---|
 | grid | `grid-auto-columns`, `grid-template-areas` |
 | backgrounds | `background-position-x`/`-y`, `background-size`, `background-repeat`, `background-origin`, `background-attachment`, `background-clip`, `background-blend-mode`, every `border-image-*` |
-| text | `text-transform`, `text-overflow`, `text-rendering`, `unicode-bidi`, `tab-size`, `caret-color`, `cursor`, `white-space-collapse`, `writing-mode`, `line-break`, `text-align-last`, `text-justify` |
+| text | `text-rendering`, `unicode-bidi`, `writing-mode`, `line-break`, `text-align-last`, `text-justify` |
 | other | `color-scheme`, `image-rendering`, `perspective-origin`, `container-type`, `container-name` |
 
 A background layer fills the box it is painted on, which is what makes the whole
@@ -769,13 +765,15 @@ A background layer fills the box it is painted on, which is what makes the whole
 
 ### Out of reach
 
-Six rows in `docs/parity.md` need a patched build of the style engine, and there is to be no fork.
+Seven rows in `docs/parity.md` need a patched build of the style engine or vector stack, and there
+is to be no fork.
 They are a boundary and not a backlog. Four are the selectors and the SVG group already listed
-above. The other two:
+above. The other three:
 
 | Missing | Write instead |
 |---|---|
 | `text-decoration-thickness`, `text-underline-offset`, `text-underline-position` | the line, its style and its colour are all read; an underline that has to sit elsewhere is a border or a box under the run |
+| `prefers-reduced-motion` | discover the preference in application code, set an attribute on the root, and select that attribute in the style sheet |
 | `scrollbar-gutter` | keep the gutter yourself with `padding-right` on the scrolling element |
 
 ## Custom properties

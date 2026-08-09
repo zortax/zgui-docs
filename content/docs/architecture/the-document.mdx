@@ -705,11 +705,10 @@ An `Edit` method applies one change and everything that change owes.
 <Step>
 
 **A snapshot, if one is needed.** The engine works out what a change can affect by comparing the
-element as it is now against a record of how it was. Two records exist, and the cheaper one is the
-default: a state write stores the previous state word and no attributes at all, which is what keeps
-hovering a row of a large table from copying that row's class list. A class, identifier or attribute
-write widens the record to carry the previous values, and widening late is correct because a state
-write earlier in the same batch has not touched them.
+element as it is now against a record of how it was. Every snapshot carries the previous state word
+and the element's attributes. This also covers a style sheet installed after a state change and
+before traversal: the engine can read the old class list from the existing record. A class,
+identifier, or attribute write marks the corresponding field as changed.
 
 One record per element per batch. The *first* change is the one worth recording, and whether a
 record already exists is asked of the element's own bookkeeping word rather than of the map.

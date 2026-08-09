@@ -37,6 +37,9 @@ rustc --version --verbose
 
 The desktop backend uses winit for the window and wgpu for the GPU.
 
+The packages below are Linux development headers. Windows and macOS do not compile the Linux
+windowing backends and need none of them. Use the normal Rust toolchain and platform SDK there.
+
 <Tabs items={['Debian / Ubuntu', 'Arch', 'Fedora']}>
 <Tab value="Debian / Ubuntu">
 
@@ -70,9 +73,13 @@ You also need a working graphics driver. Any adapter wgpu accepts will do. Conti
 runs the whole suite on Mesa's software rasteriser, so a machine with no discrete GPU still works:
 
 ```bash
-# force a backend when the default pick is wrong
-WGPU_BACKEND=vulkan cargo run --example counter
+# restrict backend selection when diagnosing a driver
+ZGUI_BACKENDS=vulkan cargo run --example counter
 ```
+
+The default is Metal on Apple platforms, Direct3D 12 with OpenGL fallback on Windows, and Vulkan
+with OpenGL fallback elsewhere. `ZGUI_BACKENDS` accepts `metal`, `dx12`, `vulkan`, `gl`, `all`, or
+`none`, with comma-separated values where more than one applies.
 
 <Callout type="info">
 Nothing above is needed to run the framework **headless**. The headless backend draws into buffers

@@ -458,11 +458,21 @@ Damage becomes scissor rectangles in exactly one place
 
 ```rust
 pub fn rects(damage: &DamageSet, used: Rect<i32, Device>) -> Vec<Rect<i32, Device>>;
+pub fn rects_covering_backdrops(
+    damage: &DamageSet,
+    used: Rect<i32, Device>,
+    backdrops: &[Rect<i32, Device>],
+) -> Vec<Rect<i32, Device>>;
 ```
 
 A full set becomes the whole of `used`. Otherwise every rectangle is intersected with `used` and the
 empties are dropped. The rectangles are pairwise disjoint on the way in and stay so, which is why no
 pixel is redrawn twice.
+
+A backdrop reads the composed target beneath it. When damage touches a backdrop, the planner grows
+the scissor to cover that backdrop's full source region, so the filter reads pixels written by this
+frame instead of its own result from the previous frame. A backdrop that does not intersect the
+scissor is skipped before capture and costs nothing on that rectangle.
 
 **The rectangles only ever scissor the composed target.** The copy to the surface is unconditional
 and covers all of it.
@@ -712,7 +722,7 @@ texture held before.
 | Dashed and dotted border | Dashes are laid out clockwise around the whole perimeter, in dash space where one period has length one. Dash size is proportional to border width. Each corner's arc length is a Ramanujan quarter-ellipse perimeter, and position along it is the eccentric anomaly, so a dash does not stretch at a corner. |
 | Outer shadow | One `Shadow` instance, drawn analytically: a closed-form horizontal integral of a Gaussian using an `erf` approximation, accumulated over four vertical samples. `Shadow::BLUR_EXTENT = 3.0` — the Gaussian is below one thousandth at three standard deviations, under half a level at eight bits per channel. |
 | Inset shadow | The same shader and the complement of the same integral. `bounds` is the casting box itself rather than a dilated one, and `inset` is 1. |
-| Text | A `MonoSprite` or `SubpixelSprite` per glyph run, reading a coverage tile from the atlas. Coverage is contrast-enhanced and gamma-corrected before it multiplies the colour, with the correction stronger for light text on a dark background. The instance's colour is premultiplied and gamma-encoded. |
+| Text and custom glyph runs | A `MonoSprite` or `SubpixelSprite` per glyph run, reading a coverage tile from the atlas. Coverage is contrast-enhanced and gamma-corrected before it multiplies the colour, with the correction stronger for light text on a dark background. The instance's colour is premultiplied and gamma-encoded. |
 | Underline, overline, strikethrough | One `Decoration` primitive with a style: `Solid`, `Wavy`, `Dashed`, `Dotted` or `Double`. Only the rectangle differs between the three positions. |
 | Image | A `ColorSprite` reading a premultiplied tile, with elliptical corner radii for the clip and a grayscale flag. |
 | Opacity group | The paint stage decides. When no two primitives in the subtree overlap, the alpha is **folded** into each primitive's own paint for identical pixels and no target at all. Otherwise the group marker leases a pool target, the content draws into it, and `Composite` multiplies the whole result by the group's alpha. |

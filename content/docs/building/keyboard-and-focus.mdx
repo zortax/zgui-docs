@@ -343,9 +343,10 @@ Four things make it work:
 - **`draft` is the only copy of the text.** The `text` node renders it; nothing else holds it.
 - **The caret is yours to draw.** The framework paints a real caret only for `field` and `editor`.
 
-What this does not give you: caret placement with the pointer, selection, undo, word motion,
-clipboard, or an input method. All of those live in the editing model, and the editing model is
-attached to two element names.
+What this does not give you: caret placement with the pointer, selection, undo, word motion, or an
+input method. All of those live in the editing model, and the editing model is attached to two
+element names. Application code can use the [clipboard API](/docs/building/clipboard), but a plain
+focusable element does not gain editing commands from it.
 
 The repository's own `examples/todo.rs` is this pattern at full size.
 
@@ -358,12 +359,12 @@ paragraph** — a view never owns a second copy.
 
 | Works today | Not built |
 |---|---|
-| typing, Backspace, Delete, by grapheme or by word | paste: no key maps to it and nothing reads the system clipboard |
+| typing, Backspace, Delete, by grapheme or by word | automatic paste: no key maps a clipboard read into the editor |
 | left and right arrows, Home, End, with Shift to extend | up and down arrows: there is no line granularity |
 | Control-A to select all | PageUp and PageDown inside an editable element |
 | Control-Z, Control-Shift-Z and Control-Y | double-click word selection, triple-click line selection |
 | copy and cut to the system clipboard | dragging text, spell checking, rich text |
-| caret placement and drag selection with the pointer | any caret styling beyond its built-in width and colour |
+| caret placement and drag selection with the pointer; `caret-color` styling | caret width or shape styling |
 | input-method composition | the `value` and `placeholder` attributes, which the model does not read |
 | `on:input` and `on:change`, and `NodeRef::set_value` / `selection` / `set_selection` / `select_all` | |
 

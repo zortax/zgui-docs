@@ -341,7 +341,7 @@ runs on and travels the ordinary capture and bubble path, so a listener on an an
 | `on:animation_iteration` | `AnimationEvent` | one iteration ends and another begins |
 | `on:animation_end` | `AnimationEvent` | it finishes on its own |
 | `on:animation_cancel` | `AnimationEvent` | it is stopped before it finishes |
-| `on:transition_run` | `TransitionEvent` | never — see below |
+| `on:transition_run` | `TransitionEvent` | the transition is created, including its delay |
 | `on:transition_start` | `TransitionEvent` | the delay is over and the value begins moving |
 | `on:transition_end` | `TransitionEvent` | the value arrives |
 | `on:transition_cancel` | `TransitionEvent` | it is stopped before the value arrives |
@@ -357,18 +357,19 @@ box(
 )
 ```
 
-An `AnimationEvent` carries `name` (the `@keyframes` name), `elapsed` and `phase`. A
-`TransitionEvent` carries `property` (the property being moved), `elapsed` and `phase`. Both have
-`is_final()`, which is true for the ended and cancelled phases.
+An `AnimationEvent` carries `name` (the `@keyframes` name), `elapsed`, `phase`, and `pseudo`. A
+`TransitionEvent` carries `property` (the property being moved) and the same other fields. `pseudo`
+is `Some(Pseudo::Before)` or `Some(Pseudo::After)` for generated content; its event is dispatched
+at the owning element because the pseudo-element has no node. Both payloads have `is_final()`,
+which is true for the ended and cancelled phases.
 
-`elapsed` is the animation's **declared** duration, not the wall time since it started. A frame
-arrives when it arrives, so the wall time disagrees with the style sheet by up to a frame, and a
-number that is never the same twice is no use to a handler comparing it against the sheet.
+`elapsed` is active animation time and excludes a positive delay. A negative delay starts part-way
+through the animation, so its start event reports that offset instead of zero. Completed edges use
+the declared animation position, not the late wall-clock instant at which a frame observed them.
 
-<Callout type="error">
-`on:transition_run` never fires. The phase behind it is defined and nothing ever constructs it.
-Use `on:transition_start`, which reports the moment the value begins to move.
-</Callout>
+`transition_run` and `transition_start` are separate. A delayed transition reports `run` when the
+cascade creates it and `start` after the delay. With no delay, both events arrive in that order in
+one tick.
 
 ### Asking what is still running
 
@@ -557,15 +558,6 @@ expressed in a sheet.
 | `transition-behavior: allow-discrete` | parses; nothing reads it |
 | `animation-play-state` | reaches the engine, which creates a paused animation. No test in the repository exercises it |
 | `prefers-reduced-motion` | not a media feature the engine answers. An application that wants it reads the setting itself and switches a class or a sheet |
-| `on:transition_run` | the phase behind it is never produced |
-
-<Callout type="info">
-`docs/parity.md` in the repository marks every `animation-*` and `transition-*` row as read by
-nothing, with the note "nothing animates yet". That claim is scoped to what the CSS layer's own
-probes can see — a probe sets a property on a fixture and looks for an immediate change in the
-fragment tree, which an animation by construction does not produce. Animations do work. The rows are
-stale wording, not a missing feature.
-</Callout>
 
 ## Next
 

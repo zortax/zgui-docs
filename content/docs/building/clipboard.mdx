@@ -1,0 +1,96 @@
+---
+title: Clipboard
+description: Copy, read, and clear plain text through the desktop clipboard.
+---
+
+zgui provides one application-wide clipboard handle. Resolve it in a component body with
+`use_clipboard()`, then capture it in listeners or effects.
+
+## Copy text
+
+```rust
+use zgui::prelude::*;
+
+#[component]
+fn CopyButton(value: String) -> impl IntoView {
+    let clipboard = use_clipboard();
+
+    view! {
+        control(
+            tabindex = Focus::Sequential,
+            on:click = move |_| {
+                clipboard.set_text(ClipboardKind::Standard, value.clone());
+            }
+        ) {"Copy"}
+    }
+}
+```
+
+`ClipboardKind::Standard` is the clipboard used by Copy and Paste. `set_text` queues the write and
+returns immediately. An unsupported operation is a no-op; it does not fail the frame.
+
+Call `clear(kind)` to empty a clipboard.
+
+## Read text
+
+A read is asynchronous. Use a callback when the answer causes an action:
+
+```rust
+let clipboard = use_clipboard();
+
+clipboard.read_text(ClipboardKind::Standard, move |text| {
+    if let Some(text) = text {
+        insert_pasted_text(text);
+    }
+});
+```
+
+The callback runs later on the UI thread. It receives `None` when the clipboard is empty, does not
+contain text, or refuses the request. If the application stops first, zgui drops the callback
+without calling it.
+
+A clipboard callback is application work. It is not cancelled when the component that started it
+unmounts. Capture application-scope state, or another value that remains valid until the answer
+arrives. Do not capture a disposable window-local signal unless that window is guaranteed to stay
+mounted.
+
+Use `read_text_signal` when a view only needs one read result:
+
+```rust
+let clipboard = use_clipboard();
+let text = clipboard.read_text_signal(ClipboardKind::Standard);
+
+view! {
+    text() {{move || text.get().unwrap_or_else(|| "No text".into())}}
+}
+```
+
+The signal contains `None` before the answer and also when no text is available. Use `read_text`
+and write an explicit loading state when the distinction matters.
+
+## Use the primary selection
+
+`ClipboardKind::Primary` is the selection clipboard used by middle-button paste on Linux and BSD.
+It is independent from the standard clipboard. Other supported desktops have no equivalent, so
+operations on it do nothing.
+
+Check support before showing a primary-selection command:
+
+```rust
+let supported = use_windows().capabilities().clipboard_primary_selection;
+```
+
+Plain text is the only public clipboard data type in this API. Rich text, files, and images are not
+accepted.
+
+## Clipboard scope and threads
+
+`Clipboards` is provided above every window. All windows resolve the same handle, and a request can
+complete while another window has focus. The handle is UI-thread state. Background work must post
+the operation back with `task::ui`.
+
+`try_use_clipboard()` returns `None` instead of panicking when no application scope is active.
+
+The built-in `field` and `editor` elements copy and cut selected text. They do not bind a Paste key
+to the system clipboard. Use `read_text` and the element's editing API when an application must
+implement that command.

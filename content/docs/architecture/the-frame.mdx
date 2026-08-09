@@ -31,7 +31,7 @@ pub trait AppHandler: 'static {
 | `surfaces_available` | Installs the clock and waker, then opens every requested window that has no surface. On resume, this rebuilds all suspended window views. |
 | `surfaces_lost` | Drops every current frame pipeline and surface while retaining the requested window specifications. |
 | `surface_event` | `RedrawRequested` runs a frame if the named window wants one and presentation pacing does not hold it. `CloseRequested` consults close callbacks; an accepted close and `Destroyed` remove that window, then apply the exit policy. Other events are queued only on the named window. |
-| `wake` | Turns surface-scoped reasons into redraw requests, or drains application window commands for `AppWork`. |
+| `wake` | Turns surface-scoped reasons into redraw requests, or drains application commands and clipboard requests for `AppWork`. |
 | `idle` | Computes the park. Returns an `IdlePolicy`. |
 | `deadline_reached` | Turns "a deadline arrived" into a redraw request on the surfaces that were parked on it. |
 | `shutting_down` | Closes every window. |
@@ -383,13 +383,15 @@ pub enum WakeReason {
 }
 ```
 
-`AppWork` tells the runtime to process deferred open, close, or quit commands. It does not name a
-surface because a command can create or remove the surface itself.
+`AppWork` tells the runtime to process deferred open, close, quit, and clipboard requests. It does
+not name a surface because the work belongs to the application and can create or remove a surface.
 
 `ColorSchemeChanged` is the one that is more than a redraw. `Runtime::wake` reads
 `cx.color_scheme()` and pushes it into every window before requesting a frame: a frame alone changes
 nothing, because the device the cascade is matched against is rebuilt from the window's own state.
-`ClipboardRead` is not handled by the runtime today.
+`ClipboardRead` resolves the callback stored under its `ClipboardSerial`. That callback runs on the
+UI thread and can queue another clipboard operation; the runtime drains it before the handler turn
+ends.
 
 ### Requesting a frame is idempotent
 
@@ -706,8 +708,10 @@ shaped for the first time, and every glyph is rasterised into the atlas.
 
 <Step>
 
-**The surface is shown**, and only now: `set_visible(true)` runs on the first `FrameOutcome::Presented`.
-Showing an unpainted surface is what produces a flash of empty window at launch.
+**The surface is shown**, and only now: `set_visible(true)` runs on the first
+`FrameOutcome::Presented`. A hidden macOS layer can refuse a drawable and report that first frame as
+occluded. In that case, the runtime shows the surface after composing its target and requests the
+presentation frame immediately. Showing before either result would produce a flash of empty window.
 
 </Step>
 
