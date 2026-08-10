@@ -237,6 +237,10 @@ Attributes written before the spread apply first and attributes after it apply l
 decides who wins. At most one prop per component may be `#[prop(attrs)]`; the setter is always
 called `attrs`.
 
+The bundle keeps classes, individual style declarations, custom properties, attributes, typed
+properties, states, listeners, and accessibility values. For example, a caller can write
+`var:--brand = "red"`; the spread stores it as `brand`, which is the name that `var(--brand)` reads.
+
 Repeated `class` props merge instead of replacing one another. Each value can be a string or an
 existing `Classes` list. Names keep their first position and duplicates are removed:
 

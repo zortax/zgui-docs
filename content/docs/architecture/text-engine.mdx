@@ -385,7 +385,7 @@ second monotonic counter records successful lookups for the cache budget.
 - the paragraph's shaping properties;
 - each run's **extent and shaping key**, in order — a moved boundary between two runs changes which
   characters are shaped together, so a key over the set of styles alone would miss it;
-- each atomic inline's id and offset;
+- each atomic inline's id, offset, and current width;
 - the `TextMap` segments.
 
 The map is in the key, which is not obvious, because it changes no glyph. A shaped result *carries*
@@ -394,6 +394,11 @@ exactly what collapsing leading white space does. Leaving the map out would serv
 paragraph the first one's provenance, putting every caret and hit test in it at the wrong offset with
 nothing to report it.
 
+The width is necessary because a shaped result carries minimum and maximum content widths, and both
+include atomic inline boxes. Two otherwise equal contexts with different box widths must not share
+those measurements. Box height is not in this key: it changes line placement and belongs to the
+breaking request.
+
 The brush is deliberately **not** in the key: it is an index into a table the shaped result does not
 own, so re-theming must not produce a different key.
 
@@ -401,9 +406,10 @@ own, so re-theming must not produce a different key.
 file a paragraph under a key that does not describe it.
 
 Hashing a large string is also proportional to its byte length. The flattened `Generated` value
-therefore keeps its `ParagraphKey` in a `OnceLock`. Layout can probe many candidate widths without
-hashing the same characters again. `shape_keyed` passes that answer through the layout and shaper
-seams, with a debug assertion where an implementation computes the key independently.
+therefore keeps the stable `ContentKey` in a `OnceLock`. Layout folds in the current atomic-inline
+widths for each measurement. It does not hash the string again. `shape_keyed` passes the complete
+`ParagraphKey` through the layout and shaper seams, with a debug assertion where an implementation
+computes the key independently.
 
 Current inline resolutions retain the paragraph identifiers they use. Replacing a resolution
 releases its old identifier, and reclamation waits until fragment diffing has completed. This delay
@@ -459,14 +465,13 @@ The cost table:
 | Same content, same style, same width | `Plan::Reflected`: one hash, one comparison |
 | Same content, a width probed before, `probe = true` | `Plan::Recalled`: a linear scan of at most four entries and a clone |
 | Same content, a new width | `Plan::Owed`: one breaking pass over glyphs already held |
-| New content, or a moved `ShapingKey`, or a new device scale | a full shape, then a break |
+| New content, a moved `ShapingKey`, a new atomic-inline width, or a new device scale | a full shape, then a break |
 
-Two further things force a break without changing a glyph, and both are inputs to `BreakRequest`
-rather than state the shaper keeps. An **atomic inline** — an image, an `inline-block`, a form control
-— may have resized under a different constraint; and its `vertical-align` shift is baked into the
-height the shaper was told, so a restyle of it is invisible to the shaper. Both are in `BreakingKey`,
-so a shift that moved forces a break exactly as a width change would. **Line bands** — the narrowed
-widths lines take beside a float — are in it for the same reason.
+Two further inputs concern an **atomic inline** — an image, an `inline-block`, or a form control.
+Its width is part of `ParagraphKey`, because the shaped result's content widths include the box. A
+new width therefore costs a shape. Its height and `vertical-align` shift affect line placement but
+not those content widths, so they stay in `BreakRequest` and cost only a break. **Line bands** — the
+narrowed widths lines take beside a float — are also in the breaking request.
 
 <Callout type="warn">
 The defect this buffer fixes was measured. With a single remembered key, min-content, max-content and
@@ -899,7 +904,8 @@ must then be computed again.
 | The element's `color`, or the theme | nothing | the brush is a slot; the slot is rewritten in place |
 | `text-align`, `text-indent`, `overflow-wrap`, `line-break` | one break | `BreakingKey` moved, `ShapingKey` did not |
 | The available width | one break | the width is in `BreakingKey` |
-| An atomic inline resizing, or its `vertical-align` | one break | both are inputs to `BreakRequest` |
+| An atomic inline changing width | a shape | its width is in `ParagraphKey` and in the stored content widths |
+| An atomic inline changing height or `vertical-align` | one break | both are inputs to `BreakRequest` |
 | A float appearing beside the text | one break | the line bands are in `BreakingKey` |
 | `font-size`, `font-family`, `letter-spacing`, `font-feature-settings`, `direction` | a shape | `ShapingKey` moved |
 | The text itself | a shape | the string is in `ParagraphKey` |

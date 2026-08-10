@@ -217,10 +217,11 @@ entry behind under its old key until the budget needs space. Current inline reso
 paragraph identifiers they name, which gives the budget an exact active set. It removes only
 inactive entries, coldest first.
 
-The flattened paragraph computes its `ParagraphKey` once and keeps it in a `OnceLock`. Intrinsic
-measurement and candidate-width probes reuse that key instead of hashing a large string on every
-question. `TextBytesShaped` records the byte volume that reached an actual shaping pass; read it
-beside `TextShaped` to distinguish one long paragraph from many short labels.
+The flattened paragraph computes its stable `ContentKey` once and keeps it in a `OnceLock`.
+Intrinsic measurement folds the current atomic-inline widths into that key to make a
+`ParagraphKey`. Candidate-width probes do not hash the large string again. `TextBytesShaped`
+records the byte volume that reached an actual shaping pass; read it beside `TextShaped` to
+distinguish one long paragraph from many short labels.
 
 ## The recall buffer
 
@@ -316,7 +317,7 @@ Defaults (`crates/zgui-atlas/src/atlas/limits.rs`):
 | Limit | Default | Why |
 |---|---:|---|
 | `texture_size` | 1024 | small enough that a document using a handful of glyphs reserves little, large enough that a text-heavy one is not allocating every few dozen glyphs |
-| `max_texture_size` | 4096 | the smallest maximum dimension any target device is expected to offer |
+| `max_texture_size` | 4096 | a conservative default; each window replaces it with the device's reported limit |
 | `max_textures_per_pool` | 16 | past it, allocation fails and the caller evicts and retries |
 | `soft_bytes` | none | eviction that nothing bounds has no criterion |
 
@@ -349,10 +350,12 @@ written — which on most devices is not a blank glyph but whatever the texture 
 loop flushes between emitting and drawing, and enforces the budget after both.
 </Callout>
 
-Decoded pictures are budgeted separately as `DecodedImages`, with a 64 MiB soft level. Sources that
-a live image element shows are pinned. Unseen source history is evictable in coldest-first order and
-is decoded again if an element shows it later. The loader maintains exact held-byte and
-evictable-byte totals, so taking a budget report does not scan all sources.
+Decoded pictures are budgeted separately as `DecodedImages`, with a 64 MiB soft level. The active
+variant of each source shown by a live image element is pinned. Other size variants of that source
+are evictable first. Sources that no element shows are then evicted in coldest-first order. After a
+large variant reaches its texture, the loader releases its host copy, so its pinned decoded-byte
+count becomes zero. The loader maintains exact held-byte and evictable-byte totals, so taking a
+budget report does not scan all sources.
 
 Counters: `AtlasTilesEvicted`, `RecordTilesRetained` and `RecordTilesReleased`. A growing gap
 between the last two is an atlas in which nothing is evictable.
@@ -577,7 +580,7 @@ and what level they come back below when a level applies.
 | Cache | Unit | Level | Why that level |
 |---|---|---|---|
 | `GlyphAtlas` | bytes | 64 MiB | several times a text-heavy document's glyphs, well under an unbounded atlas |
-| `DecodedImages` | bytes | 64 MiB | visible sources stay pinned; unseen sources can be decoded again |
+| `DecodedImages` | bytes | 64 MiB | active variants are pinned until their large host copies are released; other variants can be decoded again |
 | `ParagraphShaping` | entries | 16 384 | the largest document whose every element is live, with room |
 | `VectorResources` | entries | 16 384 | the same, for what the per-frame retain does not bound |
 | `RenderTargets` | bytes | none | group targets and the scroll-shift scratch; the pool enforces its own ceiling |
@@ -651,8 +654,9 @@ What "coming back under" means differs by cache:
 
 - **The atlas** frees cold generations until resident bytes are under the level, and stops at the
   frame's working set and at anything a paint record holds.
-- **Decoded images** remove unseen sources in least-recently-used order. Sources shown by live
-  image elements remain pinned and can keep the cache over its level.
+- **Decoded images** remove inactive variants of shown sources first, then remove unseen sources in
+  coldest-first order. The active variant stays pinned while it has host bytes. Large variants give
+  those bytes back after upload; the texture then carries the picture.
 - **Paragraph shaping** removes inactive entries in least-recently-used order. Current inline
   resolutions pin their keys because cached sizes and baselines depend on them. A document whose
   active text exceeds the level stays over it. An explicit reset still drops all shaping and marks

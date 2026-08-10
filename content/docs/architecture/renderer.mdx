@@ -592,18 +592,20 @@ One `ContentCache` per window holds **one** atlas for glyphs and images together
 (`crates/zgui-paint/src/content/cache.rs`). They compete for the same texture memory, and a budget
 split in advance is a budget wrong in one direction or the other.
 
-Inside it are three pools, one per `TextureKind`:
+Inside it are four pools, one per `TextureKind`:
 
 | Kind | Format | Holds |
 |---|---|---|
 | `Mono` | `R8Unorm` | Single-channel glyph coverage. |
 | `Subpixel` | `Rgba8Unorm` | Per-channel glyph coverage. |
-| `Color` | `Rgba8Unorm` | Decoded images and colour glyphs, premultiplied. |
+| `Color` | `Rgba8Unorm` | Colour glyphs, premultiplied and sampled without image filtering. |
+| `Image` | `Rgba8Unorm` | Decoded images, premultiplied and sampled with linear filtering. |
 
-`Subpixel` and `Color` share a format and are still separate pools, because they are drawn by
-different pipelines and one batch may not mix them. Both formats are fixed rather than following the
-surface: a surface-following colour format would need a channel swizzle on every upload, and pinning
-coverage to one byte per texel keeps a text-heavy frame's upload volume down by a factor of four.
+`Subpixel`, `Color`, and `Image` share a format. `Subpixel` uses a different pipeline. `Color` and
+`Image` use different samplers: exact-size glyph rasters must stay sharp, while images need filtered
+scaling. The formats are fixed rather than following the surface: a surface-following colour format
+would need a channel swizzle on every upload, and pinning coverage to one byte per texel keeps a
+text-heavy frame's upload volume down by a factor of four.
 
 The key is opaque:
 
@@ -640,8 +642,12 @@ pub struct AtlasLimits {
 }
 ```
 
-4096 is the smallest maximum texture dimension any target device is expected to offer, so the
-default never depends on a capability that might be absent.
+4096 is the conservative default. A window replaces `max_texture_size` with the current device's
+reported limit. Image decoding uses that effective limit, less the atlas padding.
+
+Small image variants use ordinary tiles in the `Image` pool. A variant with a long edge above 512
+pixels gets a standalone texture and a complete mip chain. It still uses the same pool and image
+sampler; standalone storage lets the GPU select a suitable level when the picture is minified.
 
 ### The soft limit and eviction
 

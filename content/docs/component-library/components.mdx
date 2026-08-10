@@ -107,6 +107,9 @@ is `Sm`, `Md`, `Lg`, `Icon`. `BadgeVariant` is `Default`, `Secondary`, `Destruct
 `Progress` with `value = None` is the indeterminate case. `Alert(live = true)` gives the element
 role `Alert` and a polite live region; `live = false` makes it a `Group`.
 
+`Card` and `Alert` use a `box` root. Their children participate in normal layout. They do not use
+the replaced `surface` element; that element is only for pixels from another renderer.
+
 ### The text fields
 
 | Component | Props | Children |
@@ -222,6 +225,10 @@ selects and virtualises through `DataModel<T>`.
 
 `Column<T>::new(...)` builds a column, with `.sortable_by(…)` and `.sized(track)`. `VirtualList`
 builds only the rows in view plus `overscan` at each edge.
+
+Use `DataModel::set_sort(state)` to restore a saved `SortState` without cycling a header. A state
+with no key restores arrival order. A state that names a missing or unsortable column is refused,
+and the current sort stays unchanged.
 
 ### Toasts
 

@@ -253,9 +253,10 @@ view! {
 }
 ```
 
-`src` names a local file. zgui decodes PNG, JPEG, WebP, and GIF data off the UI thread. The decoded
-pixel dimensions become the natural size in CSS pixels. CSS can override that size, and the image
-scales to the full content box. A reactive `src` closure changes the picture.
+`src` names a local file. zgui probes and decodes PNG, JPEG, WebP, and GIF data off the UI thread.
+The source pixel dimensions become the natural size in CSS pixels. CSS can override that size.
+`object-fit` and `object-position` control how the picture meets the resulting content box. A
+reactive `src` closure changes the picture.
 
 `alt` remains an ordinary attribute. Use `a11y:label` for an accessible name.
 [Images](/docs/building/images) covers file and memory sources, decode limits, and caching.
@@ -393,6 +394,9 @@ thread or cadence. CSS supplies the final box and applies clipping, transforms, 
 
 Use `box` for a card, sheet, dialog, or menu body. [GPU surfaces](/docs/advanced/surfaces) covers the
 two rendering models and texture lifetime.
+
+`image` and `surface` are the only replaced element tags. Their children are never laid out or
+painted. Every other element tag, including `canvas` and `vector`, keeps its children in layout.
 
 ### `overlay_root`
 

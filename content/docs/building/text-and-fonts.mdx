@@ -356,8 +356,8 @@ cascaded after it never disagree about how tall an `ex` is.
 ## What re-shapes and what does not
 
 A shaped paragraph is cached under a key built from the string, the ordered runs and their shaping
-styles, the base direction and the device scale. Anything in that key changes the key, and a changed
-key is a fresh shape.
+styles, the base direction, the device scale, and the widths of atomic inline boxes on its lines.
+Anything in that key changes the key, and a changed key is a fresh shape.
 
 | Change | Cost |
 |---|---|
@@ -367,6 +367,7 @@ key is a fresh shape.
 | `line-height`, `letter-spacing`, `word-spacing` | reshape |
 | `word-break`, `white-space-collapse`, `text-transform`, `direction` | reshape |
 | the window moving to a display with a different scale factor | reshape |
+| an atomic inline box changing width | reshape; a previous width can reuse its cached shape |
 | **the width the paragraph is given** | rebreak |
 | `text-align`, `text-indent`, `overflow-wrap`, `text-wrap-mode`, `text-overflow` | rebreak or update the overflow mark; no reshape of the source paragraph |
 | `vertical-align` on something inline | rebreak |

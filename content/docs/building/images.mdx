@@ -31,9 +31,10 @@ view! {
 }
 ```
 
-`src` is a local path, not an HTTP URL. Decode work runs off the UI thread. The element is blank
-until decoding finishes. The completed decode wakes the frame loop and updates layout if the
-natural size changed.
+`src` is a local path, not an HTTP URL. zgui first reads the image header to get the natural size.
+It does not decode pixels for this step. After layout gives the element a content box, zgui decodes
+a suitable resolution off the UI thread. Each completion wakes the frame loop. The image can get
+its natural size before its pixels are ready.
 
 The source can be reactive:
 
@@ -68,9 +69,9 @@ last `ImageBytes` clone unregisters the data. A later decode of that URL then fa
 
 ## Sizing
 
-After decode, the pixel dimensions become the natural size in CSS pixels. A 640 by 480 file has a
-natural size of 640 by 480 CSS pixels and a 4:3 natural ratio. The natural size does not change
-with the window scale factor.
+The source pixel dimensions are the natural size in CSS pixels. A 640 by 480 file has a natural
+size of 640 by 480 CSS pixels and a 4:3 natural ratio. The natural size does not change with the
+window scale factor or with the resolution that zgui decodes for display.
 
 CSS still has final control:
 
@@ -78,24 +79,55 @@ CSS still has final control:
 .preview { width: 100%; aspect-ratio: 16 / 9; }
 ```
 
-The image scales to the full content box. `object-fit` and `object-position` do not change this
-placement. Use a box with a suitable aspect ratio when the source must not be distorted. Rounded
-corners and `overflow` clip the pixels with the element.
+Use `object-fit` to control how the picture meets its content box. Its initial value is `fill`.
 
-Before decode, an image has no natural width or height. Give layout an explicit size when a late
-size change is not acceptable.
+```css
+.avatar  { width: 96px; height: 96px; object-fit: cover; }
+.preview { width: 480px; height: 320px; object-fit: contain; }
+.stamp   { width: 160px; height: 120px; object-fit: none; object-position: 100% 0%; }
+```
 
-## Decode limits and cache sharing
+| Value | Result |
+|---|---|
+| `fill` | Stretches the picture to the box. The aspect ratio can change. |
+| `contain` | Preserves the ratio and fits the whole picture in the box. |
+| `cover` | Preserves the ratio and fills the box. The box clips the excess. |
+| `none` | Uses the natural size. The box can clip the picture. |
+| `scale-down` | Uses the smaller result of `none` and `contain`. |
 
-The standard app limits each decoded dimension to 4094 pixels so that the padded tile fits the
-4096-pixel atlas limit. It scales a larger image down proportionally with a Lanczos filter. It does
-not reject the image only because it is large. Code that calls `zgui_image::decode` directly chooses
-`Limits`; its default maximum dimension is 2048 pixels.
+`object-position` places a fitted picture in the space that remains. Its initial value is
+`50% 50%`. Percentages and lengths are supported. Rounded corners and the element's content frame
+clip the fitted picture. A `contain` letterbox shows the element background.
 
-The cache key is the source string. Elements with the same source share one decode, one byte
-buffer, and one atlas tile. Visible images keep their decoded bytes. The memory budget can discard
-decoded data that no element shows. zgui decodes it again when it is needed. The known natural
-size remains, so cache eviction does not cause layout movement.
+Before the header probe finishes, an image has no natural width or height. Give layout an explicit
+size when a late size change is not acceptable.
+
+## Display-sized decoding and cache sharing
+
+zgui measures the laid-out content box in device pixels and decodes for that demand. A thumbnail
+does not keep the source-resolution pixels in memory. The fit mode is part of the demand:
+`fill`, `contain`, and `scale-down` need no more detail than the box; `cover` includes the part of
+the scaled picture that the box clips; and `none` requests the source at the display scale.
+
+The loader rounds the long edge up through size classes: 64, 128, 256, 512, 1024, and 2048 device
+pixels. This prevents a one-pixel layout change from starting another decode. A demand above the
+ladder uses the source size, up to the GPU device's texture limit. The decoder never upscales past
+the source resolution.
+
+The source string identifies an image. Elements with the same source share the best sufficient
+decoded variant and its texture tile. A larger use can add a larger size-class variant; it does not
+decode once per element. While that decode runs, zgui continues to draw the best smaller variant.
+
+Variants up to a 512-pixel long edge share filtered atlas textures. Larger variants get a texture
+with mip levels, which keeps minification smooth. After an upload, zgui releases large decoded host
+buffers. It keeps small buffers of at most 64 KiB because they are cheap to retain. If eviction or
+device loss removes a tile whose host buffer was released, zgui decodes that variant again.
+
+The memory budget removes unused variants before active ones and removes unused sources from the
+coldest to the newest. The probed natural size remains, so cache eviction does not change layout.
+
+Code that calls `zgui_image::decode` or `decode_scaled` directly chooses `Limits`; its default
+maximum dimension is 2048 pixels. The standard app instead uses the current GPU device limit.
 
 Decoded texels are premultiplied, gamma-encoded sRGB RGBA. They are tightly packed, with the top
 row first. This detail matters only to code that works with `zgui-image` directly.

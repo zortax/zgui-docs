@@ -221,6 +221,7 @@ impl ClipTable {
     pub fn resolve(&self, id: ClipId) -> ResolvedClip;
     pub fn needs_group_target(&self, id: ClipId) -> bool;   // rounded > 2 || masks > 1
     pub fn bounds(&self, id: ClipId) -> Rect<DevicePx, Device>;
+    pub fn bounds_in(&self, id: ClipId, space: u32) -> Rect<DevicePx, Device>;
     pub fn residual(&mut self, id: ClipId, ancestor: ClipId) -> ClipId;
 }
 ```
@@ -230,13 +231,18 @@ impl ClipTable {
 overflows that budget is **not** silently dropped: `needs_group_target` reports it, and the caller
 must ask. Applying two of three rounded tests is a wrong pixel with no error attached to it.
 
-`ClipTable::bounds` is also the cull rectangle. `Scene::push_*` intersects a primitive's ink with it
-before anything else happens:
+`Scene::push_*` culls with `ClipTable::bounds_in`. It intersects only clip links measured in the
+same coordinate system as the primitive's ink:
 
 ```rust
 // crates/zgui-scene/src/scene/insert.rs
-fn assign_order(&mut self, ink: Rect<DevicePx, Device>, clip: ClipId) -> Option<DrawOrder> {
-    let admitted = self.clips.bounds(clip);
+fn assign_order(
+    &mut self,
+    ink: Rect<DevicePx, Device>,
+    clip: ClipId,
+    space: u32,
+) -> Option<DrawOrder> {
+    let admitted = self.clips.bounds_in(clip, space);
     let Some(clipped) = ink.intersection(admitted) else {
         counter::bump(Counter::PrimitivesCulled);
         self.note_unreplayable();
@@ -249,6 +255,11 @@ fn assign_order(&mut self, ink: Rect<DevicePx, Device>, clip: ClipId) -> Option<
 A row of a thousand-row list that has scrolled out of its port never reaches an array, never enters
 the bounds tree and never reaches the operation log. `push_*` returns `None` and the caller counts
 one culled primitive.
+
+A clip measured in another coordinate system cannot be compared with this local ink. The cull
+leaves that link for the shader, which resolves the complete chain through the frame's matrices.
+This admits some primitives that the shader later clips, but it does not incorrectly remove content
+that a transform moved into view.
 
 ## Coordinate systems
 
@@ -435,7 +446,7 @@ So the test is intersection, at three places:
 |---|---|---|
 | `Visitor::enter` | The union of the subtree's ink, plus caret and selection marks | A whole subtree, in constant time. This is what makes a hover on a thousand-row table cost the rows near the pointer. |
 | `Painter::paint` | One fragment's `cull_rect`, which is its ink unioned with any read extent, plus marks | One fragment, while its children are still visited — a child can paint outside its parent. |
-| `Scene::push_*` | The primitive's ink against `clips.bounds(clip)` | One primitive that its own clip chain admits nothing of. |
+| `Scene::push_*` | The primitive's ink against clip links measured in the same coordinate system | One primitive that its local clip bounds admit nothing of. |
 
 ```rust
 // crates/zgui-paint/src/walk/mod.rs

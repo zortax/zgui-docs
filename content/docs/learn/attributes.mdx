@@ -206,7 +206,8 @@ view! {
 
 The name **must** start with `--`. Writing `var:brand` is a compile error that tells you to write
 `var:--brand`. The `--` is stripped when the name is stored, so a sheet saying `var(--brand)` finds
-what the view wrote. Reactive, and takes `Option<String>`.
+what the view wrote. The same normalization applies on a component call: `var:--brand` can enter an
+`Attrs` bundle and reach the element that spreads the bundle. Reactive, and takes `Option<String>`.
 
 Custom properties inherit, so setting one on a container reaches every descendant. That makes them
 the mechanism behind themes — see [Theming](/docs/building/theming).

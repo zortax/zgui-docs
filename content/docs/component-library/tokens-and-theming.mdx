@@ -1,6 +1,6 @@
 ---
 title: Tokens and theming
-description: zgui-ui-tokens — the 121 design tokens, the light and dark theme model, which selector carries them, and what switching a theme costs.
+description: zgui-ui-tokens — the 127 design tokens, the light and dark theme model, which selector carries them, and what switching a theme costs.
 ---
 
 `zgui-ui-tokens` is the crate the rest of the component library is coloured, spaced and paced from.
@@ -32,14 +32,14 @@ public API. The manifest states the reason.
 zgui = { path = "../zgui", version = "0.1.0" }
 ```
 
-Seven groups, 121 properties. Each group is a Rust struct whose fields are `String`, because a token
+Seven groups, 127 properties. Each group is a Rust struct whose fields are `String`, because a token
 *is* a CSS value: anything the style engine parses is expressible without the crate knowing about
 it.
 
 | Group | Type | Prefix | Tokens |
 |---|---|---|---:|
 | the two ramps | `ScaleTokens` | `--zui-scale-` | 24 |
-| semantic colour | `ColorTokens` | `--zui-color-` | 34 |
+| semantic colour | `ColorTokens` | `--zui-color-` | 40 |
 | spacing | `SpacingTokens` | `--zui-space-` | 8 |
 | corner radii | `RadiusTokens` | `--zui-radius-` | 10 |
 | type | `TypeTokens` | `--zui-type-` | 26 |
@@ -49,7 +49,7 @@ it.
 Every group carries the same four items: `PROPERTIES`, the custom property each field lowers to, in
 field order; `light()` and `dark()`, the two default sets; `declare()`, which writes the group out as
 declarations; and `pairs()`, which returns it as `(property, value)` pairs. `Theme::properties()`
-returns all 121 names in write order, and is what an application checks its own overrides against.
+returns all 127 names in write order, and is what an application checks its own overrides against.
 
 ## The tokens
 
@@ -107,12 +107,12 @@ intended colour, which is the one thing a design system cannot ship. Every value
 | Token | light | dark |
 |---|---|---|
 | `--zui-color-background` | `oklch(1 0 0)` | `oklch(0.145 0 0)` |
-| `--zui-color-foreground` | `oklch(0% 0 0)` | `oklch(0.985 0 0)` |
+| `--zui-color-foreground` | `oklch(0.145 0 0)` | `oklch(0.985 0 0)` |
 | `--zui-color-card` | `oklch(1 0 0)` | `oklch(0.205 0 0)` |
-| `--zui-color-card-foreground` | `oklch(0% 0 0)` | `oklch(0.985 0 0)` |
+| `--zui-color-card-foreground` | `oklch(0.145 0 0)` | `oklch(0.985 0 0)` |
 | `--zui-color-popover` | `oklch(1 0 0)` | `oklch(0.205 0 0)` |
-| `--zui-color-popover-foreground` | `oklch(0% 0 0)` | `oklch(0.985 0 0)` |
-| `--zui-color-primary` | `oklch(0% 0 0)` | `oklch(0.922 0 0)` |
+| `--zui-color-popover-foreground` | `oklch(0.145 0 0)` | `oklch(0.985 0 0)` |
+| `--zui-color-primary` | `oklch(0.205 0 0)` | `oklch(0.922 0 0)` |
 | `--zui-color-primary-foreground` | `oklch(0.985 0 0)` | `oklch(0.205 0 0)` |
 | `--zui-color-secondary` | `oklch(0.97 0 0)` | `oklch(0.269 0 0)` |
 | `--zui-color-secondary-foreground` | `oklch(0.205 0 0)` | `oklch(0.985 0 0)` |
@@ -123,11 +123,17 @@ intended colour, which is the one thing a design system cannot ship. Every value
 | `--zui-color-destructive` | `oklch(0.577 0.245 27.325)` | `oklch(0.704 0.191 22.216)` |
 | `--zui-color-destructive-foreground` | `oklch(0.97 0.01 17)` | `oklch(0.58 0.22 27)` |
 | `--zui-color-danger` | `var(--zui-color-destructive)` | same |
+| `--zui-color-success` | `oklch(0.627 0.194 149.214)` | `oklch(0.723 0.219 149.579)` |
+| `--zui-color-success-foreground` | `oklch(0.982 0.018 155.826)` | `oklch(0.266 0.065 152.934)` |
+| `--zui-color-warning` | `oklch(0.769 0.188 70.08)` | `oklch(0.828 0.189 84.429)` |
+| `--zui-color-warning-foreground` | `oklch(0.279 0.077 45.635)` | same |
+| `--zui-color-info` | `oklch(0.546 0.245 262.881)` | `oklch(0.707 0.165 254.624)` |
+| `--zui-color-info-foreground` | `oklch(0.97 0.014 254.604)` | `oklch(0.282 0.091 267.935)` |
 | `--zui-color-border` | `oklch(0.922 0 0)` | `oklch(1 0 0 / 10%)` |
 | `--zui-color-input` | `oklch(0.922 0 0)` | `oklch(1 0 0 / 15%)` |
 | `--zui-color-ring` | `oklch(0.708 0 0)` | `oklch(0.556 0 0)` |
 | `--zui-color-scrim` | `oklch(0 0 0 / 50%)` | same |
-| `--zui-color-chart-1` … `-5` | `oklch(0.809 0.105 251.813)`, `oklch(0.623 0.214 259.815)`, `oklch(0.546 0.245 262.881)`, `oklch(0.488 0.243 264.376)`, `oklch(0.424 0.199 265.638)` | the same five |
+| `--zui-color-chart-1` … `-5` | `oklch(0.87 0 0)`, `oklch(0.556 0 0)`, `oklch(0.439 0 0)`, `oklch(0.371 0 0)`, `oklch(0.269 0 0)` | the same five |
 | `--zui-color-sidebar`, `-foreground`, `-primary`, `-primary-foreground`, `-accent`, `-accent-foreground`, `-border`, `-ring` | a palette of its own for the sidebar | its own dark set |
 
 Three tests hold the shape. `--zui-color-danger` is the **only** value written as a `var()`, and it
@@ -135,6 +141,10 @@ aliases `--zui-color-destructive` so that a message can be made redder than the 
 touching the button. A chart series keeps its colour when the scheme flips, because a series is
 identified by its colour across a legend, a tooltip and a printout. The sidebar carries eight tokens
 of its own, because it sits beside the page rather than on it.
+
+`destructive`, `success`, `warning`, and `info` are semantic tones. Each tone has a foreground for
+text placed on its fill. They are independent of the five tint tokens, so a brand override does not
+turn a warning or a success mark into the brand colour. Toast icons use these tones.
 
 Five tokens are the whole tint of an interface: `primary` and its foreground are every solid call to
 action, `accent` and its foreground are every hovered row and highlighted menu item, and `ring` is
@@ -567,7 +577,7 @@ sets. What the crate adds over it:
 
 | What the crate adds | What it buys |
 |---|---|
-| 121 named decisions | a component names a decision instead of a colour |
+| 127 named decisions | a component names a decision instead of a colour |
 | an ordinal per provider | a nested provider themes a region and leaves `:root` alone |
 | a `Store` per group | a reader of the motion tokens is not woken by a colour change |
 | `System` as a media query | the desktop decides, with no signal and nothing to keep in step |
