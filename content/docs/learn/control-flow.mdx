@@ -102,8 +102,14 @@ Three parts, in this order:
 ### Why the key is required
 
 When the collection changes, the list compares the new keys with the old ones and works out what
-happened: which rows are new, which are gone, which moved. Rows that are still there are **moved**,
-not rebuilt — they keep their nodes, their signals and their scroll positions.
+happened: which rows are new, which are gone, and which moved. A surviving key keeps its row and
+node identity. zgui moves that row instead of unmounting it, so element state such as its scroll
+position stays with the key.
+
+The row builder still runs again for each surviving key. zgui first disposes the previous row run,
+then rebuilds the row in its existing place. This makes captured item data current even when the
+key did not change. Reactive state that must survive collection reconciliation should belong to
+the item or to a scope outside the row builder.
 
 Without a key the list would have to fall back on position, and inserting one row at the top would
 rewrite every row below it.
@@ -123,7 +129,8 @@ behaviour the key exists to avoid.
 
 ### Rows own their own state
 
-Each row gets its own scope. A signal created inside a row is disposed of when that row is removed.
+Each row gets its own scope. A signal created during a row build is disposed when the row is
+rebuilt or removed.
 
 This is why the common shape for a list is a collection of items where each item owns the signal
 for the part of it that changes:

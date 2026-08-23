@@ -178,7 +178,7 @@ canvas                       { width: 300px; height: 150px; }
 scroll                       { display: block; overflow: auto; }
 spacer                       { display: block; flex: 1 1 auto; }
 
-overlay_root                        { display: block; position: fixed; inset: 0;
+overlay_root                        { display: block; position: fixed; inset: 0; z-index: 1000;
                                       pointer-events: none; }
 overlay_root > [data-layer]         { position: absolute; inset: 0; pointer-events: none; }
 overlay_root > [data-layer] > *     { pointer-events: auto; }
@@ -199,6 +199,9 @@ Three consequences worth stating:
   same specificity, because the author origin beats the user-agent origin.
 - **No markup language's defaults are inherited.** A `row` is a horizontal flex container because
   this sheet says so, and for no other reason.
+- **Overlay bands use their own stacking context.** The root's `z-index: 1000` keeps their internal
+  values from competing with ordinary application chrome. An author rule can still place a
+  deliberate surface above the overlay root with a higher value.
 - **`--zgui-foreground`, `--zgui-ring`, `--zgui-selection` and `--zgui-selection-text` are
   referenced and not defined.** A theme defines them. A document with no theme has no ring colour
   rather than a wrong one.

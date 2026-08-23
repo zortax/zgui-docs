@@ -101,7 +101,8 @@ those operations must remain balanced with the surrounding scene. Put an inner c
 `overflow: hidden` when it needs an additional clip.
 
 Custom primitives paint after the element's background and border and before its descendants.
-zgui records them. It replays an unchanged custom element without calling `paint` again.
+zgui records them in the fragment's retained paint chunk. It replays an unchanged custom element
+without calling `paint` again, including after frames in which the fragment was not visited.
 
 ## Shape and draw glyph runs
 
@@ -170,8 +171,12 @@ handle.repaint();
 - Call `repaint` when only emitted primitives changed.
 - Call `relayout` when the content size or child placement can change. `relayout` also repaints.
 
+Both operations advance the custom element's revision. The revision is part of the paint-record
+signature, so a repaint cannot replay primitives from before the update.
+
 The handle is cloneable, but it is UI-thread state. `layout` and `paint` also run on the UI thread
-during a frame. Do not block in either method and do not mutate the document from them.
+during a frame. Installing a custom layout source keeps layout serial because this trait has no
+`Sync` contract. Do not block in either method and do not mutate the document from them.
 
 The standard `zgui::app()` wiring installs the custom layout and paint sources. Code that drives
 `zgui_runtime::App` directly must install `zgui_custom::sources()` with `App::with_custom`.

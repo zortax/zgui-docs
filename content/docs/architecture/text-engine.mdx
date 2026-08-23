@@ -405,6 +405,14 @@ own, so re-theming must not produce a different key.
 `ParagraphCache::insert` takes the key off the value rather than as an argument, so a caller cannot
 file a paragraph under a key that does not describe it.
 
+Before layout, the runtime collects dirty plain-text paragraphs with no inline boxes. It flattens
+them on the frame thread so brush-slot assignment remains deterministic, then shapes them on the
+layout pool. Each worker keeps a forked shaper and scratch storage across frames. The completed
+paragraphs return in request order and enter the same cache as serial shaping.
+
+Paragraphs with atomic inline content are not pre-shaped. Their text depends on inline geometry,
+so their owning layout worker shapes them after that geometry is known.
+
 Hashing a large string is also proportional to its byte length. The flattened `Generated` value
 therefore keeps the stable `ContentKey` in a `OnceLock`. Layout folds in the current atomic-inline
 widths for each measurement. It does not hash the string again. `shape_keyed` passes the complete

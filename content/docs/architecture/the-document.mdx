@@ -615,7 +615,7 @@ Every window has six nodes before a single view is built, created in
           children: [
             {
               title: 'overlay_root',
-              code: 'position: fixed; inset: 0',
+              code: 'position: fixed; inset: 0; z-index: 1000',
               children: [
                 { title: 'content', code: 'data-layer=content · z-index: 10' },
                 { title: 'popover', code: 'data-layer=popover · z-index: 20' },
@@ -634,6 +634,10 @@ They exist up front rather than on demand because the framework's own style shee
 exactly this shape (`crates/zgui-style/src/sheets/ua.rs`). A layer created when its first portal
 appeared would order the bands by whichever opened first, so a toast raised before a dialog would
 paint beneath it.
+
+The overlay root establishes one stacking context at `z-index: 1000`. The four band values order
+content inside it; they do not compete with application chrome outside it. An application can use
+a higher author `z-index` when a surface must intentionally cover all overlays.
 
 `OverlayLayer` is an ordered enum and its declared order is the paint order, asserted in
 `crates/zgui-view/src/dom/overlay.rs`. `OverlayLayer::Popover` is the default.

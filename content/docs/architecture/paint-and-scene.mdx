@@ -350,6 +350,11 @@ The enter-and-leave shape exists for two reasons. A group must be opened before 
 closed after it. And an outline must be drawn after the descendants it sits over — Appendix E's step
 ten — which is why the outline is emitted in `leave` and not beside the background.
 
+A subtree whose folded opacity is zero is refused before either stack is pushed. No descendant can
+change a pixel, so paint skips its style lookups, ink tests, and child walk as well as its
+primitives. Fully transparent vector items and singular transformed vector subtrees are also
+removed before vector pass planning.
+
 ### What one fragment emits, in order
 
 Stated once, in `crates/zgui-paint/src/walk/order.rs`:
@@ -519,27 +524,27 @@ proportional to what a frame emits, never to the size of the document.
 
 ## Recording and replay
 
-The second memoisation is per fragment. A fragment records the range of the scene's operation log
-its primitives occupied, and next frame an unchanged fragment **replays** that range instead of
-being encoded again.
+The second memoisation is per fragment. A paint record owns an `Arc<ChunkPrims>`: a complete,
+rebased copy of the primitives that fragment encoded. It does not point into a previous frame. The
+scene has no retained previous-frame operation log.
 
-```rust
-// crates/zgui-scene/src/ops/
-pub struct PaintOp { pub kind: PrimitiveKind, pub index: u32 }
-```
+The capture happens before clip culling and draw-order insertion. Replay therefore starts with the
+complete painting and pushes it through the current frame's ordinary clip, cull, and ordering
+path. A fragment can stay replayable while it is outside a scrollport, then reappear without a
+special partial-record rule.
 
-`Scene::begin_frame` swaps `primitives`, the log and the recorded names with their retained copies
-and clears the new ones. The previous frame is still there to be copied from. **The side tables are
-not cleared** — and that is forced, not tidy. A replayed range carries *last* frame's clip, paint
-and transform indices, so per-frame tables would draw one fragment with another fragment's paint.
-That is why `Table<K, V>` interns by content and keeps ids stable across frames, evicting only the
-coldest generation of untouched, unreferenced entries.
+The record stays with the fragment across frames, including frames that do not visit it. Layout
+reports fragment retirement explicitly. A generational fragment key prevents a retired record from
+being assigned to a later fragment that reuses its arena slot.
 
 Clip and paint tables also keep a bounded journal of changed slots. A renderer holds a
 `TableVersion` and asks for changes since that version without draining the journal. If the version
 is older than the journal, the answer is `ChangeCoverage::All`; otherwise it is the exact slot list.
 The wgpu backend uses this to keep its flattened CPU tables and device buffers across frames.
 Stable scene identifiers therefore provide both replay correctness and incremental GPU updates.
+
+The record owns the holds for every clip, paint, coordinate-system entry, and atlas tile that its
+chunk names. These resources remain valid until the record is retired or evicted.
 
 ### What makes a recording reusable
 
@@ -548,43 +553,24 @@ Stable scene identifiers therefore provide both replay correctness and increment
 pub enum Reuse { Encode, Replay(Size<DevicePx, Device>) }
 
 pub struct Record {
-    pub ops: Range<u32>,
+    pub prims: Arc<ChunkPrims>,
+    pub revision: u64,
     pub kind: FragmentKind,
     pub painted: Painted,
     pub border_box: Rect<DevicePx, Device>,
-    pub whole: bool,
     pub clip_hash: Option<u64>,
-    pub transform_hash: Option<u64>,
+    pub last_selected: u64,
     pub resources: Vec<AtlasKey>,
 }
-
-pub fn reuse(&self, scene: &Scene, fragment: &Fragment, painted: Painted) -> Reuse;
 ```
 
-`reuse` returns `Encode` unless **all** of these hold:
+`revision` is unique for each encoding. It gives a persistent GPU copy an identity that changes
+when the fragment re-encodes. A replay offset is always measured from the recorded `border_box`.
+The record does not move its origin after replay, so repeated movements cannot accumulate an error
+from the most recent selection.
 
-1. a record exists for the fragment's key;
-2. `record.painted == painted`;
-3. `record.kind == fragment.kind`;
-4. the kind is replayable — that is, not `FragmentKind::Vector`;
-5. `record.border_box.size == fragment.border_box.size`;
-6. `record.ops.end as usize <= scene.retained_ops()`;
-7. and, if `record.whole` is false, the fragment's ink does not intersect
-   `scene.clips.bounds(clip)`.
-
-Then the answer is `Reuse::Replay(delta)`, where the delta is the difference between the two
-border-box origins. **A zero delta is still a replay.** What replay saves is the encoding, not the
-movement.
-
-Condition 7 is the one worth reading twice. `whole` says whether replaying the range would draw what
-the encoding drew. It is false when the encoding pushed something the log cannot reproduce: a
-primitive a clip refused, or a vector item. A row far below a scroll port paints nothing wherever it
-is put, so the empty range **is** the whole of its painting down there, and a thousand such rows
-replay a thousand empty ranges. What must not happen is replaying that emptiness the moment any part
-of the row reaches the edge of the port. Condition 7 is exactly that test.
-
-The caller answers `whole` by reading `Scene::unreplayable()` either side of the encoding. That
-counter is monotonic across frames and counts both cases, in the one place either is known.
+A vector item can replay when its encoded device-space curves did not move. Movement re-encodes the
+item; an unchanged drawing does not enter the vector encoder again.
 
 ### What invalidates a recording
 
@@ -597,6 +583,9 @@ pub struct Painted {
     pub clip: ClipId,
     pub transform: SpatialId,
     pub transform_hash: u64,
+    pub custom: u64,
+    pub content: u64,
+    pub scale: u32,
     pub decorations: u64,
     pub text_fill: u64,
     pub anim: u64,
@@ -608,40 +597,45 @@ pub struct Painted {
 | Field | The bug it prevents |
 |---|---|
 | `transform_hash` | The `SpatialId` is the same name on the first frame of a movement and the last. Without the hash of the matrix it resolved to, nothing moves. |
+| `custom` | A custom element changed its primitives without changing its node or geometry. |
+| `content` | An image source or vector source changed behind a stable node identity. |
+| `scale` | Device-scale-dependent bytes replay after a display-scale change. |
 | `decorations` | Text decorations come from boxes *above* the fragment. Without this, changing `text-decoration` on a paragraph replays every line inside it unchanged. |
 | `text_fill` | Same route: the ramp painting a heading's letters is declared on the heading, and the line boxes belong to an anonymous box under it. |
 | `anim` | A lowered style is shared and does not move while an animation runs. Without this, the first frame of every animation is replayed for the animation's whole length. |
 | `alpha` | An ancestor's folded opacity. Without this, a panel fading out is a panel whose contents never fade. |
 | `highlights` | A blinking caret moves nothing else about a line. Without this, the caret freezes in whichever phase it was first encoded in. |
 
-`Record::resources` is how a replayed range keeps its atlas tiles alive. A replay re-emits instances
+`Record::resources` is how a replayed chunk keeps its atlas tiles alive. A replay re-emits instances
 that already carry their texture rectangle, so nothing on that path consults the glyph cache. The
 keys are **distinct**, each held once: a hold that counted repetitions would need exactly as many
 releases, and one miscount is either a tile that can never be freed or one freed while it is being
-drawn. `PaintCache::end_frame` drops the record of every fragment the frame did not visit and
-releases what it held.
+drawn.
+
+The cache has a 64 MiB soft budget. Chunks selected in the current frame are pinned. Budget
+enforcement evicts the coldest other records by `last_selected`. The composed target keeps its
+existing pixels; the next damaged visit re-encodes the missing chunk.
 
 ### What replay does
 
 ```rust
-pub fn replay(&mut self, range: Range<u32>, by: Size<DevicePx, Device>) -> Range<u32>;
+pub fn replay(&mut self, chunk: &ChunkPrims, by: Size<DevicePx, Device>);
 ```
 
 - **Draw order is not replayed.** Every re-emitted primitive goes through the ordinary push path, so
   it is ordered against *this* frame's neighbours. Order depends on what else is on the surface, and
   carrying a stale one forward would put a row underneath something newly drawn over it.
-- Group markers and vector items are skipped. A marker's order comes from a barrier; vector content
-  is planned into passes rather than emitted as instances.
-- Bounds are translated by `by`. Shadows translate their `element_bounds` as well; backdrops
-  translate both `bounds` and `source`.
-- An out-of-bounds range replays nothing, which is the right answer for a cache naming a frame that
-  no longer exists.
+- Bounds are translated by `by`. Shadows translate their `element_bounds`; backdrops translate
+  both `bounds` and `source`.
+- Vector items replay at zero offset. A moved vector is re-encoded because its curves are already
+  in device coordinates.
 
 ## Batching
 
 `Scene::finish(&damage)` closes the frame in two steps.
 
-**Sort and remap.** Every array is sorted by `(order, tie1, tie2)`:
+**Sort the remap.** Primitive arrays stay in insertion order. The scene sorts one remap list per
+primitive kind by `(order, tie1, tie2)`:
 
 | Arrays | Sort key |
 |---|---|
@@ -652,9 +646,7 @@ pub fn replay(&mut self, range: Range<u32>, by: Size<DevicePx, Device>) -> Range
 
 The sprite tie-break is free, because equal order already implies no overlap. Spending it on
 clustering by texture is what lets a batch run until the texture genuinely changes. Group start and
-end at the same order — a degenerate empty group — must come out in that sequence. The operation
-log's `index` fields are then rewritten through the permutation, so a recorded range stays
-meaningful after the sort.
+end at the same order — a degenerate empty group — must come out in that sequence.
 
 **Plan the vector passes**, which the next section covers.
 
@@ -676,8 +668,9 @@ pub enum Batch {
 }
 ```
 
-A batch is always a **contiguous range of one array**, which is what makes it a memory copy into an
-instance buffer rather than a gather. The iterator merges the eleven kinds by
+A batch is a contiguous range of **sorted remap positions**. The six instanced pipelines resolve
+those positions to entries in their persistent GPU arenas; the source array itself is not sorted.
+The iterator merges the eleven kinds by
 `(DrawOrder, PrimitiveKind)` and yields the longest run it can take from one of them before another
 kind's next primitive would have to come first. Finding the two lowest waiting keys is a scan and
 not a sort: eleven candidates is small enough that one pass beats sorting, and the second lowest is
@@ -700,11 +693,13 @@ entry point, submits a command encoder of its own, and clears everything it is p
 batch of paths is rasterised into a scratch texture, and one ordinary draw composites the scratch
 back at exactly the right point in the batch stream.
 
-Small solid paths can avoid this pass plan. When a path has no local clip, has one solid fill or
-stroke, uses a translation-only transform, and fits within 96 by 96 device pixels, paint rasterizes
-one monochrome coverage mask into the shared atlas and emits a `MonoSprite`. Colour and integer
-translation are not part of the mask identity. A recoloured or moved icon can therefore reuse the
-same tile. All other paths enter the pass plan below.
+Small solid paths can avoid this pass plan. An eligible fill or stroke has no local clip and its
+coverage mask uses at most 64 KiB of texels, with width at most 1024 and height at most 256. Paint
+rasterizes one monochrome mask into the shared atlas and emits a `MonoSprite`. The mask identity
+excludes colour, translation, mirrors, and quarter turns. It includes the raster density needed for
+scale. A recoloured, moved, mirrored, or quarter-turned icon can therefore reuse a tile; a new scale
+rasterizes only when the required density changes. Arbitrary rotations and shears use the general
+path, as does a non-uniformly scaled stroke.
 
 **Where those points are is decided in `zgui-scene`, never behind the rasteriser.** It is a pure
 function of the display list, the bounds tree and the damage set, so a pass count is an assertion

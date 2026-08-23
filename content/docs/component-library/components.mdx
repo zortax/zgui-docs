@@ -213,7 +213,7 @@ numbers and which gaps to draw. `Slot` is `Page(usize)` or `Gap`.
 | `TableCell` | `index`, `align: CellAlign = Start`, `header: bool = false`, `node_ref` | yes |
 | `DataTable<T, I>` | `rows: Signal<Vec<T>>`, `columns: Vec<Column<T>>`, `row_id: I`, `selectable: bool = false`, `filterable: bool = false`, `row_match: Option<RowMatch<T>>`, `page_size: usize = 0`, `virtualized: bool = false`, `row_size: f32 = 40.0`, `body_height: Option<f32>`, `resizable: bool = true`, `empty: String = "No results."`, `label`, `on_model: Option<UnsyncCallback<DataModel<T>>>`, `node_ref` | — |
 | `ColumnResizer` | `header: NodeRef`, `label: String`, `on_resize: UnsyncCallback<f32>`, `step: f32 = 8.0` | — |
-| `VirtualList<V, F>` | `count: Signal<usize>`, `row_size: f32 = 32.0`, `overscan: usize = 4`, `row: F`, `label`, `node_ref` | — |
+| `VirtualList<V, F>` | `count: Signal<usize>`, `row_size: Signal<f32> = 32.0`, `overscan: usize = 4`, `row: F`, `label`, `node_ref` | — |
 | `Chart` | `series: Signal<Vec<Series>>`, `kind: ChartKind = Bar`, `width: f64 = 480.0`, `height: f64 = 240.0`, `ticks: usize = 5`, `legend: bool = true`, `label`, `node_ref` | — |
 | `Calendar` | `value: Binding<Option<Date>>`, `default_value`, `on_change`, `default_month: Option<Date>`, `today: Option<Date>`, `available: Option<DateFilter>`, `disabled`, `label`, `node_ref` | — |
 | `CalendarDay` | `date: Date`, `in_month: bool`, `today: bool`, `unavailable: bool = false`, `on_choose: UnsyncCallback<Date>` | — |
@@ -225,6 +225,14 @@ selects and virtualises through `DataModel<T>`.
 
 `Column<T>::new(...)` builds a column, with `.sortable_by(…)` and `.sized(track)`. `VirtualList`
 builds only the rows in view plus `overscan` at each edge.
+
+`row_size` is reactive. A plain `f32` makes it constant; a signal updates the row positions and the
+scroll extent together. The declared size must match the row style because the list selects rows
+before it builds them.
+
+The extent is capped at `zgui_ui::virtualize::MAX_EXTENT`, which is 4,000,000 CSS pixels. A longer
+list maps the scrollbar proportionally across all rows. Use `VirtualWindow::offset_of(index)` when
+you scroll a row into view; `index as f32 * row_size` is wrong for a compressed list.
 
 Use `DataModel::set_sort(state)` to restore a saved `SortState` without cycling a header. A state
 with no key restores arrival order. A state that names a missing or unsortable column is refused,
@@ -250,6 +258,48 @@ context and a context only flows down. `use_toaster() -> Option<ToastQueue>` rea
 | `FormItem`, `FormLabel`, `FormDescription` | — | yes |
 | `FormMessage` | `children: Option<Children>` | optional |
 | `FormSubmit` | `variant`, `size`, `disabled`, `node_ref` | yes |
+
+### Settings
+
+| Component | Props | Children |
+|---|---|---|
+| `Settings` | `page: Binding<String>`, `default_page: String = ""`, `on_page_change`, `label`, `node_ref` | yes |
+| `SettingsPages` | `label` | yes |
+| `SettingsPage` | `value: String`, `disabled: Signal<bool> = false` | yes |
+| `SettingsPane` | `value: String`, `keep_mounted: bool = false` | fn |
+| `SettingsGroup`, `SettingsGroupLabel`, `SettingsGroupDescription` | — | yes |
+| `SettingsItem` | `label: String`, `description: Option<String>`, `disabled: Signal<bool> = false`, `control: Option<NodeRef>` | yes |
+
+`Settings` uses the same controlled, two-way, and uncontrolled value protocol as `Tabs`. The page
+list is a vertical tab list. Up and Down wrap; Home and End select an edge; disabled pages are
+skipped. Horizontal arrows remain available to controls in the pane.
+
+```rust
+Settings(default_page = "appearance", label = "Preferences") {
+    SettingsPages {
+        SettingsPage(value = "appearance") {"Appearance"}
+        SettingsPage(value = "terminal") {"Terminal"}
+    }
+    SettingsPane(value = "appearance") {
+        SettingsGroup {
+            SettingsGroupLabel {"Theme"}
+            SettingsItem(label = "Dark mode") {
+                Switch(checked = dark, {..use_settings_item_attrs()})
+            }
+        }
+    }
+}
+```
+
+Each pane element always exists because its page has an accessibility relation to it. By default,
+the pane content exists only while selected. Set `keep_mounted` when hidden content must keep local
+input or scroll state.
+
+Spread `{..use_settings_item_attrs()}` on the child control so its label and description are
+announced. To make a press on the label focus the control, give the same `NodeRef` to
+`SettingsItem(control = ...)` and to the control's `node_ref`. An item-level `disabled` value fades
+the row and blocks its pointer input; also disable the child control so accessibility APIs report
+the same state.
 
 ### The surfaces that take the window over
 

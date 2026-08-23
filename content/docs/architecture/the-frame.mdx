@@ -66,6 +66,7 @@ The names in the first column are the profiling marks the frame emits, which is 
 | `f.gestures` | Advance held contacts | `zgui-input` | pointer contacts, `now` | gesture readings, the long-press moment | no contact is held |
 | `f.reconfigure` | Point the renderer at the surface | `zgui-render` | the **surface's** extent, never the event's | the render target, full damage | no reconfiguration is owed |
 | `f.device` | Rebuild the media device | `zgui-style` | the viewport, scale and colour scheme | the device the cascade matches against | the device did not move |
+| `f.raf` | Run next-frame callbacks | `zgui-runtime`, `zgui-view` | the pending callback batch, the frame timestamp | whatever the callbacks write | no callback is pending |
 | `f.animate` | Move every running animation on | `zgui-anim`, `zgui-style` | the frame's timestamp | animated values, restyle marks, lifecycle events | nothing is running |
 | `f.flush` | Run posted UI closures, then reactive tasks | `zgui-reactive` | the UI queue and ready task set | signals and the document, through the `Dom` seam | called re-entrantly |
 | `f.commands` | Carry out what listeners asked for | `zgui-runtime` | the command queue | focus, selection, pointer capture, sheets | the queue is empty |
@@ -94,7 +95,7 @@ names in parentheses, after the words for the stage:
 | `r.plan` | Plan render passes, targets and per-draw parameter blocks. |
 | `r.encoder` | Create the frame command encoder. |
 | `r.shift` | Copy the valid pixels of an accepted scroll shift through the scratch texture. Present only when a composed scrollport is shifted. |
-| `r.buffers` | Copy changed table ranges and this frame's instances through reusable staging chunks. |
+| `r.buffers` | Update changed table ranges, persistent primitive arenas, transient instances, and remap lists through reusable staging chunks. |
 | `r.record` | Record render passes and draw commands. If the upload belt grew, this mark names how many chunks were allocated. |
 | `acq.in` | Acquire the surface after all scene work has been recorded. |
 | `sub.out` | Finish submission to the device queue. |
@@ -104,6 +105,10 @@ A long `r.tables` interval is CPU preparation. A long `r.buffers` interval with
 `upload_chunks_allocated == 0` contains copying and possible destination-buffer growth, but no
 staging allocation. A non-zero allocation count identifies a larger staging working set or GPU
 backlog that prevented reuse.
+
+`f.raf` drains its pending batch before it calls anything. A callback that requests another frame
+therefore runs in the next frame. A pending batch uses the same display cadence as CSS animation,
+and callbacks run before `f.animate` and `f.flush`, so their writes settle in the frame they receive.
 
 Two of those steps exist for one defect each, and the source says so
 (`crates/zgui-runtime/src/window/frame.rs`):
@@ -289,7 +294,7 @@ because it must not request a normal frame.
 
 | Source | Where it comes from | Dropped while occluded |
 |---|---|---|
-| The next animation tick | `AnimationCadence::due()` | yes |
+| The next animation tick or first pending frame callback | `AnimationCadence::due()` or the callback's registration time | yes |
 | The earliest scheduled callback | `Timers::peek_for(document, now)` | no |
 | The moment a held contact becomes a long press | `Window::gesture_deadline()` | no |
 | The moment a deferred configure becomes worth answering | `ResizePace::due(interval)` | no |
@@ -304,6 +309,10 @@ unrelated wake. The animation's moment comes from the phase the last frame left,
 the frame that last answered a configure, and the blink's from the caret's own origin. The
 maintenance moment is set once, at the end of a normal frame, to two seconds after that frame. A
 later normal frame replaces it.
+
+A starved surface drops animation, frame-callback, and caret deadlines. Its retry deadline remains
+so the runtime can probe the compositor. Timer and gesture deadlines still run; their work settles
+without turning starvation into a continuous sequence of presentation attempts.
 
 When maintenance wins, the runtime releases reproducible renderer and embedded-surface working
 memory without layout, paint, drawing, or presentation. It clears the maintenance deadline when the

@@ -172,7 +172,7 @@ thing it covers is being changed (`CONTRIBUTING.md`).
 | Gate | What it compares | Where the list lives |
 |---|---|---|
 | `cargo xtask skips` | every counter declared `Group::Skip` names a distinct counter of work *performed* and has a non-vacuity assertion in some member's tests | `crates/zgui-profile/src/counter/table.rs`, checked by `xtask/src/ledger/check/skips/` |
-| `cargo xtask budget` | a cache over its soft limit comes back under it within a bounded number of frames without thrashing, and no replayed range names a raster its cache has freed | `xtask/src/budget/subject.rs` |
+| `cargo xtask budget` | a cache over its soft limit comes back under it within a bounded number of frames without thrashing, and no replayed chunk names a raster its cache has freed | `xtask/src/budget/subject.rs` |
 | `cargo xtask cadence` | an animation and the overscroll spring each get exactly one frame per refresh at 60, 75 and 240 Hz | `xtask/src/cadence/subject.rs` |
 | `cargo xtask workloads` | two reference workloads, by same-run ratio; and that every criterion a workload is registered for is still *stated*, so one renamed away cannot leave the gate green | `xtask/src/workloads/subject.rs` |
 | `cargo xtask resize` | the resize slope — microseconds per box across four document sizes — as a ratio of a whole-document content change measured in the same run | `crates/zgui-bench/src/bin/resize-slope/verdict.rs` |
@@ -381,7 +381,7 @@ assert_eq!(moved.get(Counter::GlyphsRasterised), 0);
 `Counters` prints only its non-zero fields, which makes a `Debug` of a delta a readable account of
 what one interaction did. Nothing resets the counters per frame on its own.
 
-Four counters distinguish the spike paths covered by the text and upload caches:
+The following counters distinguish the spike paths covered by the text, paint, and upload caches:
 
 | Counter | Read it as |
 |---|---|
@@ -389,6 +389,11 @@ Four counters distinguish the spike paths covered by the text and upload caches:
 | `GlyphEntriesLive` | Glyph placement records held now. Unlike a delta counter, this is a live gauge set at frame start. |
 | `SideTableSlotsPrepared` | Scene-table slots flattened again on the CPU. Zero means the retained table preparation hit completely. |
 | `UploadChunksAllocated` | Reusable staging chunks that had to grow this frame. Repeated non-zero values indicate GPU backlog or bursts beyond the retained working set. |
+| `PaintChunkBytes` | CPU bytes held by retained fragment paintings. This is a live gauge. |
+| `ChunksRetainedUnvisited` | Records kept even though their fragments were not selected this frame. |
+| `ChunksEvicted` | Paint records removed by the 64 MiB soft budget. |
+| `ChunksResident` | Paint chunks with persistent instanced data on the GPU. This is a live gauge. |
+| `ChunkBytesUploaded` | Primitive-arena and transient primitive bytes copied this frame. A settled zero-offset replay should add zero. |
 
 ### The non-vacuity rule
 

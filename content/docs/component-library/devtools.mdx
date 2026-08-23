@@ -261,7 +261,7 @@ When a frame repeats the last frame, no counter moves. The tab then shows
 | `text_shaped` | Runs of text that were shaped. | A text value changed. |
 | `fragments_diffed` / `fragments_rebuilt` | Fragments compared / computed again. | Content moved. |
 | `repaints` | Fragments painted again instead of replayed. | A colour changed. |
-| `chunks_translated` | Cached ranges of primitives moved by an offset. | The user scrolls. |
+| `chunks_translated` | Cached paint chunks replayed with an offset. | The user scrolls. |
 | `hit_index_rebuilds` | Rebuilds of the hit index. | The user scrolls. This must stay at 0. |
 | `primitives_emitted` / `primitives_culled` | Primitives added to the scene / removed before it. | Each frame. |
 | `glyphs_placed` / `glyphs_rasterised` | Glyphs positioned / made into pixels. | Text is painted again. The second must be 0. |
@@ -392,6 +392,7 @@ the pinned part and the resident part. The bar is red when the cache is above it
 
 | Cache | Unit |
 |---|---|
+| `paint chunks` | bytes |
 | `glyph atlas` | bytes |
 | `decoded images` | bytes |
 | `paragraph shaping` | entries |
@@ -399,8 +400,8 @@ the pinned part and the resident part. The bar is red when the cache is above it
 | `render targets` | bytes |
 
 Each cache carries its own unit. Do not add two caches with different units. Three caches hold
-texture memory. Two caches hold objects, and a value in bytes for those objects is an estimate, not a
-measurement.
+texture memory. Paint chunks count their retained CPU primitive bytes. Two caches hold objects, and
+a byte value for those objects would be an estimate, not a measurement.
 
 A cache above its limit is a cache where eviction is too slow. A cache with **no level** has no limit
 for a reason: either the content cannot be made again, or a lower cache limits it.

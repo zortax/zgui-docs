@@ -21,16 +21,15 @@ of change and is where the interaction numbers live.
 | the glyph cache | tile, placement and extent for one glyph key, absence included | the atlas, plus 4 096 blank answers and 4 096 eviction tombstones |
 | the atlas | rasterised glyphs, pictures, and small vector masks, in textures | 64 MiB, soft |
 | the vector cache | one placed drawing per node | the live nodes; 16 384 entries |
-| per-fragment paint records | the range of the display list one fragment drew | the fragments this frame visited |
-| the scene's retained log | the previous frame's primitives and their order of issue | one frame |
+| per-fragment paint records | the compiled primitives one fragment drew | 64 MiB, soft |
 | the scene's side tables | interned clips, paints and coordinate systems | references and generations |
 | the bounds tree | draw order for this frame's primitives | this frame |
 | the hit index | one entry per fragment, one spatial hierarchy per coordinate system | the fragments |
 | renderer target pool | group targets and scroll-shift scratch | its pool ceiling and idle maintenance |
 | device memory | live renderer allocations and zgui-owned callback-surface textures | pinned; no eviction level |
 
-Six of these are registered with a **budget registry** that reports retained memory and takes
-rebuildable memory back. Four have a soft level. `RenderTargets` manages its own ceiling, and
+Seven of these are registered with a **budget registry** that reports retained memory and takes
+rebuildable memory back. Five have a soft level. `RenderTargets` manages its own ceiling, and
 `DeviceMemory` reports pinned allocations without an eviction level. The rest are bounded by the
 document, by the frame, or by a fixed number of slots.
 
@@ -380,35 +379,40 @@ The colour is not in the placement key. A hover that recolours an icon re-places
 re-reads nothing.
 
 Eligible small solid paths use a second cache. Paint rasterizes one monochrome coverage tile when a
-path has one solid fill or stroke, no local clip, a translation-only transform, and bounds no larger
-than 96 by 96 device pixels. Its mask key excludes colour and integer translation. Recolouring or
-moving the icon reuses the tile when paint encodes the shape again.
+path has one solid fill or stroke, no local clip, and a mask of at most 64 KiB of texels, no wider
+than 1024 and no taller than 256. The key excludes colour, translation, mirrors, and quarter turns;
+it includes the density needed for scale. These changes reuse the tile. A new scale needs a new tile
+only when it needs a different density. Arbitrary rotations, shears, and non-uniformly scaled
+strokes use the general vector path.
 
-Other drawings are encoded into the general vector pass list on every reached frame. Their placed
-curves remain memoized by node, and stable allocation identity lets the rasterizer reuse encoded
-geometry. The renderer shelf-packs disjoint pass regions into compact scratch space, so far-apart
-paths do not reserve the device pixels between them.
+Other drawings use the general vector pass. Their placed curves remain memoized by node, and stable
+allocation identity lets the rasterizer reuse encoded geometry. An unchanged vector item replays
+from its paint record instead of being encoded each frame. A moved item re-encodes because its
+curves are in device coordinates. The renderer shelf-packs disjoint pass regions into compact
+scratch space, so far-apart paths do not reserve the device pixels between them.
 
 ## The per-fragment paint record
 
 A **fragment** is one rectangle of one box after layout, in absolute coordinates. The **display
-list** is the frame's drawing instructions as a value. This cache records the range of the display
-list each fragment produced, so that an unchanged fragment costs a copy instead of an encoding. It
+list** is the frame's drawing instructions as a value. This cache owns a copy of the primitives
+each fragment produced, so that an unchanged fragment costs a replay instead of an encoding. It
 is the cache the whole "what does an unchanged frame cost" story rests on.
 
 | The record | |
 |---|---|
 | Filled by | every fragment the emit walk encodes. |
-| Invalidated by | any of nine compared fields moving, a change of kind or size, a range outside the retained log, and the end of a frame that did not visit the fragment. |
+| Invalidated by | a compared paint input changing, a change of kind or size, explicit fragment retirement, or budget eviction. |
 | A miss costs | encoding that fragment again from its lowered style and geometry. |
-| Bounded by | the fragments this frame visited. |
+| Bounded by | 64 MiB, soft. Records selected this frame are pinned. |
 
 The record lives in the paint stage, not on the fragment. The emit walk is a pure reader of the
 fragment tree — that is what lets the fragment tree have exactly one writer — so the record carries
 enough of the fragment's own state to decide for itself whether it still stands. A record that
 decides for itself cannot be invalidated by the wrong phase, or left valid by a phase that forgot.
 
-The comparison is one `Copy` value of nine fields, and each field exists to stop one defect:
+The comparison is one `Copy` value. In addition to the fields below, it includes the custom-element
+revision, outside-content revision, and device scale. These inputs can change while the fragment's
+node and geometry stay stable.
 
 | Field | Without it |
 |---|---|
@@ -428,7 +432,7 @@ shaping of its characters — so one changed character issues a new identifier w
 exactly where it was. A counter going from `1` to `7` is the whole failure: same width, same line,
 same geometry, and the old digit back on the screen.
 
-### The two replay modes
+### Replay
 
 ```rust
 pub enum Reuse {
@@ -443,59 +447,40 @@ The offset is zero for a fragment that did not move at all, which is the commone
 a replay. What a replay saves is the encoding, not the movement. A scrolled list's rows take the
 same path with a non-zero offset.
 
-Three rules govern replay:
+The record owns an `Arc<ChunkPrims>` captured before clip culling and draw-order insertion. Four
+rules govern replay:
 
 - **Draw order is not replayed.** Every re-emitted primitive goes through the ordinary push path, so
   it is ordered against this frame's neighbours.
-- **Group markers and vector items are skipped**, because a marker's order comes from a barrier and
-  vector content is planned into passes.
-- **A range that is less than the painting is never replayed where the fragment paints anything.**
-  The `whole` bit says whether the range covers the painting. A primitive whose ink misses the clip
-  is refused by the scene rather than logged, so a row below a scroll port records nothing at all —
-  which is exactly what it paints down there, however far it moves, and is why a thousand-row list is
-  not re-encoded for the sake of the two rows arriving.
+- **The capture is complete.** Replay runs through this frame's clip and cull, so a fragment that
+  was outside a scrollport can enter it without re-encoding.
+- **Movement is measured from the encoding.** The record's border-box origin does not move after a
+  replay, so repeated moves do not accumulate error.
+- **A still vector replays.** A moved vector re-encodes because its curves are in device space.
 
-A record takes **one hold on each distinct raster its range draws**. That is what makes eviction
+A record takes **one hold on each distinct raster its chunk draws**. That is what makes eviction
 safe: a replay re-emits instances that already carry a rectangle of a texture and looks nothing up,
 so without the hold, a static label's tiles look exactly like content that left the screen a hundred
 frames ago. Distinct, because a hold that counted repetitions would have to be given back exactly as
 many times, and one miscount is either a tile that can never be freed or one freed while it is being
 drawn.
 
-Counters: `ChunksTranslated` for replays against `ChunksReencoded` and `Repaints` for encodings.
+Records survive unvisited frames and own their side-table and atlas holds. Layout reports retired
+fragment keys. Under memory pressure, the cache evicts the least recently selected records that are
+not part of the current working set. Counters include `ChunksRetainedUnvisited`, `PaintChunkBytes`,
+`ChunksEvicted`, `FragmentsRetired`, `ChunksTranslated`, and `ChunksReencoded`.
 
-## The scene's retained log and side tables
+## The scene's side tables
 
-The scene keeps the previous frame's primitives so that this frame can replay out of them.
-
-```rust
-// Scene::begin_frame, in order.
-core::mem::swap(&mut self.primitives, &mut self.retained);
-core::mem::swap(&mut self.ops, &mut self.retained_ops);
-core::mem::swap(&mut self.spaces, &mut self.retained_spaces);
-```
-
-| The retained log | |
-|---|---|
-| Filled by | last frame's pushes. |
-| Invalidated by | the next `begin_frame`: the log is one frame deep. |
-| A miss costs | encoding, since a record whose range is past the retained log is refused. |
-| Bounded by | one frame's primitives. |
-
-**The side tables are not cleared.** Clips, paints, text paints and coordinate systems are interned:
-the same content returns the same identifier, and an identifier keeps resolving to its content for
-as long as anything refers to it. A replayed range carries last frame's indices, so a table rebuilt
-per frame would draw one fragment with another fragment's paint, with no error anywhere. In debug
-builds the recorded content hashes are checked against what the indices resolve to now.
+The scene has no retained primitive log. Paint records own the bytes they replay. Clips, paints,
+text paints, and coordinate systems are still persistent and interned: the same content returns the
+same identifier, and an identifier resolves to its content while a scene or paint record refers to
+it. In debug builds, recorded content hashes are checked against what the indices resolve to.
 
 Each table is generation-marked and reference-counted, and frees the coldest generation of entries
 that nothing refers to and this frame did not touch. A coordinate system is named after the box that
 establishes it, so moving a box is a write into a node rather than a new identity, and a thousand
 untransformed rows resolve to one node.
-
-`Scene::unreplayable` counts, monotonically, the pushes a replay would not reproduce: a primitive
-the clip refused, and a vector item planned into a pass. A caller reads it either side of an
-encoding and compares the two readings. Equality is what `whole` means.
 
 ## The bounds tree
 
@@ -574,11 +559,12 @@ Counters: `HitEntriesUpdated`, `HitEntriesMovedInPlace`, `HitEntriesReinserted`,
 
 ## The cache budget registry
 
-Retained state without a budget only grows. Six registry entries state what they hold, in what unit,
+Retained state without a budget only grows. Seven registry entries state what they hold, in what unit,
 and what level they come back below when a level applies.
 
 | Cache | Unit | Level | Why that level |
 |---|---|---|---|
+| `PaintChunks` | bytes | 64 MiB | unvisited live fragments retain compiled primitives; cold chunks are cheap to encode again |
 | `GlyphAtlas` | bytes | 64 MiB | several times a text-heavy document's glyphs, well under an unbounded atlas |
 | `DecodedImages` | bytes | 64 MiB | active variants are pinned until their large host copies are released; other variants can be decoded again |
 | `ParagraphShaping` | entries | 16 384 | the largest document whose every element is live, with room |
@@ -652,6 +638,8 @@ frame at the cost of the eviction plus the rebuild plus the upload.
 
 What "coming back under" means differs by cache:
 
+- **Paint chunks** keep the current frame's selected records pinned and evict other records from
+  the oldest selection forward. Eviction releases their scene-table and atlas holds.
 - **The atlas** frees cold generations until resident bytes are under the level, and stops at the
   frame's working set and at anything a paint record holds.
 - **Decoded images** remove inactive variants of shown sources first, then remove unseen sources in
@@ -670,9 +658,10 @@ After each normal frame, the window schedules maintenance for two seconds later.
 frame moves that deadline forward. A continuously active window therefore keeps its working set.
 
 When the deadline arrives, the runtime does not run layout, paint, rendering, or presentation. It
-releases unused group targets and scroll-shift scratch, shrinks retained high-water frame buffers,
-releases completed upload chunks, and releases reproducible vector scratch. The composed target and
-initialized fixed renderer state remain. A later frame recreates the released working memory.
+releases unused group targets and scroll-shift scratch, persistent primitive arenas, retained remap
+and table buffers, completed upload chunks, and reproducible vector scratch. The composed target and
+initialized fixed renderer state remain. A later frame recreates the released working memory and
+restores chunk residence from retained CPU paint records.
 
 ### The gate
 
@@ -725,6 +714,7 @@ wrong at once. The cascade's own output is the exception
 | shaped paragraphs | keyed by the ratio, so a new ratio misses and re-shapes |
 | rasterised glyphs | keyed by their size in device pixels, so a new ratio misses and re-rasterises |
 | lowered paint styles | cleared on the first lowering at a new scale |
+| retained paint chunks | carry the encoded scale in their signature, so a new ratio re-encodes them |
 
 The layout cache has to be emptied by hand because it is keyed by the *question*, and a min-content
 probe carries no size at all — so it asks a question that is identical at every ratio and would be
@@ -778,7 +768,7 @@ Two rules:
 |---|---|
 | document node | one 8-byte invalidation word, one dirty-child record, the core record, and an entry in each side table that node uses |
 | box | one box node and one layout record: one exact full-layout answer, sixteen exact size-only answers, intrinsic answers for two axes, baselines, and any resolved inline lines; rare replaced and custom payloads use sparse columns |
-| fragment | one fragment, one hit entry in a dense table, and one paint record while it is visited |
+| fragment | one fragment, one hit entry in a dense table, and one paint record until retirement or budget eviction |
 | distinct style | one lowered paint description |
 | distinct paragraph | one shaped result, plus up to four breaking results |
 | distinct glyph key | one cache entry, and one atlas tile unless it rasterises to nothing |
@@ -787,33 +777,27 @@ Two rules:
 The shipped gallery is 1 851 boxes and 2 363 fragments, of which 325 boxes — 17.6 % — are anonymous
 (`docs/perf/gallery-scale.md`).
 
-Two of these do **not** follow the live tree, and both are why the budget exists:
+Three of these do **not** follow only the current frame's live working set, which is why the budget
+exists:
 
 - **Shaped paragraphs.** A virtualised list holds a screenful of rows, but every distinct string
   that has scrolled past leaves a shaped result behind under its own key until inactive LRU
   eviction brings the cache back to its level.
+- **Paint chunks.** An unvisited live fragment keeps its compiled painting so that returning to it
+  does not re-encode it. The 64 MiB soft level evicts the coldest unselected records.
 - **Interned names.** They are never freed at all.
 
 ## Threading
 
-**Everything in a shipped frame runs on the UI thread.** Event drain, timers, the animation tick,
-the reactive flush, the cascade, damage translation, the box tree, layout, text, fragments, the hit
-index, paint, the scene, the render submission, the accessibility publication and the recycle step.
-There is no worker pool in the loop.
+The frame is coordinated on the UI thread. A reusable `LayoutPool` moves large, cold, independent
+layout subtrees and eligible plain-text shaping jobs to at most eight workers. All document writes,
+reactive work, fragment composition, paint, render submission, and accessibility publication remain
+on the UI thread.
 
-The parallel cascade exists and is not used. `StylePool` builds up to `MAX_STYLE_THREADS` — six,
-which is a hard ceiling of the style engine rather than a tuning choice, because the engine's
-per-worker storage is sized for it and a seventh worker indexes past the end of that array. The
-shipped frame passes no pool:
-
-```rust
-// crates/zgui-runtime/src/window/frame.rs
-let pass = self.engine.restyle(&mut document, None);
-```
-
-The only callers that build a pool are the style crate's own tests. This is why the paint-style
-lowering cache keeps its content-hashed fallback: the fallback is what the design owes a cascade
-that runs on workers, and it costs a hash only on the path that already paid for a lowering.
+Parallel layout starts only for a batch with at least eight cold roots and at least 256 planned
+boxes. Cache-hot work, nested batches, and trees with a custom layout source stay serial. Text with
+atomic inline boxes also shapes during layout because it needs their geometry. These gates avoid
+paying worker coordination for small or already-cached work.
 
 What does cross a thread boundary:
 

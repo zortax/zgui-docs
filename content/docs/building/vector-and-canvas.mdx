@@ -122,17 +122,20 @@ identity lets the rasterizer reuse its encoded geometry.
 
 Small solid shapes use a fast path when all these conditions are true:
 
-- The device-pixel bounds are at most 96 by 96.
-- The transform is translation only.
 - The shape has no local clip.
 - The shape has one solid fill or one solid stroke.
+- The mask uses at most 64 KiB of texels, is no wider than 1024 texels, and is no taller than 256.
+- A non-uniform transform is not applied to a stroke.
 
 zgui rasterizes the shape to a monochrome coverage mask and stores it in the shared atlas. The
-cache key includes the geometry, fill or stroke style, scale, and mask size. It excludes the colour
-and whole-pixel translation. You can recolour or move an icon without rasterizing its outline
-again. The same rule applies to eligible `canvas` shapes.
+cache key includes the geometry, fill or stroke style, raster density, and mask size. It excludes
+colour, translation, mirrors, and quarter turns. You can recolour, move, mirror, or quarter-turn an
+icon without rasterizing its outline again. Scaling reuses the tile while the required density is
+unchanged. The same rule applies to eligible `canvas` shapes.
 
-Gradients, local clips, larger shapes, non-translation transforms, and shapes with both fill and
-stroke use the general vector rasterizer. The renderer packs disjoint pass regions into compact
-scratch space. GPU scratch size therefore follows the drawn regions, not the empty distance between
-them.
+Gradients, local clips, larger masks, arbitrary rotations or shears, non-uniformly scaled strokes,
+and shapes with both fill and stroke use the general vector rasterizer. An unchanged general-vector
+item replays from its paint record. Movement re-encodes it because its curves are already in device
+coordinates. The renderer
+packs disjoint pass regions into compact scratch space. GPU scratch size therefore follows the
+drawn regions, not the empty distance between them.

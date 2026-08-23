@@ -486,7 +486,9 @@ control(
 ```
 
 While a capture is held, the path ends at the capturing element, so the event still travels down
-through that element's ancestors.
+through that element's ancestors. Re-hit testing also keeps that captured path. Elements under a
+drag do not gain hover until capture is released, which prevents hover and crossing events from
+flickering during the drag.
 
 <Callout type="warn">
 `ev.capture_pointer()` always captures the mouse. A handler cannot capture one touch contact today.

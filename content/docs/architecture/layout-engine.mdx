@@ -197,6 +197,26 @@ boxes with undecided `overflow: auto`; a document with none does not enter the f
 pass does no rounding. Rounding and fragment composition both need the cumulative absolute origin,
 so one later walk performs both operations.
 
+### Parallel batches
+
+One `LayoutPool` belongs to the application and is shared by its windows. It has at most eight
+workers. Windows still enter layout one at a time; the pool divides only independent child
+subtrees inside that pass.
+
+A batch runs in parallel only when it has at least eight cold child roots and its planned subtrees
+contain at least 256 boxes. Cache-hot batches stay serial. Nested worker batches also stay serial,
+and installing a custom layout source disables this path because the custom seam has no `Sync`
+contract.
+
+Before the workers start, the executor divides the layout store into disjoint mutable views. Each
+worker updates its own subtree in place and owns a forked text measurer. Results are reassembled in
+request order. There is no copied tree and no commit phase.
+
+`MeasureContent::fork_measurer(owned)` and `absorb_measurer(worker)` are the public extension seam.
+Their default keeps a batch serial. A custom measurer that opts in returns a `Send`
+`WorkerMeasure`, gives it ownership of the named paragraph results, and absorbs its results after
+the batch. A fork must return the same measurements as its producer.
+
 <Callout type="info">
 Container queries are the other fixpoint. The styles inside a container depend on its resolved size,
 and its size depends on those styles, so there is no ordering that resolves it in one pass.

@@ -180,6 +180,44 @@ fn Tooltip() -> impl IntoView {
 A timer created through `Timers` does not bind itself to a component scope. Its handle controls
 its lifetime. Store the handle in the component.
 
+## Run work on the next frame
+
+Use `request_frame` for one animation step. It runs once during the next frame and supplies that
+frame's `Timestamp`.
+
+```rust
+pub fn request_frame(callback: impl FnOnce(Timestamp) + 'static) -> FrameHandle;
+```
+
+The pending callback makes the window animate at the display cadence. Request the next callback
+from the current callback to run once per frame. zgui removes the current batch before it runs, so
+the new request cannot run in the same frame.
+
+```rust
+fn step(
+    timers: Timers,
+    position: RwSignal<f32>,
+    last: Timestamp,
+    pending: StoredValue<Option<FrameHandle>>,
+) {
+    pending.set_value(Some(timers.request_frame(move |now| {
+        position.update(|x| *x += seconds_between(last, now) * 120.0);
+        step(timers, position, now, pending);
+    })));
+}
+```
+
+Measure motion from the supplied timestamps. A slow frame then makes one larger step instead of
+slowing the animation.
+
+The free function uses the current window and belongs to the current component scope. Scope
+disposal or dropping its `FrameHandle` cancels it. In a listener, capture `Timers::current()` in
+the component body and call `timers.request_frame(...)`; that request is controlled only by its
+handle, as for the timer methods above.
+
+Use `set_timeout` for elapsed-time work. A zero-duration timeout can request another frame, but it
+does not provide display cadence. Use `request_frame` for visual animation.
+
 ## Wait inside a view
 
 `Await` runs one future and builds a view from its output. `Suspense` and `Transition` provide a
