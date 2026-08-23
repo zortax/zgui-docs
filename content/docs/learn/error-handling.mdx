@@ -331,8 +331,11 @@ they were tried.
 ### No display server
 
 `Error::Platform(PlatformError::Backend(_))`, carrying the windowing system's own message. The
-desktop backend builds its event loop first, and there is nothing to connect to — a session over
-SSH with no forwarded display is the usual cause. Nothing is opened and nothing is drawn.
+selected desktop backend cannot connect — a session over SSH with no forwarded display is the usual
+cause. On Linux and BSD, automatic selection uses native Wayland only when a Wayland display is
+available and otherwise selects winit. An explicit `ZGUI_PLATFORM=wayland` requires the native
+connection. If that selected connection fails, zgui returns the error and does not silently start a
+different backend. Nothing is opened and nothing is drawn.
 
 ### A bad style sheet
 

@@ -108,9 +108,10 @@ fn main() -> Result<(), zgui::Error> {
 | `with_title` | the window title | the title bar, the window list, a screen reader |
 | `with_application_id` | the Wayland toplevel's `app_id`, and the general class of the X11 `WM_CLASS` with the instance part beside it | Linux window rules, icons, and task-bar grouping |
 
-On Linux, the identifier is set through both display servers' extensions because the event loop
-selects Wayland or X11 at run time (`crates/zgui-platform-winit/src/surface/attributes.rs`). Windows
-takes application identity from its Application User Model ID. macOS takes it from the bundle
+On Linux and BSD, the native Wayland backend writes the toplevel `app_id`. The portable backend
+writes both winit display-server attributes; portable Wayland consumes its `app_id`, and X11
+consumes `WM_CLASS`. Windows takes application identity from its Application User Model ID. macOS
+takes it from the bundle
 identifier in `Info.plist`. Those identities are fixed by packaging, so `with_application_id` has no
 window attribute to set on those systems.
 
@@ -195,24 +196,26 @@ ldd target/release/my-app
 libfontconfig.so.1
 libfreetype.so.6   libexpat.so.1   libz.so.1
 libbz2.so.1.0      libpng16.so.16  libbrotlidec.so.1
+libwayland-client.so.0             libxkbcommon.so.0
 libgcc_s.so.1      libm.so.6       libc.so.6
 ```
 
 | Library | How it is reached | Needed for |
 |---|---|---|
 | `libfontconfig.so.1` and its own dependencies | linked; it is in the binary's list | enumerating the faces installed on the machine |
-| `libxkbcommon.so.0` | opened at run time | turning key codes into characters |
-| the Wayland client libraries | opened at run time | a Wayland session |
+| `libxkbcommon.so.0` | linked through the native backend | turning Wayland key codes into characters |
+| the Wayland client libraries | linked through the native backend | Linux and BSD builds, even when the process later selects X11 |
 | `libX11.so.6`, `libXcursor`, `libXi`, `libXrandr`, `libxcb` | opened at run time | an X11 session |
 | `libvulkan.so.1`, or `libEGL.so.1` and `libGL.so.1` | opened at run time | the graphics device |
 
-Fontconfig is the one hard link, and it comes from font enumeration. An application built with
+Fontconfig, libwayland-client, and libxkbcommon are hard links. Fontconfig comes from font
+enumeration. An application built with
 `Fonts::shipped_only()` and its own registered faces still links it but does not enumerate through
 it — see [Text and fonts](/docs/building/text-and-fonts).
 
-A missing run-time library is not a link error. It is a failure at the moment the window is opened,
-which is why the four checks below are worth running on a clean machine rather than on the one you
-built on.
+A missing dynamically opened library is not a link error. It is a failure at the moment the window
+is opened. A missing hard link prevents the process from starting. Test both cases on a clean
+machine rather than only on the one you built on.
 
 The following checks apply to a Linux release. Windows and macOS use their native window, input,
 accessibility, and graphics stacks.
@@ -221,9 +224,10 @@ accessibility, and graphics stacks.
 
 <Step>
 
-**Both display servers.** Run once under Wayland and once with `WAYLAND_DISPLAY` unset so the X11
-path is taken. They are different code, and the identifier reaches the window through a different
-extension in each.
+**Both display servers and both Wayland paths.** Run normally under Wayland to test the native
+backend. Run with `ZGUI_PLATFORM=winit` under the same session to test the portable Wayland path.
+Then run with `WAYLAND_DISPLAY` unset to select winit on X11. These are different platform
+implementations.
 
 </Step>
 

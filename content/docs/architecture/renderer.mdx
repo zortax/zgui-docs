@@ -540,23 +540,32 @@ nothing observed.
 
 ## Present
 
-The swap chain is the queue of images the compositor takes finished frames from. Its configuration
-is pinned (`crates/zgui-render-wgpu/src/gpu/surface.rs`):
+The swap chain is the queue of images the compositor takes finished frames from. Its maximum frame
+latency is fixed, but its presentation mode follows the platform's pacing contract
+(`crates/zgui-render-wgpu/src/gpu/surface.rs`):
 
 ```rust
 pub const FRAME_LATENCY: u32 = 2;
-pub const PRESENT_MODE: wgpu::PresentMode = wgpu::PresentMode::Fifo;
+
+pub fn present_mode(
+    pacing: PresentPacing,
+    capabilities: &wgpu::SurfaceCapabilities,
+) -> wgpu::PresentMode;
 ```
 
-`Fifo` is vsync: the compositor takes one image per refresh interval and the frame loop is paced by
-it, so the event loop never spins. Two is one image being composited and one being drawn; wgpu-hal
-turns `desired_maximum_frame_latency: 2` into three swap-chain images
-(`docs/perf/present.md`).
+`PresentPacing::Display` selects `Fifo`: surface acquisition waits for the display, and that wait
+paces the frame loop. `PresentPacing::Platform` selects `Mailbox` when available, then `Immediate`.
+Those modes do not add a display wait to a backend that already schedules frames from compositor
+callbacks. If neither is available, it falls back to `Fifo`; this remains correct, but can add
+latency because both layers pace the frame.
 
-`acquire_block()` reports how long the last frame waited for a swap-chain image. The runtime uses
-that observation to hold a later requested frame until closer to the next presentation. It clears
-the hold when a frame takes at least one refresh interval, because that frame has no scheduling
-slack.
+Two is one image being composited and one being drawn; wgpu-hal turns
+`desired_maximum_frame_latency: 2` into three swap-chain images (`docs/perf/present.md`).
+
+`acquire_block()` reports how long the last frame waited for a swap-chain image. On a display-paced
+surface, the runtime uses that observation to hold a later requested frame until closer to the next
+presentation. On a platform-paced surface, acquisition normally returns without waiting, so this
+servo converges to no additional hold. The backend's frame callback remains the cadence source.
 
 The pacing margin is one sixth of the refresh interval, clamped to 500 µs through 2 ms. This keeps
 the margin proportional on fast displays without removing the measured safety margin on slower
@@ -913,7 +922,7 @@ disappears, the bug is a rectangle somebody under-reported, not a shader.
   <Card
     title="The platform layer"
     href="/docs/architecture/platform-layer"
-    description="Surface, AppHandler, Clock, Waker and Clipboard; the winit and headless backends."
+    description="Surface, AppHandler, Clock, Waker and Clipboard; the native Wayland, portable and headless backends."
   />
   <Card
     title="The crate map"

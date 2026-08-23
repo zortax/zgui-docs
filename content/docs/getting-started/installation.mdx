@@ -35,7 +35,8 @@ rustc --version --verbose
 
 ## System libraries
 
-The desktop backend uses winit for the window and wgpu for the GPU.
+The desktop uses the native Wayland backend when a Wayland display is available. It uses winit on
+X11, Windows, and macOS. Both paths draw through wgpu.
 
 The packages below are Linux development headers. Windows and macOS do not compile the Linux
 windowing backends and need none of them. Use the normal Rust toolchain and platform SDK there.
@@ -80,6 +81,11 @@ ZGUI_BACKENDS=vulkan cargo run --example counter
 The default is Metal on Apple platforms, Direct3D 12 with OpenGL fallback on Windows, and Vulkan
 with OpenGL fallback elsewhere. `ZGUI_BACKENDS` accepts `metal`, `dx12`, `vulkan`, `gl`, `all`, or
 `none`, with comma-separated values where more than one applies.
+
+On Linux and BSD, `App::run` selects the native Wayland backend when `WAYLAND_DISPLAY` identifies
+an available compositor. Otherwise it selects winit. Use `ZGUI_PLATFORM=winit` to force the
+portable backend, including winit's Wayland path. Use `ZGUI_PLATFORM=wayland` to require the native
+backend. A forced native connection failure is returned; zgui does not silently fall back.
 
 <Callout type="info">
 Nothing above is needed to run the framework **headless**. The headless backend draws into buffers

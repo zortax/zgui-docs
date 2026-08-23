@@ -323,6 +323,13 @@ not yet be seen, `Window::wants_a_frame` refuses **every** frame whatever asked 
 presentation pacing holds a frame, `Window::holds_a_frame` does the same. A moment before either
 gate is not an early frame but no frame at all: wake, ask, be refused, recompute, wake again.
 
+The platform and graphics waits are separate. A display-paced surface uses blocking swap-chain
+acquisition, and `PresentPace` uses that measured wait to release later work near the next refresh.
+A platform-paced surface, such as native Wayland, uses compositor frame callbacks and normally has
+no acquisition wait; the acquisition-based hold therefore converges to zero. The surface's measured
+presentation interval, when available, takes precedence over its last reported output rate for
+animation, resize, and deadline calculations.
+
 ## What wakes the loop
 
 Four things, and the list in `crates/zgui-runtime/src/lib.rs` is exhaustive on purpose, because a

@@ -144,6 +144,11 @@ The application identifier also applies to every window. Set it once with
 `ColorScheme` for `with_theme` is available as `zgui::platform::ColorScheme`; the prelude keeps that
 name for view theming.
 
+`WindowOptions` creates toplevel windows only. The low-level platform contract also defines pop-up
+and layer surface roles. The native Wayland backend supports XDG pop-ups and supports layer surfaces
+when the compositor offers wlr layer shell. `Windows::open` and the built-in overlay components do
+not select those roles yet; menus, tooltips, and dropdowns remain inside their owner window.
+
 ## Share state between windows
 
 A context provided inside a window belongs to that window. Other windows cannot resolve it. Put

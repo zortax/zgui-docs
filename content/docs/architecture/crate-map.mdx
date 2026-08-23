@@ -3,7 +3,7 @@ title: The crate map
 description: Every crate in the workspace, the layer it sits in, the rule that keeps the arrows pointing one way, and the checks that enforce it.
 ---
 
-This page is the reference for the workspace: fifty-three crates under `crates/`, plus the `xtask`
+This page is the reference for the workspace: fifty-four crates under `crates/`, plus the `xtask`
 gate runner. It assumes [the architecture overview](/docs/architecture/overview), which gives the
 pipeline these crates implement. None of it is needed to write an application — an application
 names one crate.
@@ -49,7 +49,8 @@ stamps into a new manifest.
 | `zgui-render-wgpu` | L2 | The graphics backend: device, pipelines, batching, and the persistent target a frame is composed into. |
 | `zgui-render-vector-vello` | L2 | Vector rasterisation with a compute-shader path renderer. |
 | `zgui-render-vector-coverage` | L2 | Vector rasterisation for a device with no compute shaders, so a capability check has somewhere to fall back to. |
-| `zgui-platform-winit` | L2 | The desktop: a real event loop, real windows, the clipboards, the accessibility adapter. |
+| `zgui-platform-wayland` | L2 | Native Wayland surfaces, shell roles, input, clipboard, accessibility, visibility, and compositor-paced frames. |
+| `zgui-platform-winit` | L2 | The portable desktop backend for X11, Windows, macOS, and an overrideable Wayland fallback. |
 | `zgui-platform-headless` | L2 | A platform with no windowing system: a clock a test moves, scripted input, a surface that is a buffer. |
 | `zgui-tokio` | L2 | The optional Tokio backend for background work, UI-task runtime context, and Tokio channel helpers. |
 | `zgui-dom` | L3 | The document: one arena of nodes, safe to read from many threads while the cascade runs over it. |
@@ -219,7 +220,7 @@ return, in `docs/guide/layering.md`:
 
 **A backend's next major version reaches one crate.** A windowing library that renames its size
 accessors, splits its lifecycle callbacks and removes its user-event payload touches every crate in
-a framework that names it directly. Behind `zgui-platform` it touches `zgui-platform-winit` and
+a framework that names it directly. Behind `zgui-platform` it touches the backend that uses it and
 nothing else.
 
 **Every stage is testable without the one below it.** The style engine is exercised over a document
@@ -227,7 +228,7 @@ with no layout engine. Layout is exercised with a fixed-metrics text source and 
 exercised with no graphics device. The frame loop is exercised with no display server. None of that
 is a special test mode.
 
-**A second implementation is an implementation, not a fork.** There are two platform backends, two
+**A second implementation is an implementation, not a fork.** There are three platform backends, two
 vector rasterisers, two text metric sources, and a capture renderer beside the real one. Each
 exists because the boundary above it names no library.
 
@@ -240,7 +241,7 @@ fail the build.
 
 ## What is published, and what it promises
 
-Forty-nine of the fifty-three crates publish. Four do not, and each says why in its manifest:
+Fifty of the fifty-four crates publish. Four do not, and each says why in its manifest:
 
 | Crate | Why it is not published |
 |---|---|
@@ -389,21 +390,24 @@ checked against the pins below.
 | `stylo`, `stylo_dom`, `stylo_atoms`, `stylo_static_prefs`, `selectors`, `servo_arc`, `web_atoms`, `cssparser`, `app_units`, `euclid` | `zgui-css`, `zgui-dom`, `zgui-style` | The style engine: parsing, selector matching, the cascade, and the shared computed style. |
 | `taffy` | `zgui-layout` | The flexbox, grid, block and float layout algorithms. |
 | `parley`, `fontique`, `harfrust`, `skrifa`, `swash`, `zeno` | `zgui-text-parley`; `zeno` also in `zgui-paint` | Shaping, face resolution, metrics, glyph rasterisation, and small vector coverage masks. |
-| `wgpu` | `zgui-render-wgpu`, `zgui-wgpu`, both vector rasterisers, `zgui-platform-winit` | The graphics API. |
+| `wgpu` | `zgui-render-wgpu`, `zgui-wgpu`, both vector rasterisers | The graphics API. |
 | `image` | `zgui-image` | Decodes PNG, JPEG, WebP, and the first frame of GIF data. |
 | `vello` | `zgui-render-vector-vello` | Compute-shader path rasterisation. |
 | `usvg` | `zgui-svg` | Reads an SVG document into paths, paints and clips. It draws nothing. |
 | `winit` | `zgui-platform-winit` | The event loop and the windows. |
-| `accesskit` | `zgui-vocab`, `zgui-platform`, `zgui-dom`, `zgui-a11y`, `zgui-text`, `zgui-text-parley`, both platform backends | The accessibility tree, as pure `no_std` data with no platform coupling. |
-| `accesskit_winit`, `arboard`, `smithay-clipboard`, `zbus` | `zgui-platform-winit` | The desktop's accessibility adapter, its clipboards and its portals. |
+| `wayland-client`, `wayland-backend`, `wayland-protocols`, `smithay-client-toolkit`, `calloop` | `zgui-platform-wayland` | The native compositor connection, protocols, and event loop. |
+| `accesskit` | `zgui-vocab`, `zgui-platform`, `zgui-dom`, `zgui-a11y`, `zgui-text`, `zgui-text-parley`, and the platform backends | The accessibility tree, as pure `no_std` data with no platform coupling. |
+| `accesskit_winit` | `zgui-platform-winit` | Accessibility through winit. |
+| `accesskit_unix`, `zbus` | `zgui-platform-wayland` | Native Wayland accessibility and the desktop colour-scheme portal. |
+| `arboard`, `smithay-clipboard` | `zgui-platform-winit` | The portable backend's desktop clipboards. |
 | `reactive_graph`, `reactive_stores`, `any_spawner`, `send_wrapper` | `zgui-reactive` | The reactive engine and the process-wide executor slot. |
 | `tokio` | `zgui-tokio` | The optional runtime for background work and runtime-dependent asynchronous APIs. |
 | `kurbo`, `peniko` | `zgui-elements`, `zgui-scene`, `zgui-paint`, `zgui-svg`, `zgui-text`, `zgui-text-parley`, the three graphics crates, `zgui-ui-icons`, `zgui-ui-primitives` | Béziers and paint description, as pure data. An outline crosses from a view to the rasteriser with no conversion. |
 | `etagere` | `zgui-atlas` | Shelf allocation inside an atlas. |
 | `bytemuck` | `zgui-geom`, `zgui-scene`, the three graphics crates | Casting plain-data structs to the bytes a GPU buffer takes. |
 | `syn`, `quote`, `proc-macro2` | `zgui-view-macro` | The macros. |
-| `raw-window-handle` | `zgui-platform`, `zgui-platform-winit` | The handles a graphics API draws into. Confined to the `GpuSurface` sub-trait, so a backend with no GPU does not implement it. |
-| `rayon` | `zgui-dom`, `zgui-style` | The parallel half of selector matching. |
+| `raw-window-handle` | `zgui-platform`, `zgui-platform-wayland`, `zgui-platform-winit` | The handles a graphics API draws into. Confined to the `GpuSurface` sub-trait, so a backend with no GPU does not implement it. |
+| `rayon` | `zgui-dom`, `zgui-style`, `zgui-layout` | Parallel selector matching, layout batches, and text pre-shaping. |
 | `thiserror`, `tracing`, `bitflags`, `rustc-hash`, `smallvec` | many | Errors, spans, flag sets, hashing and small-vector storage. Not ledgered: none of them is an engine. |
 | `proptest`, `trybuild`, `criterion`, `loom`, `toml` | test and tool targets | Property tests, compile-failure tests, micro-benchmarks, the concurrency model checker, and manifest reading in `xtask`. |
 
@@ -445,8 +449,9 @@ handed in.
 Three notes the source is explicit about.
 
 A platform backend does not implement `AppHandler` — it **calls** one. `zgui_runtime::Runtime` is
-the implementation, and the driver is handed it boxed. `zgui_platform_winit::run` is the shipped
-one, and `zgui::app::desktop()` returns it.
+the implementation, and the driver is handed it boxed. `zgui::app::desktop()` selects
+`zgui_platform_wayland::run` when a Wayland display is available on Linux or BSD; otherwise it
+returns `zgui_platform_winit::run`.
 
 A renderer with no vector rasteriser attached plans a display list's vector passes, counts them,
 and composites a scratch nothing ever wrote. That is not an error, not a warning and not a wrong
@@ -488,7 +493,7 @@ intra-doc links, and warns on `unreachable_pub` and all of clippy. Every member 
 `[lints] workspace = true`.
 
 `cargo xtask ledger unsafe` requires `#![forbid(unsafe_code)]` in the crate root of every member
-outside a six-entry allowlist, and each allowlist entry names what the crate needs unsafe *for*:
+outside a seven-entry allowlist, and each allowlist entry names what the crate needs unsafe *for*:
 
 | Crate | What it is permitted unsafe for |
 |---|---|
@@ -498,6 +503,7 @@ outside a six-entry allowlist, and each allowlist entry names what the crate nee
 | `zgui-render-wgpu` | GPU resource handling |
 | `zgui-render-vector-vello` | creating a pipeline cache from a stored blob |
 | `zgui-platform-winit` | the Wayland clipboard's unsafe constructor |
+| `zgui-platform-wayland` | borrowing native display and surface handles for the graphics API |
 
 Every hand-written `unsafe impl Send` or `unsafe impl Sync` in the workspace must carry a
 `// SAFETY:` comment directly above it. A crate that needs unsafe for something not on its row

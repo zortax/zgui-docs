@@ -450,10 +450,11 @@ problem and not a drawing one. This is the first thing to try when something loo
 
 <Step>
 
-**Set `ZGUI_LATENCY=/tmp/trace.jsonl`** and reproduce the interaction. The desktop backend starts
-the recording for you, and the frame loop marks every stage. What is recorded is *instants*, so
-every gap between two consecutive marks is visible whether or not anyone named the thing that filled
-it.
+**Set `ZGUI_LATENCY=/tmp/trace.jsonl`** and reproduce the interaction. Both desktop backends start
+the recording, and the frame loop marks every stage. The portable backend periodically flushes the
+file; for an interrupt-safe native Wayland file trace, force `ZGUI_PLATFORM=winit`. What is recorded
+is *instants*, so every gap between two consecutive marks is visible whether or not anyone named the
+thing that filled it.
 
 </Step>
 

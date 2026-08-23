@@ -283,7 +283,9 @@ fn main() -> Result<(), zgui::Error> {
 
 `app()` starts a builder. Each `with_*` call decides one thing about the window or the application.
 `run` opens the primary window and drives the event loop until the selected exit policy stops the
-application.
+application. On Linux and BSD it selects the native Wayland backend when a Wayland compositor is
+available, and otherwise uses winit. `ZGUI_PLATFORM=winit` or `ZGUI_PLATFORM=wayland` overrides
+that selection.
 
 The closure passed to `run` builds the primary window's root view. It runs once during an ordinary
 desktop session. A platform suspension removes the window scope, and resume runs the closure again.

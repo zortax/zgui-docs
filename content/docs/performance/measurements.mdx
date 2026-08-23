@@ -458,9 +458,11 @@ Turn it on with an environment variable and nothing else:
 ZGUI_LATENCY=/tmp/trace.jsonl cargo run --release
 ```
 
-The winit backend calls `start_epoch()` when the event loop starts and `flush()` every time the loop
-parks, so a desktop application needs no code change. The output is newline-delimited JSON, one
-object per mark:
+Both desktop backends call `start_epoch()` when their event loop starts. The winit backend also
+calls `flush()` every time its loop parks, so a portable-backend run needs no code change. The
+native Wayland backend does not yet periodically flush the file sink; use the in-process ring for a
+live tool, or force `ZGUI_PLATFORM=winit` when the file must survive an interrupted run. The file is
+newline-delimited JSON, one object per mark:
 
 ```json
 {"t":142900,"base_unix_ns":1785456583000000000,"stage":"b.why","note":"owed=1 spliced=1 noroot=false rebuild=false"}
@@ -558,6 +560,7 @@ redraws every frame, because what it shows changes every frame.
 | Variable | Effect |
 |---|---|
 | `ZGUI_LATENCY=<path>` | writes the instant trace to `<path>` as newline-delimited JSON |
+| `ZGUI_PRESENT_PACING=notify` | also requests pre-present notification on the display-paced winit backend; use only to compare callback pacing |
 | `ZGUI_FULL_DAMAGE=1` | every frame starts with the whole surface damaged |
 | `ZGUI_INVARIANTS=1` | turns on the checks that the element, box and fragment levels still agree, plus replay ownership and spatial dependencies |
 | `ZGUI_BENCH_GPU=1` | the bench harness draws through this machine's device offscreen instead of the null renderer |
