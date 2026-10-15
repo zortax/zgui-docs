@@ -1,27 +1,27 @@
 ---
 title: Background work
-description: Run futures and blocking functions on workers, post results to the UI thread, and consume streams.
+description: Run CPU-heavy and blocking work on worker threads, get the results back to the UI thread, and consume streams.
 ---
 
-Do not run slow work on the UI thread. zgui provides explicit operations to move work to a worker
-and to return to the UI thread. This page assumes [UI tasks and
-timers](/docs/learn/async-and-timers).
+A [UI task](/docs/learn/async-and-timers) can wait without cost, but any real work it does delays
+the frame. Run CPU-heavy work and blocking calls on a worker thread, then bring the result back to
+the UI thread, where signals and views can be updated.
 
-## Select the execution place
+## Choose where work runs
 
-| Operation | Runs on | Can use reactive or view state | Cancellation |
+| Operation | Runs on | May use signals and views | Cancellation |
 |---|---|---|---|
-| `spawn` or `spawn_local` | UI thread | yes | the current scope or `Task::cancel` |
-| `background(future)` | background executor | no | work continues; a cancelled caller discards the result |
-| `blocking(closure)` | blocking worker | no | work continues; a cancelled caller discards the result |
+| `spawn` / `spawn_local` | UI thread | yes | its scope, or `Task::cancel` |
+| `background(future)` | background executor | no | the work continues; a cancelled caller discards the result |
+| `blocking(closure)` | a worker that may block | no | the work continues; a cancelled caller discards the result |
 | `ui().post(closure)` | UI thread, at the next flush | yes | none |
 
-`spawn`, `background`, `blocking`, and `ui` are in the prelude.
+All four are in the prelude.
 
 ## Run an async operation on a worker
 
-Use `background` for work that is already asynchronous. Await it from a UI task. Only the future
-passed to `background` moves to the worker. Execution resumes on the UI thread after the await.
+Await `background` from a UI task. Only the future passed to `background` moves to the worker;
+the code after the `await` runs on the UI thread again.
 
 ```rust
 view! {
@@ -36,22 +36,24 @@ view! {
 }
 ```
 
-The background future and its output must be `Send + 'static`. The future must not read a signal,
-use a node handle, or access the document. Read the required values on the UI thread and move plain
-data to the worker.
+The future and its output must be `Send + 'static`. The future must not read signals, use node
+handles or touch the document. Read what it needs on the UI thread and move plain data in:
 
 ```rust
 let id = selected.get();
 let detail = background(async move { load_detail(id).await }).await;
 ```
 
-This order is required inside `AsyncDerived` and `Action`. A signal read on a worker does not
-register a dependency on the UI thread.
+A signal read on a worker does not register a dependency, so the same rule applies inside
+[`AsyncDerived` and `Action`](/docs/learn/async-and-timers#async-values-and-actions).
 
-## Run a blocking operation
+Awaiting a `background` result panics if the work panicked, or if the executor shut down before it
+finished.
 
-Use `blocking` for synchronous work. Examples include file parsing, image decoding, and a call to
-a synchronous database driver.
+## Run blocking code
+
+Use `blocking` for synchronous work: parsing a file, decoding an image, calling a synchronous
+database driver.
 
 ```rust
 spawn(async move {
@@ -60,18 +62,13 @@ spawn(async move {
 });
 ```
 
-Do not put a blocking call in `background(async { ... })`. A runtime can schedule many async tasks
-on a small set of worker threads. `blocking` tells the executor to use a thread where blocking is
-permitted.
-
-Without the Tokio feature, zgui starts a small background pool on first use. The pool has at most
-four threads and has no I/O reactor. For Tokio timers, networking, file APIs, or libraries that
-require a Tokio runtime, see [Tokio integration](/docs/learn/tokio-integration).
+Do not put a blocking call inside `background(async { … })`. An async executor runs many futures
+on a few threads; `blocking` tells it that this work will not yield.
 
 ## Post to the UI thread
 
-Use `ui()` on the UI thread to obtain a `Ui` handle. The handle is `Send + Clone`. Move it to a
-worker thread or a foreign callback.
+`ui()` returns a `Ui` handle for the current UI thread. It is `Send + Clone`, so you can move it
+into a worker thread or into a callback from a foreign library. Call `ui()` on the UI thread.
 
 ```rust
 let ui = ui();
@@ -84,10 +81,10 @@ std::thread::spawn(move || {
 });
 ```
 
-`post` returns immediately. The closure runs at the start of the next reactive flush. A post asks
-the platform for that frame.
+`post` returns immediately. The closure runs at the start of the next flush, before UI tasks are
+polled, and the post requests that frame.
 
-Use `Ui::run` when background code needs a value from the UI thread before it continues.
+Use `Ui::run` when worker code needs a value from the UI thread before it can continue:
 
 ```rust
 let ui = ui();
@@ -109,17 +106,17 @@ impl Ui {
 }
 ```
 
-A signal with synchronized storage can move to another thread. Do not use that as the normal
-communication method. Owners and observers are thread-local. A later change can also introduce a
-local-storage value and cause a panic. Post a closure through `Ui` instead.
+A signal with thread-safe storage can be written from another thread, but do not rely on it. Reads
+there do not subscribe, writes run outside any frame, and the first `LocalStorage` value in the
+code path panics. Post a closure instead.
 
-## Cancel and reject stale results
+## Discard stale results
 
-When a component is unmounted, its UI task is cancelled. Work already running on a worker is not
-cancelled. zgui discards its result because the UI task no longer waits for it.
+Unmounting a component cancels its UI tasks. Work already running on a worker is not stopped; its
+result is discarded because nothing awaits it any more.
 
-Scope cancellation does not reject an old result while the component remains mounted. Check that
-the request is still current after the await.
+While the component stays mounted, nothing rejects an outdated result for you. After the `await`,
+check that the request is still current:
 
 ```rust
 let wanted = page.get_untracked();
@@ -130,12 +127,13 @@ if page.get_untracked() == wanted {
 }
 ```
 
-Use the same check for search input, route parameters, selection, and any value that can change
-while work is pending.
+Do the same for search input, route parameters, selection, and any value that can change while
+work is pending. `examples/async.rs` in the zgui repository shows the full pattern, with a Cancel
+button and a progress bar written from a plain thread.
 
 ## Consume a stream
 
-Use `zgui::reactive::spawn_stream` to handle each stream item on the UI thread.
+`zgui::reactive::spawn_stream` calls a closure on the UI thread for every item:
 
 ```rust
 use zgui::reactive::spawn_stream;
@@ -145,7 +143,7 @@ spawn_stream(events, move |event| {
 });
 ```
 
-Use `signal_from_stream` when the view only needs the latest item.
+`signal_from_stream` keeps only the latest item, starting from an initial value:
 
 ```rust
 use zgui::reactive::signal_from_stream;
@@ -153,20 +151,26 @@ use zgui::reactive::signal_from_stream;
 let status = signal_from_stream(Status::Offline, status_updates);
 ```
 
-Both helpers run the stream as a scoped UI task. The task stops when the stream ends or its scope
-is disposed.
+Both run the stream as a scoped UI task: it stops when the stream ends or the scope is disposed.
+Neither needs a runtime: `futures` channels and Tokio's `sync` channels both work as they are. For
+Tokio receivers, `zgui::tokio` has
+[ready-made helpers](/docs/learn/tokio-integration#connect-tokio-channels-to-signals).
 
-`futures` channels do not need an external runtime. Tokio synchronization channels also do not
-need a Tokio runtime. The `zgui::tokio` module provides helpers for Tokio `mpsc`, `watch`, and
-`broadcast` receivers.
+## The default thread pool
 
-## Wake and frame cost
+Without the `tokio` feature, zgui starts its own pool on the first `background` or `blocking`
+call. The pool:
 
-When a worker result becomes ready, it wakes the UI task and requests a frame. The event loop does
-not poll while it waits. Multiple wakes before the frame are combined.
+- has at most four threads (fewer on smaller machines);
+- has no I/O reactor, so Tokio timers, sockets and files do not work in it;
+- runs `blocking` work on the same threads as `background` futures, so four long blocking calls
+  stall every other background task.
 
-At the start of the flush, zgui first runs closures posted through `Ui`. It then polls ready tasks.
-Signal writes from both operations can settle in the same frame.
+If you need a reactor, a separate blocking pool or more threads, install Tokio; see
+[Tokio integration](/docs/learn/tokio-integration).
+
+`with_style_threads` and `with_layout_threads` on `app()` size the style and layout pools. They do
+not affect `background` or `blocking`.
 
 ## Next
 

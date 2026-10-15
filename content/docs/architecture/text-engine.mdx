@@ -1,110 +1,60 @@
 ---
 title: The text engine
-description: "How a text node becomes glyphs and then pixels: the four seams, the libraries behind them, shaping against breaking, and every cache on the path."
+description: "How a text node becomes glyphs and then pixels: the four text seams, the font libraries behind them, flattening, shaping, line breaking, glyph rasterisation, and every cache on the way."
 ---
 
-Text is the one stage that cannot be computed from the document alone. It needs font files, and a
-font file answers questions no other stage asks. This page follows one paragraph from a `text` node
-to pixels, and names every type, seam and cache on the way.
+The text engine turns the text inside an inline formatting context into shaped glyphs, breaks them
+into lines, and rasterises the glyphs for painting. Shaping and line breaking run in the `f.layout`
+step of [the frame](/docs/architecture/the-frame), when the
+[layout engine](/docs/architecture/layout-engine#measurecontent) measures a paragraph. Glyph
+rasterisation runs later, in `f.paint`. Layout and paint reach the engine only through four traits,
+so neither depends on a font library.
 
-It assumes [the architecture overview](/docs/architecture/overview) and
-[the layout engine](/docs/architecture/layout-engine).
+The sections follow one paragraph from a `text` node to pixels, then list the caches on the way and
+what each kind of change costs.
 
-## Three crates
+## Crates
 
-| Crate | Holds |
+| Crate | Contains |
 |---|---|
-| `zgui-text-style` | text properties lowered out of the cascade, and the two hashes over them |
-| `zgui-text` | the contracts: four seams, the value types on both sides, the paragraph cache |
-| `zgui-text-parley` | the implementation, and the only crate in the workspace that names a font engine |
+| `zgui-text-style` | Text properties lowered from the cascade, and the shaping and breaking hashes over them |
+| `zgui-text` | The contracts: four seams, the value types on both sides, the paragraph cache |
+| `zgui-text-parley` | The implementation. The only crate in the workspace that depends on a font engine |
 
-The split is stated in the manifests. `crates/zgui-text/Cargo.toml` says it outright:
-
-> There is no font engine here and there must never be one: this crate is the set of contracts a
-> font engine is plugged in *through*, so naming one would make every consumer of the contracts
-> depend on the implementation the contracts exist to keep swappable.
-
-Every crate above L4 is written against `zgui-text` alone. `zgui-layout` shapes and breaks through
-it; `zgui-paint` reads positioned glyphs through it; `zgui-style` reads face metrics through it. None
-of them can name a font library, and the test suites of all three run with no font file on the
-machine.
+`zgui-layout`, `zgui-paint` and `zgui-style` depend only on `zgui-text`. They shape, break, read glyph
+positions and read face metrics through its traits, and their test suites run without any font file.
 
 ## The pipeline
 
-<FlowDiagram
-  label="The text pipeline"
-  items={[
-    {
-      title: 'A text node',
-      code: 'zgui-dom · NodeKind::Text',
-      next: 'Flatten whitespace, expand tabs, and apply text-transform',
-    },
-    {
-      title: 'ParagraphContent',
-      description: 'One string, a TextMap, styled runs, and inline-box geometry.',
-      next: 'Shape once per distinct content and style',
-    },
-    {
-      title: 'ShapedParagraph<E>',
-      description: 'Glyphs, content widths, the strut, and the recall buffer.',
-      next: 'Break cheaply, once per distinct width',
-    },
-    {
-      title: 'BrokenParagraph',
-      description: 'Line geometry and the positions of atomic inlines.',
-      next: 'Stack CSS line boxes and emit one fragment per line',
-    },
-    {
-      title: 'Fragments',
-      code: 'zgui-layout',
-      next: 'Visit each line with its face, size, synthesis, brush, and glyph positions',
-    },
-    {
-      title: 'ShapedRun',
-      description: "Positions relative to the line box's own corner.",
-      next: 'Rasterise into atlas tiles or extract curves',
-    },
-    {
-      title: 'Sprites and vector items',
-      code: 'zgui-paint → display list',
-    },
-  ]}
-/>
-
-Stage by stage, with the file that owns each:
+A paragraph moves through these stages:
 
 | Stage | Where | Produces |
 |---|---|---|
 | Flatten | `crates/zgui-layout/src/inline/content/generate.rs` | `Generated`: the string, the map, the runs, the inline items |
 | Shape | `crates/zgui-text-parley/src/shape/build.rs` | `ShapedParagraph<ShapedLayout>` |
 | Break | `crates/zgui-text-parley/src/shape/breaking.rs` | `BrokenParagraph` |
-| Line boxes | `crates/zgui-layout/src/inline/lines.rs` | CSS line boxes, stacked, with baselines |
+| Line boxes | `crates/zgui-layout/src/inline/lines.rs` | CSS line boxes with baselines and ink extents |
 | Place | `crates/zgui-paint/src/content/glyphs/place.rs` | `PlacedGlyph`: an atlas tile and a rectangle |
-| Emit | `crates/zgui-paint/src/emit/text.rs` | sprites, vector items, decoration lines |
+| Emit | `crates/zgui-paint/src/emit/text.rs` | Sprites, vector items, decoration lines |
 
-A **glyph** is one drawable shape in a font file, named by an index within that file. It is not a
-character. One character can be several glyphs, several characters can be one glyph, and the same
-character is a different glyph in a different face.
+A **glyph** is one drawable shape in a font file, identified by an index within that file. It is not
+a character: one character can be several glyphs, several characters can be one glyph, and the same
+character maps to different glyphs in different faces.
 
 ## The four seams
 
-A seam is a trait with an implementation on each side. All four live in `crates/zgui-text/src`.
+Each seam is a trait in `crates/zgui-text/src`.
 
-| Seam | File | Asked by | Second implementation |
+| Seam | File | Called by | Other implementations |
 |---|---|---|---|
-| `FontMetricsSource` | `metrics/source.rs` | the cascade, resolving `ex`, `ch`, `cap`, `ic` | `FixedMetrics` |
-| `FontSource` | `font/source.rs` | face resolution and `@font-face` | — |
-| `ParagraphShaper` | `paragraph/shaper.rs` | layout, once per paragraph and many times per width | `MonoShaper` |
-| `GlyphRaster` | `glyph/raster.rs` | painting, once per distinct glyph | `MonoRaster`, `NoRaster` |
+| `FontMetricsSource` | `metrics/source.rs` | The cascade, to resolve `ex`, `ch`, `cap`, `ic` | `FixedMetrics` |
+| `FontSource` | `font/source.rs` | Face resolution and `@font-face` | — |
+| `ParagraphShaper` | `paragraph/shaper.rs` | Layout: once per paragraph, then once per width | `MonoShaper` |
+| `GlyphRaster` | `glyph/raster.rs` | Paint: once per distinct glyph | `MonoRaster`, `NoRaster` |
 
-Three of the four have a second implementation, which is the test that they are boundaries rather
-than indirections. `MonoShaper` and `MonoRaster` are in `crates/zgui-testkit-scene/src/shaper/`:
-every character is one cluster, eight device pixels wide and sixteen tall at the initial size, drawn
-as a filled rectangle. No file is opened and no font library is linked, so a layout or painting test
-states where a glyph must land and is wrong only if the pipeline is.
-
-`FontSource` has one, and that is not an omission: a collection holding nothing is `FontSystem` under
-`Enumeration::Registered` with nothing registered, not a different type.
+`MonoShaper` and `MonoRaster` live in `crates/zgui-testkit-scene/src/shaper/`. Every character is one
+cluster, 8 device pixels wide and 16 tall at the initial size, drawn as a filled rectangle. Layout and
+paint tests use them to assert exact glyph positions without opening a font.
 
 ### FontSource
 
@@ -122,16 +72,13 @@ pub trait FontSource: Send + Sync + 'static {
 }
 ```
 
-Every method takes `&self`. Registering a face mutates the collection, so an implementation locks
-internally: a mutable borrow here would sit on the path of every style resolution, and style
-resolution runs on several threads at once.
-
-`resolve_for` is separate from `resolve` because fallback is **per character**. A Latin sentence with
-one emoji in it resolves to two faces, and a query about the run as a whole cannot say that.
-
-A `FaceId` is opaque and means nothing outside the source that issued it. `FaceRecord` reports the
-face's **own** weight, slant and width, not the ones asked for — that is how a consumer learns that a
-weight has to be synthesised.
+- All methods take `&self`. Style resolution runs on several threads, so implementations lock
+  internally.
+- `resolve_for` exists because fallback is per character: a Latin sentence with one emoji resolves to
+  two faces.
+- A `FaceId` is opaque and only meaningful to the source that issued it.
+- `FaceRecord` reports the face's **actual** weight, slant and width. Comparing them with the
+  requested values tells the caller that synthesis is needed.
 
 ### FontMetricsSource
 
@@ -142,18 +89,12 @@ pub trait FontMetricsSource: Send + Sync + 'static {
 }
 ```
 
-This seam exists because `ex`, `ch`, `cap` and `ic` cannot be resolved without opening a face, so the
-cascade depends on the font system — while the font system must not depend on the style engine, or
-neither could be replaced.
+Resolving `ex`, `ch`, `cap` and `ic` requires opening a face. This seam lets the cascade do that without
+depending on a font library. Equal arguments must return equal metrics while the set of registered
+faces is unchanged; otherwise one element could get two computed styles.
 
-The contract is exact: two calls with equal arguments return equal metrics for as long as the set of
-registered faces is unchanged. A cascade that saw two answers for one query would produce two
-computed styles for one element.
-
-`FixedMetrics` (`crates/zgui-text/src/metrics/fixed.rs`) is the second implementation. It answers
-fixed fractions of the size asked for — x-height 0.5, cap height 0.7, ascent 0.8 — so a cascade test
-reads the same on every machine. Every field is present, so a document styled against it exercises
-the *present* branch of every font-relative unit rather than the fallback branch.
+`FixedMetrics` (`crates/zgui-text/src/metrics/fixed.rs`) answers fixed fractions of the size
+(x-height 0.5, cap height 0.7, ascent 0.8, descent 0.2), so cascade tests are machine-independent.
 
 ### ParagraphShaper
 
@@ -162,35 +103,34 @@ pub trait ParagraphShaper {
     type Engine;
 
     fn shape(&mut self, content: &ParagraphContent<'_>) -> ShapedParagraph<Self::Engine>;
+    fn shape_keyed(&mut self, key: ParagraphKey, content: &ParagraphContent<'_>)
+        -> ShapedParagraph<Self::Engine>;               // default: shape + debug_assert on the key
+    fn fork(&self) -> Option<Self> where Self: Sized;  // default: None
 
     fn break_lines(&mut self, shaped: &mut ShapedParagraph<Self::Engine>,
                    request: &BreakRequest<'_>) -> BrokenParagraph;
-
     fn strut(&mut self, style: &TextStyle) -> StrutMetrics;
 
     fn visit_line(&self, shaped: &ShapedParagraph<Self::Engine>, line: u16,
                   visit: &mut dyn FnMut(ShapedRun<'_>));
-
     fn visit_clusters(&self, shaped: &ShapedParagraph<Self::Engine>, line: u16,
                       visit: &mut dyn FnMut(ClusterRun<'_>));
 }
 ```
 
-The two halves are separate methods because they cost two very different amounts, and every caching
-decision below rests on being able to do the second without the first.
-
-`Engine` is the shaper's own shaped form. It is carried through `ShapedParagraph` and never
-interpreted outside the shaper. For `zgui-text-parley` it is `ShapedLayout`, which holds a
-`parley::Layout`, the byte length of the directional prefix, and the last break taken.
-
-The two visitors are `&self` rather than `&mut self`, and deliberately: reading where the glyphs are
-is not a write, and a shaper held mutably for the whole of painting could not also be measuring. They
-are also visitors rather than slice-returning methods, because a run's glyphs live wherever the
-engine put them and a caller that had to hand out a slice would allocate one per line, every frame.
-
-`visit_line` and `visit_clusters` answer different questions. A glyph is what is painted; a cluster is
-what can be selected. On a ligature or a combining mark the two do not correspond, and a caret may
-not be placed inside a cluster.
+- `shape` and `break_lines` are separate because their costs differ by more than an order of
+  magnitude. All caching below depends on breaking without reshaping.
+- `Engine` is the shaper's private shaped form. For `zgui-text-parley` it is `ShapedLayout`: a
+  `parley::Layout`, the byte length of the directional prefix, the last break, and whether any run may
+  wrap.
+- `shape_keyed` lets a caller that already computed the `ParagraphKey` skip rehashing the paragraph.
+- `fork` returns a second shaper over the same font data with its own scratch space, for shaping on
+  worker threads. `None` keeps shaping on the caller's thread.
+- The visitors take `&self`, so painting can read glyph positions while the shaper is also used for
+  measuring. They are callbacks rather than slice-returning methods so no per-line allocation is
+  needed.
+- `visit_line` yields glyphs (what is painted). `visit_clusters` yields clusters (what can be
+  selected). On ligatures and combining marks they differ, and a caret may not land inside a cluster.
 
 ### GlyphRaster
 
@@ -201,520 +141,420 @@ pub trait GlyphRaster: Send + Sync + 'static {
 }
 ```
 
-One glyph at a time and entirely by value: nothing here knows about atlases, textures or frames, so a
-rasteriser can be exercised against a byte buffer with no GPU anywhere.
+- One glyph at a time, by value. Nothing here knows about atlases or the GPU.
+- **Equal keys produce identical bytes.** Every input the rasteriser reads is in the key, which is what
+  makes caching its output safe.
+- `outline` is required, not defaulted. A rasteriser that silently returned no outlines would make
+  every rotated, gradient-filled or very large run invisible.
+- `NoRaster` is used before a font engine is configured. It reports every glyph as absent.
 
-The promise is that **equal keys give identical bytes**. That is what makes a cache between this
-trait and its caller safe, and it is why every input a rasteriser reads is in `GlyphKey` rather than
-in the rasteriser's own state. A hinting setting held on the side would silently change what an
-already cached key means.
+Absent and blank are different results throughout: a space rasterises to a valid image with zero
+extent, while a face without the glyph returns `None`. The glyph cache relies on this to remember that a
+space draws nothing.
 
-`outline` is required rather than defaulted. The reasoning is in the source:
+## Font libraries
 
-> A rasteriser that could quietly answer *no outlines* would leave every rotated heading, every
-> display size and every gradient run drawing nothing, with no error anywhere and every test still
-> green.
+`crates/zgui-text-parley/Cargo.toml` is the only manifest that names these.
 
-`NoRaster` is what a window brought up before a font engine has been chosen draws its text through.
-It reports every glyph as **absent** rather than as blank, which is the honest answer from something
-that holds no face.
+| Library | Version | Role |
+|---|---|---|
+| `parley` | 0.11.1 | Text layout: styled ranges, bidi, script segmentation, shaping, line breaking, alignment, justification |
+| `fontique` | 0.11.1, patched | Font collection: system enumeration, registration, family and attribute matching, per-script fallback |
+| `harfrust` | 0.12 (via parley) | The OpenType shaper parley calls. Not named by any zgui crate |
+| `skrifa` | 0.44 | Font-file reader: face metrics (`metrics/read.rs`) and glyph outlines (`raster/outline.rs`) |
+| `swash` | 0.2 | CPU rasteriser: hinting, coverage and colour rendering (`raster/glyphs.rs`), script lookup |
+| `kurbo` | 0.13 | Bézier paths. `zgui-text` re-exports it so `GlyphRaster` implementors use the same version |
 
-<Callout type="info">
-The absent case and the blank case are different everywhere in this crate. A space rasterises to a
-well-formed image of zero extent; a face with no glyph for a codepoint answers `None`. Collapsing the
-two costs a cache the ability to remember that a space draws nothing.
-</Callout>
+The workspace manifest declares `parley = "0.11.0"`; `Cargo.lock` resolves 0.11.1.
 
-## The libraries behind the seams
+### The fontique patch
 
-`crates/zgui-text-parley/Cargo.toml` names the font libraries, and it is the only manifest in the
-workspace that does.
+The workspace patches fontique with a vendored copy (`vendor/fontique`, `[patch.crates-io]`, changes
+marked `ZGUI-PATCH:`). Upstream clears a collection's query state at the start and end of every query,
+and parley runs one query per paragraph. `sans-serif` resolves to around two hundred families on a
+typical system, so every paragraph rebuilt that list, and every digit (which parley checks as a
+possible emoji) rebuilt it again with emoji families appended. The patch keeps query state across
+queries:
 
-| Library | What it does |
-|---|---|
-| `fontique` | the font collection. Enumerates the operating system's faces, holds registered ones, matches a family list and a set of attributes to a face, and provides the per-script fallback lists. |
-| `parley` | the text layout engine. Takes a string with styled ranges, runs the bidirectional algorithm and script segmentation, drives shaping, and breaks the result into lines with alignment, indent and justification. |
-| `harfrust` | the shaper `parley` calls. It applies a face's OpenType tables — substitutions, positioning, kerning — to one run of one script in one face. No zgui crate names it; the workspace manifest pins its version. |
-| `skrifa` | the font-file reader. Used directly for the cascade's face metrics (`metrics/read.rs`) and for extracting a glyph's curves (`raster/outline.rs`). |
-| `swash` | the CPU rasteriser. Hints a glyph and renders it to coverage or to colour (`raster/glyphs.rs`), and answers which script a character belongs to. |
-| `kurbo` | Bézier paths. The workspace's one spelling of a curve, so a glyph's outline reaches a path rasteriser with no conversion at any boundary. |
+- The current family list and the last three are reused, with the faces they loaded.
+- The fallback list is rebuilt only when its script or locale changes.
+- A generation counter, raised by every collection mutation, discards stale state, so an unregistered
+  face is never used again.
 
-`kurbo` is the exception in that list: `zgui-text` names it as well, and re-exports it, so an
-implementor of `GlyphRaster` can name the geometry it returns without pinning its own copy of a
-version that might not be this one.
+The patch only applies when building the zgui workspace. Applications using the published crates get
+upstream fontique (same fonts, slower resolution) unless they add the same patch entry pointing at the
+zgui repository; `vendor/README.md` shows how.
+
+## The font system
+
+`FontSystem` (`crates/zgui-text-parley/src/system/mod.rs`) is one collection per application. It
+implements `FontSource` and `FontMetricsSource`, and `Shaper` and `Rasteriser` are built from it, so a
+registered face is visible to all four seams.
+
+fontique needs `&mut` even for lookups, while the cascade queries metrics from many threads. So the
+collection, its source cache and the face table sit behind one `Mutex`, with a metrics memo behind an
+`RwLock` in front. `FontSystem::lock_acquisitions()` counts lock acquisitions so tests can check that the
+memo works: the count should track distinct queries, not calls.
+
+The collection is created shared, so the shaper's clone and every fork see faces registered later. The
+source cache is shared too, so one font file is one blob everywhere; downstream caches keyed by blob
+identity would otherwise treat the same face as different fonts per shaper.
+
+### System and registered fonts
+
+`Enumeration::System` uses the operating system's faces plus registrations. `Enumeration::Registered`
+(the default) uses registrations only, so the same registrations give the same advances and pixels on
+every machine. Tests and reference images use it. In this mode, registering a family also binds it to every
+generic role nothing else has claimed, so an unstyled document (which resolves to `serif`) still finds
+a face. Applications choose with `zgui::app::Fonts::system()` or `Fonts::shipped_only()`.
+
+### Matching and fallback
+
+`FaceQuery` holds only what selects a face: family list, weight, slant, width, variations, language.
+`first_match` (`font/query.rs`) walks the family list in order and returns the first face the
+collection matches.
+
+`resolve_for` adds a character and sets a fallback key from its script. `script_of` (`font/script.rs`)
+converts the OpenType tag (`arab`) that character properties use to the ISO 15924 code (`Arab`) that
+fallback lists use, by uppercasing the first letter. Versioned tags such as `dev2` map to no list and
+get no fallback rather than a wrong one.
+
+Under `Registered` there is no system fallback list, so the registered families are swept instead.
+That sweep is bounded by what the application registered, which is why it only happens in that mode.
+
+### Synthetic bold and italic
+
+When no face covers the requested weight or slant, the run reports synthesis:
+
+- **Bold**: strokes are thickened by `SYNTHETIC_BOLD_RATIO = 0.02` of the size.
+- **Italic**: each glyph is sheared forward about its own origin by the angle fontique reports. The
+  shear is per glyph, not per run, so letters lean instead of the whole line.
+
+Both values are in `GlyphKey` and `OutlineKey`, so synthesised glyphs are separate cache entries.
+
+### The metrics memo
+
+`face_metrics` hashes the query, size and writing mode into a `MemoKey` and answers from an
+`FxHashMap` behind an `RwLock` (`metrics/memo.rs`). Only a miss takes the collection lock.
+Registering or unregistering a family calls `forget_metrics()` and clears the memo, because the best
+match for a query may have changed.
+
+A query that matches nothing returns default metrics (optional fields absent, zero ascent) rather than
+failing, so a document using a missing family still cascades.
 
 ## Flattening a paragraph
 
-An **inline formatting context** is the box that lays out a run of text, images and nested spans as
-lines. To the algorithms around it, it is one leaf box with a size. Inside it is a tree, and none of
-that tree is laid out on its own: a line break is a decision about the whole sequence.
+An **inline formatting context** lays out text, images and nested spans as lines. To the layout around
+it, it is one leaf box. Its contents are flattened into one string in
+`crates/zgui-layout/src/inline/content/generate.rs`. Flattening changes the text:
 
-A shaper takes a flat string. Flattening the tree into that string happens in
-`crates/zgui-layout/src/inline/content/generate.rs`, and it is not a copy:
+- Under `white-space-collapse: collapse`, runs of spaces, tabs and newlines become one space. Runs at
+  the start, at the end and after a forced break are removed.
+- Under `preserve`, a tab becomes a jump to the next tab stop.
+- `text-transform` changes letters.
 
-- under `white-space-collapse: collapse`, every run of spaces, tabs and newlines becomes one space;
-  a run at the start of the context or after a forced break disappears, and so does one at the end;
-- a tab under `preserve` stands for a jump to the next tab stop rather than for a character;
-- `text-transform` changes the letters.
-
-Every one of those moves the byte offsets. So the map back is built **as the string is** — this is
-the only point at which the correspondence is known.
+Each of these moves byte offsets, so the map from the generated string back to the source is built
+while the string is built.
 
 ```rust
 pub struct ParagraphContent<'a> {
     pub text: &'a str,                     // the generated string
-    pub map: &'a TextMap,                  // the way back to the source
-    pub runs: &'a [StyledRun],             // ascending, covering the string, no gaps
-    pub boxes: &'a [InlineBoxGeometry],    // the atomic inlines packed between the words
+    pub map: &'a TextMap,                  // generated offsets → source positions
+    pub runs: &'a [StyledRun],             // ascending, covering the string with no gaps
+    pub boxes: &'a [InlineBoxGeometry],    // atomic inlines between the words
     pub paragraph: &'a ParagraphStyle,
     pub scale: f32,                        // device pixels per CSS pixel
 }
 ```
 
-`TextMap` (`crates/zgui-text/src/map/mod.rs`) is a sorted list of `Segment`s, each recording that a
-stretch of the generated string is a verbatim copy of bytes at some offset in some source run.
-Contiguous stretches merge, so text that survived collapsing untouched costs one entry however long
-it is. Lookups are a `partition_point` binary search.
+`TextMap` (`crates/zgui-text/src/map/mod.rs`) is a sorted list of `Segment`s. Each records that a
+stretch of the generated string is a verbatim copy of a source run's bytes. Adjacent stretches merge,
+so uncollapsed text costs one entry. `to_source` and `to_generated` convert in each direction by binary
+search. Their `_snapped` variants return the nearest real position instead of `None`, for hit testing on
+a collapsed space and for a caret at the end of a field.
 
-The map has four accessors, and the pairs matter:
+`ParagraphContent::runs_are_well_formed` checks that runs cover the string. Callers check it; shapers
+assume it.
 
-| Method | Answers |
-|---|---|
-| `to_source` | the source position of a generated offset, or nothing for text the source never held |
-| `to_source_snapped` | the nearest real source position — what a hit test on a collapsed space needs |
-| `to_generated` | the generated offset of a source position |
-| `to_generated_snapped` | the same, allowing the position immediately past a stretch — what the caret at the end of a field needs |
-
-`ParagraphContent::runs_are_well_formed` checks the covering invariant. A shaper handed runs that do
-not cover the string is entitled to any result at all, so the caller checks rather than the shaper
-defending.
+The flattened form is memoised beside its box (`inline/content/memo.rs`) and reused across layout
+passes until its boxes, styles or device scale change. Style lowering (`inline/content/styles.rs`)
+happens once per distinct computed style, not once per box.
 
 ## Shaping
 
-**Shaping** turns a sequence of characters into a sequence of positioned glyphs. It is not a lookup
-per character, and it cannot be replaced by one:
+**Shaping** turns characters into positioned glyphs by running the font's OpenType tables. It cannot be
+done per character: faces substitute glyphs in context (`fi` ligatures, Arabic joining forms), position
+glyphs relative to each other (kerning, mark attachment), and some scripts reorder. A string's advance
+is not the sum of its characters' advances.
 
-- a face substitutes glyphs in context — `f` and `i` become one `fi` ligature, Arabic letters take
-  initial, medial, final or isolated forms according to what joins them;
-- a face positions glyphs relative to each other — kerning between `A` and `V`, an accent attached to
-  the base letter it belongs on;
-- some scripts reorder — an Indic vowel sign is written before the consonant it is pronounced after;
-- one cluster may be several glyphs, and one glyph may cover several characters, so the advance of a
-  string is not the sum of the advances of its characters.
+parley first splits the text into runs that share one face, script, direction and style, and the
+shaper processes one run at a time.
 
-None of that is derivable from the string. It is a program in the font file, and running it is what
-shaping is.
+**Single-style fast path.** When every non-empty run has the same style and brush (the common case for
+labels and plain paragraphs), `shape/build.rs` resolves that style once and builds the layout with
+parley's style-run builder over the whole string. Otherwise it uses the ranged builder and pushes each
+run's properties over its range. Both produce the same layout; the fast path skips per-property pushes
+and range splitting.
 
-Before any of it, the text is cut into **runs**: maximal stretches that share one face, one script,
-one direction and one style. `parley` does the segmentation; a shaper works on one run at a time,
-because the tables it applies are per script and per face.
+### Base direction
 
-### Bidi
+The bidirectional algorithm orders mixed right-to-left and left-to-right text relative to a paragraph
+base direction. `zgui-text-parley` forces the base direction by prefixing a directional mark (U+200F
+or U+200E) to the string it hands parley (`crates/zgui-text-parley/src/direction/mod.rs`).
 
-The **bidirectional algorithm** decides the visual order of text that mixes right-to-left and
-left-to-right scripts. It needs a *base direction* for the paragraph, and every character's direction
-is resolved relative to it.
+It does not wrap the paragraph in an isolate pair. The bidi paragraph-level rule skips everything
+inside an isolate, so an isolate around the whole paragraph hides every strong character and the base
+level falls back to left-to-right. The text still reorders correctly but aligns to the wrong edge.
 
-`zgui-text-parley` forces the base direction by prefixing a **directional mark** — U+200F or U+200E —
-onto the string the engine is handed (`crates/zgui-text-parley/src/direction/mod.rs`). It does not
-wrap the paragraph in an isolate pair, and the reason is exact:
+The mark has no source position. Every line and cluster range is reported with the prefix length
+subtracted (`crates/zgui-text-parley/src/shape/lines.rs`), so callers see one byte space only.
+`Controls::Verbatim` disables the prefix for callers that emit their own controls.
 
-> The bidirectional algorithm's paragraph-level rule skips every character between an isolate
-> initiator and its matching pop, so an isolate around the *whole* paragraph hides every strong
-> character from the detection and the base level falls through to left-to-right. The content still
-> reorders correctly, which is what makes the failure hard to see: the paragraph reads right and then
-> aligns to the wrong edge.
+## Shaping keys and breaking keys
 
-The mark belongs to no source position, and **no offset a caller ever sees counts it**. Line ranges
-and cluster ranges have `prefix` subtracted before they are reported
-(`crates/zgui-text-parley/src/shape/lines.rs`). There is one byte space on this boundary, not two —
-a shifted map beside offsets that counted the prefix would be self-consistent and wrong in the same
-measure, placing a caret and a click a prefix apart from each other.
+**Breaking** decides where lines end, using glyphs that shaping already produced. It changes no glyph.
+On a thousand words, shaping costs about 28 times as much as breaking (`crates/zgui-text/src/lib.rs`).
+Layout asks a paragraph for its size at many widths while it resolves flex or grid, so those questions
+must cost breaks, not shapes.
 
-`Controls::Verbatim` leaves the string exactly as the caller wrote it, which is what a caller that
-has emitted its own controls, or one implementing detection from content, needs.
+`zgui-text-style` therefore hashes text style into two keys (`crates/zgui-text-style/src/key/`):
 
-## Breaking, and why it is not shaping
+| Key | Covers |
+|---|---|
+| `ShapingKey` | What decides which glyphs exist and how wide they are: family, size, weight, slant, width, `font-synthesis-weight`, optical sizing, variations, features, variant, language, letter-spacing, word-spacing, line-height, `word-break`, white-space handling, `text-transform`. On the paragraph: direction and writing mode |
+| `BreakingKey` | What only decides where lines end: `overflow-wrap`, `text-wrap-mode`, `line-break`. On the paragraph: `text-align`, `text-align-last`, `text-justify`, `text-indent` |
 
-**Breaking** walks the glyphs shaping already produced and decides where the lines fall. It changes
-no glyph.
+`TextStyle::hash_shaping` and `hash_breaking` (and the `ParagraphStyle` equivalents) are the only place
+a property is assigned to one side. Direction and writing mode are shaping properties because they
+change bidi resolution, mirroring and which advance table is read.
 
-The difference in cost is the axis the whole design turns on: shaping is expensive and breaking is
-cheap.
+`TextDamage::between(old, new)` classifies a style change as `None`, `Rebreak` or `Reshape` by comparing
+the two keys, not by consulting a property list.
 
-That ratio matters because a layout algorithm asks a paragraph its size at many candidate widths
-while it resolves the flex or grid around it. If each question cost a shape, text would dominate the
-frame.
+### Colour and brush slots
 
-So a text style is hashed **twice** (`crates/zgui-text-style/src/key/`):
+Colour is in neither key. A run's paint is lowered separately into `TextPaint`, and each distinct
+cascade result claims a **brush slot** in a table that lives as long as the document. Shaped glyphs
+store the slot number, not a colour. A theme change rewrites table entries and recolours every cached
+paragraph without reshaping.
 
-| Key | Covers | Example |
-|---|---|---|
-| `ShapingKey` | everything that decides which glyphs exist and how wide they are | family, size, weight, slant, width, variations, features, variant, language, letter-spacing, word-spacing, line-height, `word-break`, `white-space-collapse` |
-| `BreakingKey` | everything that decides only where the lines fall | `overflow-wrap`, `text-wrap-mode`, `line-break`; and on the paragraph: alignment, `text-align-last`, `text-justify`, indent |
-
-`TextStyle` is split down the middle: the fields from `overflow_wrap` down are the breaking half, and
-`hash_shaping` / `hash_breaking` are the one place a property can be on the wrong side of the line.
-Every consumer of the split calls those two rather than reading fields. Two of the *paragraph's*
-properties are shaping properties, which is not obvious: the base direction decides bidi resolution
-and therefore which characters are mirrored, and the writing mode decides which advance table is
-read.
-
-`TextDamage::between(old, new)` is that split seen from the restyle side, and it is **derived from
-the keys** rather than from a table of properties:
-
-```rust
-pub enum TextDamage { None, Rebreak, Reshape }
-```
-
-The colour is in neither key, and that absence is load-bearing. A run's paint is lowered separately
-into `TextPaint`; a consumer claims one **brush slot** per distinct cascade result and stores the
-slot number in the shaped result. Switching theme rewrites a handful of table entries and re-colours
-every cached paragraph, with nothing re-shaped.
+The slot number itself **is** part of the paragraph key, because the shaped glyphs name it. If two
+contexts with the same text and style but different slots shared an entry, both would draw through
+whichever slot shaped first. An element that has to move to a different slot (because the slot it
+shared cannot be rewritten for it alone) therefore reshapes. `zgui-layout/src/text/reshape.rs` limits
+that to the affected boxes: the element's own text boxes and the ancestors sized from them. The
+[style engine](/docs/architecture/style-engine#text-colour) describes when an element moves.
 
 ## The paragraph cache
 
-`ParagraphCache<E>` (`crates/zgui-text/src/paragraph/cache.rs`) holds shaped results in a hash map
-under `ParagraphKey`. Each entry records a monotonic last-use clock for entry-local eviction. A
-second monotonic counter records successful lookups for the cache budget.
+`ParagraphCache<E>` (`crates/zgui-text/src/paragraph/cache.rs`) maps `ParagraphKey` to shaped
+paragraphs. `ParagraphKey::of(content)` digests everything a shape depends on:
 
-`ParagraphKey::of(content)` digests everything a shaping pass reads:
+| Input | Why |
+|---|---|
+| The generated string | — |
+| The device scale | Hinting changes the glyphs |
+| The paragraph's shaping properties | Direction and writing mode |
+| Each run's extent, `ShapingKey` and brush slot, in order | Moving a run boundary changes which characters shape together; slots are baked into glyphs |
+| Each atomic inline's id, offset and width | Content widths include the boxes |
+| The `TextMap` segments | A shaped result carries its map. Two sources can flatten to the same string (leading whitespace collapse), and sharing would misplace carets and hit tests |
 
-- the generated string;
-- the device scale, because it changes hinting and therefore the glyphs;
-- the paragraph's shaping properties;
-- each run's **extent and shaping key**, in order — a moved boundary between two runs changes which
-  characters are shaped together, so a key over the set of styles alone would miss it;
-- each atomic inline's id, offset, and current width;
-- the `TextMap` segments.
+Box **height** is not in the key. It only moves lines and belongs to the break request.
 
-The map is in the key, which is not obvious, because it changes no glyph. A shaped result *carries*
-its map, and two paragraphs can generate the same string from different source text — which is
-exactly what collapsing leading white space does. Leaving the map out would serve the second
-paragraph the first one's provenance, putting every caret and hit test in it at the wrong offset with
-nothing to report it.
+The key is computed in two parts. `ContentKey` covers everything except inline-box widths and is stored
+in a `OnceLock` on the flattened `Generated` value, so a large string is hashed once.
+`ContentKey::with_boxes` folds in the current widths for each measurement. `shape_keyed` passes the
+finished key to the shaper.
 
-The width is necessary because a shaped result carries minimum and maximum content widths, and both
-include atomic inline boxes. Two otherwise equal contexts with different box widths must not share
-those measurements. Box height is not in this key: it changes line placement and belongs to the
-breaking request.
+`ParagraphCache::insert` takes the key from the shaped value, so a paragraph cannot be filed under a
+wrong key.
 
-The brush is deliberately **not** in the key: it is an index into a table the shaped result does not
-own, so re-theming must not produce a different key.
+### Pre-shaping on workers
 
-`ParagraphCache::insert` takes the key off the value rather than as an argument, so a caller cannot
-file a paragraph under a key that does not describe it.
+When the application has a [layout pool](/docs/architecture/layout-engine#parallel-layout), the
+runtime shapes dirty paragraphs before layout asks for them. `crates/zgui-layout/src/text/preshape.rs`
+walks the dirty region and collects dirty paragraphs with no inline boxes. It flattens them on the
+frame thread, because flattening claims brush slots and slot assignment must stay deterministic.
+`Paragraphs::pre_shape` then skips keys already in the cache and shapes the misses:
 
-Before layout, the runtime collects dirty plain-text paragraphs with no inline boxes. It flattens
-them on the frame thread so brush-slot assignment remains deterministic, then shapes them on the
-layout pool. Each worker keeps a forked shaper and scratch storage across frames. The completed
-paragraphs return in request order and enter the same cache as serial shaping.
+- **16 or more misses** (`PRE_SHAPE_MIN_MISSES`): on forked shapers on the layout pool. Each worker
+  keeps its fork and scratch space across frames. Results are inserted in request order, so the cache
+  ends up exactly as serial shaping would leave it.
+- **Fewer than 16**, or a shaper that cannot fork: serially on the frame thread, which still warms the
+  cache. Measured with the `label-churn` bench, waking workers for 4–12 short labels made the frame
+  1.9× slower at the median.
 
-Paragraphs with atomic inline content are not pre-shaped. Their text depends on inline geometry,
-so their owning layout worker shapes them after that geometry is known.
+Paragraphs with atomic inlines are not pre-shaped, because their key includes inline widths that layout
+has not measured yet. They are shaped by whichever layout worker reaches them.
 
-Hashing a large string is also proportional to its byte length. The flattened `Generated` value
-therefore keeps the stable `ContentKey` in a `OnceLock`. Layout folds in the current atomic-inline
-widths for each measurement. It does not hash the string again. `shape_keyed` passes the complete
-`ParagraphKey` through the layout and shaper seams, with a debug assertion where an implementation
-computes the key independently.
+During parallel layout, each batch worker has its own paragraph cache, and batch workers never claim
+brush slots. A paragraph probed on one worker may be kept by another; the keeping pass calls
+`shape_keyed` again, which is a lookup if that measurer already has it and a shape otherwise.
 
-Current inline resolutions retain the paragraph identifiers they use. Replacing a resolution
-releases its old identifier, and reclamation waits until fragment diffing has completed. This delay
-prevents a new paragraph from taking an old slot while an old fragment can still compare against
-that slot. It also gives the budget an exact set of active `ParagraphKey`s.
+### Eviction
 
-## The recall buffer
+Live inline resolutions hold the keys they use. Replacing a resolution releases its old key, but
+reclamation waits until fragment diffing has finished, so a new paragraph cannot reuse a slot that an
+old fragment still compares against.
 
-One shaped result holds one break at a time, because the engine's own laid-out form is what the
-glyphs are drawn from. That is right for the pass whose lines will be painted and wrong for a
-measurement. So a `ShapedParagraph` also keeps a small buffer of previous breaks:
+The runtime budget (`SHAPED_PARAGRAPHS = 16_384`, `crates/zgui-runtime/src/budget/limits.rs`) evicts
+only **inactive** entries, least recently used first, via `ParagraphCache::evict_inactive`. Exceeding
+the budget never invalidates the live layout tree; a document with more active paragraphs than the
+budget stays above it.
 
-```rust
-// crates/zgui-text/src/paragraph/recall.rs
-const REMEMBERED: usize = 4;   // SmallVec<[(BreakingKey, BrokenParagraph); 4]>, oldest evicted
-```
+`Window::forget_caches` is all-or-nothing: it can drop active shaping, so it marks the whole layout tree
+dirty.
 
-Four, because a layout algorithm asks a paragraph the same three questions in a row — how narrow it
-can be, how wide it wants to be, and how tall it is at the width it was given — and then asks them
-again on the next iteration. Three makes the second round free; the fourth slot covers a nested grid
-adding a candidate width of its own. The bound is the point: a window being dragged proposes a new
-width every frame, and an unbounded map would grow for as long as the drag lasts, once per paragraph
-on the page.
+## Line breaking
 
-`plan_break` is the single place a breaking pass is decided on:
+A shaped paragraph holds one current break, because parley draws glyphs from its own laid-out form.
+That suits the pass whose lines will be painted, but not measurement probes. So `ShapedParagraph` also
+keeps the last four breaks (`crates/zgui-text/src/paragraph/recall.rs`, `REMEMBERED = 4`), keyed by
+`BreakingKey`. This recall buffer stops min-content, max-content and final-width probes from evicting
+each other.
+
+Four covers the three questions layout asks repeatedly (min-content, max-content, height at the final
+width) plus one extra width from a nested grid. It is bounded because a window being resized proposes
+a new width every frame.
+
+`ShapedParagraph::plan_break` decides every breaking pass:
 
 ```rust
 pub enum Plan<'a> {
-    /// The glyphs already reflect this request; the shaper must report what it has.
-    Reflected,
-    /// A previous pass at this width was remembered, and answers the measurement.
-    Recalled(&'a BrokenParagraph),
-    /// A breaking pass is owed, and has been counted.
-    Owed,
+    Reflected,                    // the current break already answers the request
+    Recalled(&'a BrokenParagraph),// a remembered break answers it (probes only)
+    Owed,                         // a breaking pass is needed, and has been counted
 }
-
-pub fn plan_break(&mut self, request: &BreakRequest<'_>) -> Plan<'_>
-pub fn begin_break(&mut self, request: &BreakRequest<'_>) -> bool
 ```
 
-Only `Plan::Owed` bumps `Counter::TextRebroken`, so a shaper cannot report a cheap pass and take an
-expensive one. `Recalled` is offered **only to a probe** — `BreakRequest::probe` — because answering
-from the buffer does not move the engine's laid-out form, which is exactly right for a question about
-how big the paragraph *would* be and exactly wrong for the pass whose lines are going to be drawn.
-
-`ShapedParagraph::new` is the only constructor and bumps `Counter::TextShaped`, so the two counters
-between them describe every pass the pipeline takes.
-
-The cost table:
+- Only `Owed` bumps `Counter::TextRebroken`. `ShapedParagraph::new` is the only constructor and bumps
+  `Counter::TextShaped`. Together they count every pass.
+- `Recalled` is offered only to probe requests (`BreakRequest::probing`). Answering from the buffer
+  does not change parley's laid-out form, which is fine for "how big would it be" and wrong for the
+  pass that will be painted.
+- Intrinsic-size probes are answered from `ShapedParagraph::content_widths` without breaking at all
+  (`crates/zgui-layout/src/inline/measure.rs`).
 
 | Request | Cost |
 |---|---|
-| Same content, same style, same width | `Plan::Reflected`: one hash, one comparison |
-| Same content, a width probed before, `probe = true` | `Plan::Recalled`: a linear scan of at most four entries and a clone |
-| Same content, a new width | `Plan::Owed`: one breaking pass over glyphs already held |
-| New content, a moved `ShapingKey`, a new atomic-inline width, or a new device scale | a full shape, then a break |
+| Same content, style and width | `Reflected`: one hash and one comparison |
+| Same content, a previously probed width, `probe = true` | `Recalled`: scan of at most four entries |
+| Same content, new width | `Owed`: one breaking pass |
+| New content, new `ShapingKey`, new brush slot, new inline-box width, or new device scale | A full shape, then a break |
 
-Two further inputs concern an **atomic inline** — an image, an `inline-block`, or a form control.
-Its width is part of `ParagraphKey`, because the shaped result's content widths include the box. A
-new width therefore costs a shape. Its height and `vertical-align` shift affect line placement but
-not those content widths, so they stay in `BreakRequest` and cost only a break. **Line bands** — the
-narrowed widths lines take beside a float — are also in the breaking request.
+`BreakingKey` for a request (`paragraph/key.rs::breaking_key`) combines the paragraph's and runs'
+breaking properties, each inline box's width, height and shift, the max advance, the indent basis and
+the **line bands** (narrowed widths beside floats).
 
-<Callout type="warn">
-The defect this buffer fixes was measured. With a single remembered key, min-content, max-content and
-final-width probing evicted each other: **662 re-breaks per keystroke, 1 013 per resize step and
-2 441 per glide tick** over the gallery document (`docs/perf/gallery-interactions.md`). Intrinsic
-probes are now answered from `ShapedParagraph::content_widths` without breaking at all
-(`crates/zgui-layout/src/inline/measure.rs`), and the rest from the buffer.
-</Callout>
+### No-wrap paragraphs with inline boxes
 
-### The protocol, in one call
+parley allows a break after every inline box regardless of wrap mode. For a paragraph where no run may
+wrap (`ShapedLayout::wraps` is false) and that contains inline boxes, `shape/breaking.rs` first breaks
+with no width limit and then breaks at the larger of the requested width and the full width. The line
+stays on one line, keeps its own width, and still overflows its box for clipping and ellipsis.
 
-```rust
-pub fn lay_out<'cache, S: ParagraphShaper>(
-    shaper: &mut S,
-    cache: &'cache mut ParagraphCache<S::Engine>,
-    content: &ParagraphContent<'_>,
-    request: &BreakRequest<'_>,
-) -> (&'cache mut ShapedParagraph<S::Engine>, BrokenParagraph)
-```
+### Shape and break from layout
 
-Hash the content, shape it if it is new, break the glyphs — new or not — at the width being asked
-about. It exists so that no caller reimplements the order and gets it wrong.
+`zgui_text::lay_out(shaper, cache, content, request)` hashes the content, shapes it if it is new, and
+breaks it at the requested width. `zgui-layout` performs the two steps separately through
+`MeasureContent::shape` and `MeasureContent::break_lines`, because one measure call shapes once and
+may break several times. `Paragraphs<S, R>` (`crates/zgui-layout/src/text/paragraphs.rs`) holds the
+shaper, its cache, the brush table and the worker forks. The cache lives there so the shaper can be
+swapped; the brush table lives there because it must outlive every cached paragraph.
 
-`zgui-layout` performs the two steps separately, through `MeasureContent::shape` and
-`MeasureContent::break_lines`, because a measure call shapes once and may break several times.
-`Paragraphs<S, R>` (`crates/zgui-layout/src/text/paragraphs.rs`) is the type that holds a shaper, its
-cache and the brush table together. The cache is there rather than inside a shaper because it is what
-outlives the pass; the brush table is there because it must outlive **everything**.
+## Line metrics and line boxes
 
-## Faces: selection, matching and fallback
+`FaceMetrics` always carries `ascent`, `descent` and `line_gap`. The rest are `Option`s: `x_height`
+(`ex`), `zero_advance` (`ch`), `cap_height` (`cap`), `ic_width` (`ic`), underline and strikeout offset
+and thickness, and the two MATH-table script percentages (always `None` from `zgui-text-parley`).
+`None` means the face does not carry the metric, not zero. Each has a `*_or_fallback` method:
 
-`FontSystem` (`crates/zgui-text-parley/src/system/mod.rs`) is one collection per application. It
-implements `FontSource` and `FontMetricsSource` itself, and `Shaper` and `Rasteriser` are built from
-it, so a face registered once is visible to all four seams and a metric answered once is not answered
-again.
+| Metric | Fallback |
+|---|---|
+| `x_height` | `X_HEIGHT_FALLBACK = 0.5` × size |
+| `zero_advance` | `ZERO_ADVANCE_FALLBACK = 0.5` × size, or the full size for upright vertical text |
+| `cap_height` | The face's ascent |
+| `ic_width` | The full size (ideographs are square) |
+| Decoration thickness | `DECORATION_THICKNESS_FALLBACK = 1/14` × size |
+| Underline offset | `UNDERLINE_OFFSET_FALLBACK = -1/9` × size |
 
-```rust
-// fields, for the shape of it; all four are private
-pub struct FontSystem {
-    shared: Mutex<Shared>,        // the collection, the source cache, the face table
-    memo: RwLock<MetricsMemo>,    // face metrics already answered
-    locks: AtomicU64,
-    options: FontSystemOptions,
-}
-```
+### The strut and leading
 
-A font collection needs exclusive access even to answer a question, while the cascade asks it
-questions from every worker thread through a shared reference. So the collection sits behind a lock
-and every answer that can be remembered is. `FontSystem::lock_acquisitions()` is what makes the claim
-checkable: it counts every acquisition, so a number that tracks the call count rather than the number
-of distinct queries means a memo has stopped working.
+The **strut** is the invisible zero-width box every line box is at least as tall as, so an empty line
+does not collapse.
 
-### Enumeration
+`StrutMetrics` holds the face's ascent and descent, the resolved line height, the x-height and the font
+size. **Leading** is the line height minus the face's content area (ascent + descent), split equally
+above and below: `half_leading()`, `ascent()` and `descent()` return those values. Leading is negative
+when `line-height` is tighter than the face. `zgui-text-parley` measures the strut by
+laying out `x` and caches it by `ShapingKey` (`shape/strut.rs`).
 
-```rust
-pub enum Enumeration {
-    System,      // the operating system's faces, plus registrations
-    Registered,  // registrations only  (default)
-}
-```
-
-Under `Registered` nothing is discovered, so the same registrations produce the same shaped advances
-and the same pixels anywhere. Every test and every reference image uses it. Registering a family under
-that mode also binds it to every generic role nothing else has claimed — otherwise `font-family:
-serif`, which is what an unstyled document resolves to, would find no face at all.
-
-`zgui::app::Fonts::system()` and `Fonts::shipped_only()` are the two an application picks between.
-
-### Matching
-
-`FaceQuery` is deliberately *less* than a whole style: family list, weight, slant, width, variations,
-language. Everything in it changes which face is chosen, and nothing in it only changes what is done
-with the face afterwards — so two runs with equal queries resolve to the same face however else they
-differ. It borrows rather than owns, because face lookup happens once per run per restyle.
-
-`first_match` (`crates/zgui-text-parley/src/font/query.rs`) walks the family list in author order and
-takes the first face the collection matches on the attributes. The record it issues reports the
-face's own axis values, which is what tells a caller a synthetic weight or slant is coming.
-
-### Fallback
-
-`resolve_for` adds one character to the query and sets a fallback key on the collection lookup, keyed
-on the character's script. `script_of` (`font/script.rs`) is the conversion, and it has one subtlety:
-
-> A script has two four-letter spellings — the ISO 15924 code (`Arab`) and the OpenType tag (`arab`)
-> — and a fallback list is keyed on the first while character properties are reported in the second.
-
-They differ only in the case of the first letter, so that is the conversion. A script whose OpenType
-tag is a versioned form resolves to a code no fallback list holds, and falls through to no fallback
-rather than to the wrong one.
-
-Under `Enumeration::Registered` there is no system fallback list, so the registered families **are**
-the fallback list and they are swept. That sweep is bounded by what the application registered, which
-is why it is done only in that mode: over an enumerated system it would be a walk of every installed
-face.
-
-### Synthesis
-
-When no face covers the requested weight or slant, the shaper reports that the glyphs are to be
-faked. `SYNTHETIC_BOLD_RATIO = 0.02` — a fraction of the size — thickens a stem; a synthetic italic is
-a shear about each glyph's own origin. Both are in `GlyphKey`, so a synthesised glyph is a separate
-cache entry, and the shear is applied per glyph rather than per run: applied to a run it would lean
-the line of text rather than the letters on it.
-
-### The metrics memo
-
-`face_metrics` hashes the query, the size and the writing mode into a `MemoKey` and answers from an
-`FxHashMap` behind an `RwLock`. Only a miss takes the collection's lock. A hash rather than the query
-itself, because the query borrows a family list the answer must outlive, and because a cascade asks
-the same question for thousands of elements.
-
-Registering or unregistering a family calls `forget_metrics()` and clears it whole. A face that now
-wins a match the memo already answered would otherwise keep answering with the face that used to win
-it, and two elements cascaded either side of the registration would disagree about how tall an `ex`
-is.
-
-A query that matches no face reports the default metrics — every optional field absent, a zero ascent
-— rather than failing. A document styled with a family nothing provides still has to cascade.
-
-## Metrics, baselines and inline boxes
-
-The **baseline** is the line the bodies of letters sit on. Descenders hang below it. Every vertical
-measurement in text layout is relative to it.
-
-```rust
-pub struct FaceMetrics {
-    pub x_height: Option<CssPx>,      // `ex`
-    pub zero_advance: Option<CssPx>,  // `ch`
-    pub cap_height: Option<CssPx>,    // `cap`
-    pub ic_width: Option<CssPx>,      // `ic`
-    pub ascent: CssPx,
-    pub script_percent: Option<f32>,
-    pub script_script_percent: Option<f32>,
-}
-```
-
-Four fields are optional in a specific sense: `None` means *this face does not carry the metric*, not
-"unknown" and not "zero". Reporting zero would collapse every `ex` length in the document. The
-fallbacks are named constants — `X_HEIGHT_FALLBACK = 0.5`, `ZERO_ADVANCE_FALLBACK = 0.5` — except cap
-height, which falls back to the face's ascent rather than to a fraction of the size, and `ic`, which
-falls back to the whole font size because an ideograph is square.
-
-`script_percent` and `script_script_percent` live in the `MATH` table, which is absent from every text
-face, so `zgui-text-parley` reports them as `None`.
-
-### The strut
-
-A **strut** is the invisible zero-width box every line box is at least as tall as. It is the
-line-height contribution of the block itself, independent of its content — what stops an empty line,
-or a line holding one small image, from collapsing to nothing.
-
-```rust
-pub struct StrutMetrics {
-    pub font_ascent: CssPx,
-    pub font_descent: CssPx,
-    pub line_height: CssPx,
-    pub x_height: CssPx,
-    pub font_size: CssPx,
-}
-
-pub fn half_leading(&self) -> CssPx  // (line_height - (ascent + descent)) / 2
-pub fn ascent(&self) -> CssPx        // font_ascent + half_leading
-pub fn descent(&self) -> CssPx       // font_descent + half_leading
-```
-
-**Leading** is the difference between the resolved `line-height` and the face's own content area. It
-is distributed equally above and below, and it is negative when the line height is tighter than the
-face asks for — which is legitimate and common.
-
-`ParagraphShaper::strut` is separate from shaping because a block establishes a strut whether or not
-it holds any text. `zgui-text-parley` measures it by laying out the single character `x` and reading
-the line's metrics, and caches the answer under the style's `ShapingKey`
-(`crates/zgui-text-parley/src/shape/strut.rs`). That key covers family, size, weight, slant, width and
-line height and nothing else, so two styles differing only in colour share one measurement.
+parley clamps a negative leading to zero when it reports where a line starts. CSS does not: with a tight
+line height the glyphs extend outside the line box, above and below. `shape/lines.rs::top` recomputes the
+line top with the negative leading kept (repeating parley's rounding of ascent and descent), and both
+`LineGeometry::top` and glyph positions use it.
 
 ### Line boxes
 
-```rust
-pub struct LineGeometry {
-    pub text: Range<usize>,   // bytes of the generated string on this line
-    pub top: CssPx,           // from the top of the paragraph
-    pub baseline: CssPx,      // from the top of the paragraph
-    pub height: CssPx,
-    pub width: CssPx,         // the advance the content occupies, before alignment
-    pub offset: CssPx,        // inset from the start edge, after alignment and indent
-}
-```
+`LineGeometry` reports, per line: the byte range of the generated string, `top` and `baseline` from the
+top of the paragraph, `height`, `width` (content advance before alignment) and `offset` (inset from the
+start edge after alignment and indent).
 
-The baseline is never derived from the font size. A line holding a tall inline image is taller than
-its text, and a line holding superscripts is taller still.
+- The baseline comes from the line's contents, never from the font size: tall inline images and
+  superscripts make lines taller.
+- `offset` is parley's alignment offset plus the line's minimum inline coordinate, which is non-zero
+  when the line is narrowed beside a float.
 
-`offset` is two numbers added together: the engine's alignment offset, and the line's minimum inline
-coordinate, which is anywhere but zero as soon as the line was banded around a float. Reporting only
-the first leaves a line's box at the paragraph's edge while its glyphs sit correctly beside the float.
+`zgui-layout` stacks these into `LineBox`es. Each line box records its `extents` (how far the line
+reaches above and below its baseline) and its `ink`: the union of the extents and the content area of
+every run on the line. With a line height tighter than the face, ink extends past the line box.
+`fragment/ink.rs::of_line` turns that into the rectangle damage uses, adding room for glyphs leaning
+past their advance (0.25 × the ink height, the tangent of a synthesised italic's 14°), one device pixel
+for rounding, and text shadows. The rectangle is mapped through the box's transform, so damage covers
+overhanging glyphs wherever the box is drawn.
 
-### Inline boxes
+parley offers two walks over a line: by run, or by positioned item (which visits every glyph). Over a
+long paragraph the second costs four times what the break itself costs. It is only needed to locate
+atomic inlines, so it is used only when the context contains one.
 
-An **atomic inline** is something on the line that is not text and is not broken into: an image, an
+### Atomic inlines
+
+An **atomic inline** is a non-text item on the line that is not broken internally: an image, an
 `inline-block`, a form control.
 
 ```rust
 pub struct InlineBoxGeometry {
     pub id: u64,
     pub offset: usize,     // byte offset in the generated string
-    pub width: CssPx,      // the real margin-box width
-    pub height: CssPx,     // the real margin-box height
+    pub width: CssPx,      // margin-box width
+    pub height: CssPx,     // margin-box height
     pub ascent: CssPx,     // baseline to top margin edge, before the shift
-    pub shift: CssPx,      // the resolved vertical-align shift, positive upwards
+    pub shift: CssPx,      // resolved vertical-align shift, positive upwards
 }
 
 pub fn shaper_height(&self) -> CssPx   // ascent + shift
+pub fn below_baseline(&self) -> CssPx  // height - shaper_height
 ```
 
-A shaper places an inline box with its **bottom edge on the baseline**, so the only lever for moving
-it is the height it is told. The height handed over is therefore not the real height; it is
-`shaper_height()`, and the real geometry travels beside it.
+parley places an inline box with its bottom edge on the baseline. To position it, the shaper is given
+`shaper_height()` instead of the real height; the real geometry is kept alongside.
 
-`vertical-align: top` and `bottom` are resolved against the line box, which does not exist until
-everything else on the line has been placed. So a line carrying one is broken again with the shift the
-first pass revealed, up to `MAX_REALIGN_PASSES = 4`
-(`crates/zgui-layout/src/inline/measure.rs`). The exchange only ever makes a line taller, so it
-settles; the bound exists because a document mixing enough of them can take longer than a frame is
-worth. A layout that stops one pass early is a box a pixel out; a layout that does not stop is a
-window that never paints again.
+`vertical-align: top` and `bottom` are resolved against the line box, which only exists after
+everything else on the line is placed. A line containing one is broken again with the shift the
+previous pass revealed, up to `MAX_REALIGN_PASSES = 4` (`crates/zgui-layout/src/inline/measure.rs`).
+Each pass can only make the line taller, so it converges; the bound caps the cost.
 
-## Glyphs into pixels
+## Rasterising glyphs
 
-Each fragment says which line of which paragraph it draws. `visit_line` turns that into `ShapedRun`s.
+Each text fragment names one line of one paragraph. During paint, `visit_line` turns it into
+`ShapedRun`s:
 
 ```rust
 pub struct ShapedRun<'a> {
     pub face: FaceId,
     pub size: f32,             // device pixels
-    pub synthetic_bold: f32,   // fraction of the size; zero when the face covers the weight
-    pub synthetic_slant: f32,  // degrees; zero when a real italic was found
+    pub synthetic_bold: f32,   // fraction of the size; 0 when the face covers the weight
+    pub synthetic_slant: f32,  // degrees; 0 when a real italic was found
     pub has_color: bool,
     pub brush: Brush,          // a slot, never a colour
     pub glyphs: &'a [ShapedGlyph],
@@ -723,260 +563,163 @@ pub struct ShapedRun<'a> {
 pub struct ShapedGlyph { pub glyph: u16, pub x: f32, pub y: f32 }
 ```
 
-Positions are relative to the **line box's own top-left corner**, never to the paragraph or to the
-surface. That is what lets one shaped paragraph be drawn at any position without being re-walked:
-whoever draws it adds the line box's absolute origin, which it already has from the fragment tree, and
-a paragraph that scrolled costs nothing.
+Positions are relative to the **line box's top-left corner**. The painter adds the line box's absolute
+origin from the fragment tree, so a scrolled paragraph needs no new glyph walk.
 
-### Which of the two paths a run takes
+### Atlas or outlines
 
-```rust
-pub enum RasterPath { Atlas, Vector }
+`RasterPath::of` (`crates/zgui-text/src/glyph/route.rs`) picks one path per run, before anything is
+rasterised. A run goes to the atlas if it has colour glyphs, or if it is small enough, its transform is a
+pure translation and its brush is a single colour. Everything else is drawn as outlines.
 
-pub fn of(profile: &RunProfile) -> Self {
-    if profile.color_glyphs { return Self::Atlas; }
-    let surface = profile.surface;
-    let cacheable =
-        profile.size <= ATLAS_MAX_SIZE && surface.translated_only && surface.solid_brush;
-    if cacheable { Self::Atlas } else { Self::Vector }
-}
-```
+| Constant | Value | Meaning |
+|---|---|---|
+| `ATLAS_MAX_CSS_SIZE` | 96 CSS px | Largest run the atlas serves, stated in CSS pixels so a heading takes the same path on every display |
+| `ATLAS_MAX_SIZE` | 256 device px | Hard cap on a cached tile. The effective limit is 96 at 1×, 192 at 2×, 256 from 3× |
 
-`ATLAS_MAX_SIZE = 96.0` device pixels. Neither path is a fallback for the other. The atlas rasterises
-once on the processor and draws one quad per glyph, which is what makes a page of body text cost
-almost nothing, and it is the only path that can be hinted. Outlines are filled by the frame's path
-rasteriser, which costs more per glyph and is the only path that survives a rotation, a size no cache
-should hold, or a brush that is not one colour.
+| Path | Used for | Notes |
+|---|---|---|
+| Atlas | Small runs with a translation-only transform and a solid brush; all colour runs | Rasterised once on the CPU, drawn as one quad per glyph. The only path that can be hinted or use subpixel (per-channel) coverage. |
+| Vector | Large sizes, non-translation transforms, non-solid brushes | Outlines filled by the frame's path rasteriser. |
 
-A **colour run takes the atlas whatever else is true**. A colour glyph is a picture — layered outlines
-or a bitmap strike — and there is no single outline to fill. Sending one down the vector path would
-draw its first layer's silhouette in the text colour.
+Colour runs always use the atlas, because a colour glyph is layered outlines or a bitmap, with no
+single outline to fill.
 
-The choice is made once, in `FrameContent::visit_line` (`crates/zgui-paint/src/content/cache.rs`),
-*before* anything is rasterised. A run that leaves the atlas never allocates a tile and never touches
-the glyph cache, so a page of turned headings does not evict the body text behind it. The one
-exception is honest: a face with no curves at all — a bitmap-only face — falls back to tiles, because
-a resampled letter is a letter and the alternative is a run that draws nothing.
+The choice is made in `FrameContent::visit_line` (`crates/zgui-paint/src/content/cache.rs`). A vector
+run never allocates an atlas tile or touches the glyph cache, so rotated headings do not evict body
+text. A bitmap-only face, which has no curves, falls back to tiles.
 
-### The key, and the pen
+### Glyph keys and pen positions
 
-```rust
-pub struct GlyphKey {
-    pub face: FaceId,
-    pub glyph: u16,
-    pub size_bits: u32,           // bits, so the key hashes and compares exactly
-    pub offset: SubpixelOffset,
-    pub style: RasterStyle,       // Grayscale | Subpixel | Color
-    pub synthetic_bold_bits: u32,
-    pub synthetic_slant_bits: u32,
-}
-```
+`GlyphKey` holds the face, glyph index, size, `SubpixelOffset`, `RasterStyle` (`Grayscale`, `Subpixel`
+or `Color`) and the synthetic bold and slant amounts. Floats are stored as bits so the key hashes and
+compares exactly. A glyph's horizontal position is split into a whole pixel (where the tile is drawn)
+and a quantised fraction (how far the outline is shifted before rasterising).
+`SubpixelOffset::STEPS = 4`, so each glyph has at most four phases.
 
-A glyph's position along the baseline is fractional, and a rasteriser cannot be asked for an unbounded
-set of positions. The position is therefore split in two: the whole pixel the tile is drawn at, and a
-quantised fraction the outline is shifted by *before* it is turned into coverage.
-`SubpixelOffset::STEPS = 4`, which is what turns an unbounded set of positions into four.
+`PenPosition::of` quantises the position to quarter pixels first and only then splits it into pixel and
+phase. Rounding the phase and flooring the pixel independently would disagree whenever the fraction
+rounds up to a whole pixel, and the glyph would land almost a pixel left of where it belongs. The
+position passed in must be **absolute** (including the line box's own left edge); a line box at half a
+pixel shifts every phase on it.
 
-The two halves are one type, and that is not tidiness:
+Because position enters the key only as a phase, the same letter at the same phase anywhere on the page
+is one cache entry, and scrolling by whole pixels reuses every tile.
 
-```rust
-pub fn of(position: f32) -> Self {
-    let steps = f32::from(SubpixelOffset::STEPS);
-    let quantised = (position * steps).round() / steps;   // quantise first,
-    let pen = quantised.floor();                          // then split
-    let step = ((quantised - pen) * steps).round() as u8;
-    Self { pen, offset: SubpixelOffset(step % SubpixelOffset::STEPS) }
-}
-```
-
-Taking the phase by rounding and the pixel by flooring disagrees for every position whose fraction
-rounds up to a whole pixel: the phase says *no shift* while the floor says *the pixel below*, and the
-glyph lands nearly a whole pixel to the left of where it belongs. Along a line of proportional text
-that is one letter crowding its neighbour and the next opening a gap.
-
-The position passed to `PenPosition::of` must be **absolute** — the line box's own left edge included.
-A line box at half a pixel shifts every phase on it, and splitting a line-relative position rasterises
-for a phase the glyph is never drawn at.
-
-Because the position enters the key only through the phase, the same letter at the same phase anywhere
-on the page is one entry, and a paragraph that scrolled by a whole pixel keeps every one of them.
+**Subpixel coverage** is used only when all three hold (`TextPlacement::keeps_subpixel`): the device
+supports dual-source blending, the target is opaque, and the run's transform is a translation by
+**whole device pixels**. Any other transform (rotation, scale, fractional translation) resamples the
+tile and would turn the per-channel stripes into colour fringes, so those runs use grayscale coverage.
+Recorded lines are keyed on whether they keep subpixel coverage, so a box that moves on or off the
+pixel grid re-emits its text. Text shadows never use subpixel coverage.
 
 ### The glyph cache
 
-**An atlas** is a large texture that many small images share, so that drawing a thousand glyphs is a
-thousand quads sampling one texture rather than a thousand texture bindings. `zgui-atlas` owns the
-allocation and eviction policy; `AtlasKey` is what a caller caches by, `AtlasTile` is the texture, tile
-id and rectangle it got back.
+An **atlas** is a large texture shared by many small images, so a thousand glyphs are a thousand quads
+sampling one texture. `zgui-atlas` owns allocation and eviction. The glyph cache
+(`crates/zgui-paint/src/content/glyphs/cache.rs`) sits in front of it and remembers, per `GlyphKey`:
 
-The glyph cache (`crates/zgui-paint/src/content/glyphs/cache.rs`) sits in front of it, because the
-atlas answers a narrower question than a frame is asking:
+1. **The tile.**
+2. **Placement and size.** These come from the rasterised image; without them a cache hit would still
+   require rasterising to know where to draw.
+3. **Absence.** A space has no pixels and no tile. Without remembering that, every space would be
+   re-hinted on every full repaint.
 
-```rust
-struct Remembered {
-    tile: Option<AtlasKey>,               // None when there were no pixels at all
-    placement: Point<DevicePx, Device>,   // top-left of the pixels relative to the glyph's origin
-    size: Size<u32, Device>,
-}
-```
+It does not cache failures that depend on the current state: an unresolved face (it may be registered
+later) or a full atlas.
 
-Three facts are cached, and each is a defect if it is not:
+| Situation | Behaviour |
+|---|---|
+| Atlas full | Evict one cold generation (and the matching glyph and vector-mask records), retry once. If the retry fails, draw nothing and refuse to cache the paint record, so it is not replayed with a missing letter |
+| Atlas evicts a tile | The glyph cache drops the matching record immediately. A bounded tombstone remembers the key; rebuilding it bumps `Counter::RebuiltAfterEviction` |
+| Blank answers and tombstones | Capped at 4 096 each (`COLD_ANSWERS`), since atlas pressure cannot evict them |
+| Face has no outline, or glyph has no pixels | No primitive. Nothing is drawn in place of the glyph |
 
-1. **The tile.** Two glyphs of one extent share a tile shape and sit at different heights above the
-   baseline.
-2. **The placement and extent.** They live in the rasterised image, so a frame holding the tile and
-   not the placement has to rasterise the glyph again to learn where to put it — the whole cost of
-   rasterising, paid on every frame, for a cache hit.
-3. **Absence.** A space rasterises to an image with no pixels, so nothing is inserted into the atlas
-   for one. A cache that only remembered tiles would run the face's whole hinting program for every
-   space on the page on every full repaint.
+### Atlas tile format
 
-Two things are deliberately **not** remembered: a key whose face could not be resolved, and a key the
-atlas had no room for. Both are states of the world rather than properties of the glyph — a face
-registered later, or an eviction, makes the same key succeed, and a remembered failure would outlive
-its cause.
+`AtlasGlyph::of(key, image)` makes two conversions:
 
-Atlas eviction reports the keys it removed. The content cache immediately removes the matching
-tile and placement records, so the glyph cache and atlas cannot disagree about what is resident. A
-bounded tombstone remembers that the key existed. Rebuilding it bumps
-`Counter::RebuiltAfterEviction` rather than looking like an ordinary miss.
+- Subpixel glyphs have three coverage values per pixel; the atlas pool is four bytes wide, so a fourth
+  channel is padded in.
+- Colour glyphs arrive with straight alpha; the atlas is premultiplied, so colour channels are scaled by
+  alpha. Uploading straight alpha makes soft edges glow.
 
-Answers with no tile need a separate bound because atlas pressure cannot evict them. The cache keeps
-at most 4 096 blank-glyph answers and 4 096 recent eviction tombstones. Tile-backed entries remain
-bounded by the atlas. This prevents a long stream of distinct spaces or evicted glyphs from turning
-metadata into an unbounded process-lifetime cache.
-
-### The hand-off to the atlas
-
-```rust
-pub struct AtlasGlyph { pub key: AtlasKey, pub size: Size<u32, Device>, pub texels: Vec<u8> }
-pub fn of(key: &GlyphKey, image: &GlyphImage) -> Self
-```
-
-Two conversions happen here and both go wrong silently if they do not. A subpixel glyph is three
-coverage values per pixel and the atlas pool that draws it is four bytes wide, so the bytes are padded
-with an opaque fourth channel that is never read as coverage. A colour glyph arrives with straight
-alpha and every atlas pool is premultiplied, so its colour channels are scaled by its alpha. Uploading
-straight bytes makes every soft edge bloom light, which no invariant test can see and every user can.
-
-The `AtlasKey` handle is a hash of the whole `GlyphKey`, so two requests that would rasterise
-identically share a tile and two that would not never can.
-
-All three failures — no outline, no pixels, no room — produce **no primitive** rather than a
-placeholder. A frame that drew a box where a space belongs would be worse than one that drew nothing,
-and an atlas that is full this frame has room again next frame once eviction has run.
+`AtlasKey` is a hash of the whole `GlyphKey`, so requests that would rasterise identically share a tile.
 
 ### The outline path
 
-`OutlineKey` carries the face, the glyph, the size and the synthetic slant — and no position, because
-an outline is the same curve wherever it is drawn. There is no phase, so the whole subpixel apparatus
-is absent, and the curves are extracted **unhinted**: a curve has no pixel grid to be pulled onto, and
-hinting one would bake a pixel grid into a shape that is about to be rotated.
+`OutlineKey` holds face, glyph, size and synthetic slant, and no position: an outline is the same curve
+wherever it is drawn, and the path rasteriser antialiases analytically, so there is no phase. Outlines
+are extracted **unhinted**, since hinting snaps to a pixel grid that a rotated curve no longer has.
 
-`GlyphOutline` is `Arc<BezPath>`, and the allocation matters as much as the curves: a path rasteriser
-keeps its encoding of a path under the identity of the `Arc`, so handing back a fresh copy of identical
-curves every frame would re-encode every glyph of every turned heading, every frame. `Outlines`
-(`crates/zgui-text-parley/src/raster/outline.rs`) holds 512 of them and clears wholesale rather than
-evicting, because the set is bounded by the display-sized glyphs on the screen at once.
+`GlyphOutline` is `Arc<BezPath>`. The path rasteriser caches its encoding of a path by `Arc` identity,
+so returning the same allocation each frame avoids re-encoding every glyph. `Outlines`
+(`crates/zgui-text-parley/src/raster/outline.rs`) holds up to 512 and clears all at once when full.
+Each placed outline glyph (`OutlineGlyph`) shares that allocation and carries its pen position;
+the display list places it by translation. Repeated outlines can additionally be rasterised once into
+glyph sheets; see [Paint and the scene](/docs/architecture/paint-and-scene).
 
-## Every cache on the path
+### Carets and selection
 
-| Cache | Where | Keyed on | Cleared by |
+Caret and selection rectangles come from `visit_clusters`. A caret plan records the box that owns it as
+well as the paragraph, so when two boxes share one cached paragraph (same text and style), the caret is
+drawn only in the box that holds it.
+
+## All text caches
+
+| Cache | Where | Key | Cleared by |
 |---|---|---|---|
-| Lowered text styles | `zgui-layout` `inline/content/styles.rs` | the identity of three computed-style groups | the pass being rebuilt |
-| Flattened content | `zgui-layout` `inline/mod.rs` | the boxes, their styles and the scale | the content changing |
-| Face metrics | `zgui-text-parley` `metrics/memo.rs` | query + size + writing mode | any registration |
+| Lowered text styles | `zgui-layout` `inline/content/styles.rs` | Computed-style identity | Rebuilding the pass |
+| Flattened content | `zgui-layout` `inline/content/memo.rs` | The boxes, their styles, the scale | Any of those changing |
+| Face metrics | `zgui-text-parley` `metrics/memo.rs` | Query + size + writing mode | Any registration |
+| Font query state | `vendor/fontique` `collection/query.rs` | Family list (last four), script and locale | A collection generation change |
 | Struts | `zgui-text-parley` `shape/strut.rs` | `ShapingKey` | `Shaper::forget_measurements` |
-| Face bytes | `zgui-text-parley` `raster/faces.rs` | `FaceId` | never — a handle names a file and an index |
-| Shaped paragraphs | `zgui-text` `paragraph/cache.rs` | `ParagraphKey` | inactive LRU budget eviction, a brush split, or an explicit reset |
-| Breaks of one paragraph | `zgui-text` `paragraph/recall.rs` | `BreakingKey`, four deep | the fifth distinct width |
-| Glyph tiles and placements | `zgui-paint` `content/glyphs/cache.rs` | `GlyphKey` | its atlas tile being evicted, or a lost device |
-| Glyph curves | `zgui-text-parley` `raster/outline.rs` | `OutlineKey`, 512 deep | reaching capacity |
+| Face bytes | `zgui-text-parley` `raster/faces.rs` | `FaceId` | Never (a handle names a file and an index) |
+| Shaped paragraphs | `zgui-text` `paragraph/cache.rs` | `ParagraphKey` | Inactive LRU eviction, a brush-slot move, or `forget_caches` |
+| Recent breaks | `zgui-text` `paragraph/recall.rs` | `BreakingKey`, four deep | The fifth distinct width |
+| Glyph tiles and placements | `zgui-paint` `content/glyphs/cache.rs` | `GlyphKey` | Atlas eviction, lost device |
+| Glyph outlines | `zgui-text-parley` `raster/outline.rs` | `OutlineKey`, 512 deep | Reaching capacity |
 
-Two limits are stated in `zgui-runtime`: `SHAPED_PARAGRAPHS = 16_384`
-(`crates/zgui-runtime/src/budget/limits.rs`) and `ATLAS_SOFT_BYTES = 64 MiB`
-(`crates/zgui-runtime/src/window/mod.rs`).
-
-Budget eviction is entry-local. Current inline resolutions pin the keys they name. The budget drops
-only inactive entries, in least-recently-used order, so crossing 16 384 entries does not invalidate
-the live layout tree. A document with more than 16 384 active paragraphs stays above the soft level
-instead of reshaping active text on every frame.
-
-An explicit reset remains all-or-nothing. `Window::forget_caches` can remove active shaping, so
-that path marks the whole layout tree dirty. Every cached measurement taken from those shaped runs
-must then be computed again.
+The atlas soft limit is `ATLAS_SOFT_BYTES = 64 MiB` (`crates/zgui-runtime/src/window/mod.rs`).
 
 ## What invalidates a paragraph
 
-| Change | Costs | Why |
+| Change | Cost | Reason |
 |---|---|---|
-| The element's `color`, or the theme | nothing | the brush is a slot; the slot is rewritten in place |
-| `text-align`, `text-indent`, `overflow-wrap`, `line-break` | one break | `BreakingKey` moved, `ShapingKey` did not |
-| The available width | one break | the width is in `BreakingKey` |
-| An atomic inline changing width | a shape | its width is in `ParagraphKey` and in the stored content widths |
-| An atomic inline changing height or `vertical-align` | one break | both are inputs to `BreakRequest` |
-| A float appearing beside the text | one break | the line bands are in `BreakingKey` |
-| `font-size`, `font-family`, `letter-spacing`, `font-feature-settings`, `direction` | a shape | `ShapingKey` moved |
-| The text itself | a shape | the string is in `ParagraphKey` |
-| The device scale factor | a shape, every paragraph | the scale is in `ParagraphKey` |
-| A face registered or dropped | metrics memo and struts cleared | the best match may have moved |
-| An element leaving a shared brush slot | the affected inline contexts reshape | what their glyphs name was baked in when they were shaped; a shared key stays cached while another active context names it |
+| `color`, or a theme change | Nothing | The slot's colour is rewritten in place |
+| `text-align`, `text-indent`, `overflow-wrap`, `line-break` | One break | `BreakingKey` changed |
+| Available width | One break | Width is in `BreakingKey` |
+| Inline box height or `vertical-align` | One break | Both are in the break request |
+| A float beside the text | One break | Line bands are in `BreakingKey` |
+| Inline box width | One shape | Width is in `ParagraphKey` |
+| `font-size`, `font-family`, `letter-spacing`, `font-feature-settings`, `direction`, … | One shape | `ShapingKey` changed |
+| The text | One shape | The string is in `ParagraphKey` |
+| An element moving to a different brush slot | One shape for its contexts | The slot is in `ParagraphKey` |
+| Device scale factor | Every paragraph reshapes | Scale is in `ParagraphKey` |
+| A face registered or removed | Metrics memo and font query state cleared | The best match may have changed |
 
-What keeps a style change on the cheap side of that table is a narrowing in
-`crates/zgui-style/src/damage/layout_damage.rs`. The style engine's own hook is handed two styles and
-no memory, so the only classification it can make is the conservative one: any layout-affecting change
-re-shapes. `TextKeyStore` gives it a memory — each element's last shaping and breaking keys — and
-compares:
+On the style side, `TextKeyStore` compares each element's previous shaping and breaking keys to
+narrow a restyle to `TextWork::None`, `Rebreak` or `Reshape`; see
+[Invalidation](/docs/architecture/invalidation#reshaping-and-rebreaking-text). A text edit is
+written into the existing box; see
+[Rewriting text in place](/docs/architecture/layout-engine#rewriting-text-in-place).
 
-```rust
-pub enum TextWork { None, Rebreak, Reshape }
-pub fn record(&mut self, node: NodeKey, style: &ComputedStyle) -> TextWork
-```
-
-One exception is written into `translate.rs`: when the engine reports the widest damage it can, the
-narrowing is not applied. That case means a generated-content box has started or stopped existing, so
-the text under the element changed with no property of the element's own style moving.
-
-`Dirty::RESHAPE` is also the one bit the box-tree stage deliberately does **not** retire. The fragment
-pass reads it to decide that a line holding different glyphs has to be painted again where it stands.
-
-## Costs, measured
+## Measured costs
 
 | Figure | Value | Source |
 |---|---|---|
-| Breaking against shaping, one thousand words | about 1 to 28 | `crates/zgui-text/src/lib.rs` |
-| One keystroke: one edit, one paragraph reshaped, one box repainted | 301.39 µs p50 | `kitchen.keystroke`, `docs/performance.md` |
+| Shaping vs breaking, 1 000 words | about 28 : 1 | `crates/zgui-text/src/lib.rs` |
 | Rasterising one glyph, with a stable scaler id | 32.0 µs | `docs/perf/endtoend.md` |
-| …without one, so the face's control program runs per glyph | 74.8 µs | `docs/perf/endtoend.md` |
-| A scale-factor change, gallery document, 483 placed glyphs | 218–230 rasterisations | `docs/perf/scale.md` |
-| The same document moving back to a ratio it has been at | 0 rasterisations | `docs/perf/scale.md` |
+| Same, with a fresh scaler id per glyph | 74.8 µs | `docs/perf/endtoend.md` |
+| Scale-factor change, gallery, 483 placed glyphs | 218–230 rasterisations | `docs/perf/scale.md` |
+| Returning to a previously used scale | 0 rasterisations | `docs/perf/scale.md` |
 
-The scaler-id figure is the one to understand, because it explains why `GlyphKey` carries what it
-carries. A profile over the gallery found that **82 % of everything the application did was the
-TrueType bytecode hinting interpreter**, and actual rasterisation was 2 %
-(`docs/perf/endtoend.md`). The cause was a fresh font identity per glyph, which made the rasteriser
-re-run the face's `fpgm` and `prep` control programs — work that is supposed to happen once per face
-and size — for every single glyph. The fix is one line, and it is in the tree:
+The scaler id matters because swash runs a face's TrueType hinting programs (`fpgm` and `prep`) once
+per font identity. A fresh identity per glyph re-runs them for every glyph. `raster/glyphs.rs` builds
+the scaler with `builder_with_id(font, identity(key.face, index))`, a stable id per face.
 
-```rust
-// crates/zgui-text-parley/src/raster/glyphs.rs
-let mut scaler = context
-    .builder_with_id(font, identity(key.face, index))
-    .size(key.size())
-    .hint(true)
-    .build();
-```
-
-Two counters watch the rest. `Counter::GlyphsRasterised` reading anything other than zero on a repaint
-of unchanged text is a cache that is not being consulted. `Counter::TextShaped` and
-`Counter::TextRebroken` are bumped in exactly one place each, so a shaper cannot report one and do the
-other.
-
-One measurement inside the engine is worth stating because it shapes an interface. `parley` offers two
-walks over a line: one yields its runs, the other yields positioned items and therefore touches every
-glyph. Over a long paragraph the second costs four times what the line break itself costs
-(`crates/zgui-text-parley/src/shape/lines.rs`). It is only needed when the context holds an atomic
-inline, so it is taken only then — which for body text and for every label in a component library
-means never.
+Counters to watch: `Counter::GlyphsRasterised` should be zero when repainting unchanged text.
+`Counter::TextShaped` and `Counter::TextRebroken` are each bumped in exactly one place.
 
 ## Next
 
@@ -989,7 +732,7 @@ means never.
   <Card
     title="The renderer"
     href="/docs/architecture/renderer"
-    description="The atlas on the device, and how a coverage tile becomes a lit pixel."
+    description="The atlas on the device, and how a coverage tile becomes a pixel."
   />
   <Card
     title="Caches"
@@ -999,6 +742,6 @@ means never.
   <Card
     title="Text and fonts"
     href="/docs/building/text-and-fonts"
-    description="The same material from the application's side: registering faces, and what re-shapes."
+    description="The application side: registering faces, and what causes reshaping."
   />
 </Cards>

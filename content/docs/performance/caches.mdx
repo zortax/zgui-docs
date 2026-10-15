@@ -1,693 +1,397 @@
 ---
-title: Caches
-description: Every cache in the pipeline, what fills it, what invalidates it, what a miss costs, and how large it is allowed to get.
+title: Caches and memory
+description: Every cache in the pipeline, what fills and invalidates it, what a miss costs, how large it may grow, and how the budget keeps memory bounded.
 ---
 
-The framework keeps the result of every stage and re-uses it. This page names each store that keeps
-one, and says for each what fills it, what invalidates it, what a miss costs, and what bounds it. It
-follows [the cost model](/docs/performance/cost-model), which gives the measured cost of each kind
-of change and is where the interaction numbers live.
+zgui keeps the result of each pipeline stage between frames and reuses whatever is still valid. This
+page lists each of those stores in pipeline order, from style to drawing, and then explains how
+their memory is bounded. [The cost model](/docs/performance/cost-model) gives the cost of each kind
+of change; the architecture pages linked from each section describe the mechanisms in depth.
 
-## The inventory
+## Inventory
 
-| Cache | What it holds | Bounded by |
+| Cache | Holds | Bounded by |
 |---|---|---|
-| computed-style sharing | one allocation per distinct cascade result | the live document |
-| paint-style lowering | one lowered paint description per distinct style | the distinct styles used since the last scale change |
-| the box tree | the boxes themselves, spliced rather than rebuilt | the document |
-| per-box layout | one exact full layout, sixteen exact size-only questions, and intrinsic answers per axis | fixed answers per box |
-| paragraph shaping | one shaped paragraph per distinct content and style, with its last use | 16 384 entries, inactive LRU |
-| the recall buffer | four breaking results per shaped paragraph | four per paragraph |
-| the glyph cache | tile, placement and extent for one glyph key, absence included | the atlas, plus 4 096 blank answers and 4 096 eviction tombstones |
-| the atlas | rasterised glyphs, pictures, and small vector masks, in textures | 64 MiB, soft |
-| the vector cache | one placed drawing per node | the live nodes; 16 384 entries |
-| per-fragment paint records | the compiled primitives one fragment drew | 64 MiB, soft |
-| the scene's side tables | interned clips, paints and coordinate systems | references and generations |
-| the bounds tree | draw order for this frame's primitives | this frame |
-| the hit index | one entry per fragment, one spatial hierarchy per coordinate system | the fragments |
-| renderer target pool | group targets and scroll-shift scratch | its pool ceiling and idle maintenance |
-| device memory | live renderer allocations and zgui-owned callback-surface textures | pinned; no eviction level |
+| [computed styles](#computed-style-sharing) | one allocation per distinct cascade result | the live document |
+| [box tree](#the-box-tree) | the boxes, spliced rather than rebuilt | the document |
+| [per-box layout](#per-box-layout) | one final layout, 11 size answers, intrinsic answers per axis | fixed slots per box |
+| [shaped paragraphs](#shaped-paragraphs) | one shaped result per distinct content and style | 16 384 entries, soft |
+| [recall buffer](#the-recall-buffer) | line-breaking results | 4 per paragraph |
+| [hit index](#the-hit-index) | one entry per fragment | the fragments |
+| [paint-style lowering](#paint-style-lowering) | one lowered paint description per distinct style | distinct styles since the last scale change |
+| [paint records](#paint-records) | the primitives each fragment drew | 64 MiB, soft |
+| [glyph cache](#the-glyph-cache) | placement and extent per glyph, blank glyphs included | the atlas, plus 4 096 blank answers and 4 096 eviction records |
+| [atlas](#the-atlas) | glyphs, pictures, small vector masks, path-glyph sheets | 64 MiB, soft |
+| [vector caches](#vector-caches) | parsed drawings, placements, recognitions, payloads, CPU layers, encodings | see the section |
+| [scene side tables](#scene-side-tables) | clips, paints, text paints, shader parameters, coordinate systems | reference counts and generations |
+| [bounds tree](#the-bounds-tree) | draw order for this frame's primitives | this frame |
+| render targets | offscreen group targets and scroll-shift scratch | the target pool's own ceiling |
+| device memory | live renderer allocations and zgui-owned callback-surface textures | pinned; never evicted |
 
-Seven of these are registered with a **budget registry** that reports retained memory and takes
-rebuildable memory back. Five have a soft level. `RenderTargets` manages its own ceiling, and
-`DeviceMemory` reports pinned allocations without an eviction level. The rest are bounded by the
-document, by the frame, or by a fixed number of slots.
+Eight of these report to the [budget registry](#the-budget-registry), which measures retained memory
+and releases what can be rebuilt. The rest are bounded by the document, by the frame, or by a fixed
+number of slots.
 
 ## Computed-style sharing
 
-A **computed style** is the output of the cascade for one element: every property with a final
-value, no keywords and no inheritance left. It is a shared pointer, and it holds one shared
-allocation per property group — the font group, the background group, the border group, and so on.
+A **computed style** is the cascade's result for one element. It holds one shared allocation per
+property group (font, background, border, and so on), and elements that cascade to the same result
+share those allocations.
 
-| The computed style | |
+| | |
 |---|---|
-| Filled by | the cascade. Elements that cascade to the same result share the allocation. |
-| Invalidated by | a restyle that produces a different result. The old allocation is freed when the last element holding it drops it. |
-| A miss costs | one more pass of whatever the consumer does per style. |
-| Bounded by | the live document. |
+| Filled by | the cascade |
+| Invalidated by | a restyle that produces a different result; the old allocation is freed when its last holder drops it |
+| A miss costs | one more pass of whatever a consumer does per style |
+| Bounded by | the live document |
 
-The point of the sharing is downstream. A consumer keys its own work on the pointer and does that
-work once per **distinct style** rather than once per element — in a component library, one to two
-orders of magnitude fewer (`crates/zgui-css/src/computed/style.rs`).
+Later stages key their caches on these pointers, so they work once per **distinct style** rather than
+once per element. In a component library that is one to two orders of magnitude fewer.
 
-```rust
-// The identity test: a pointer comparison, no values compared.
-StructPtr::of(style.get_border()) == StructPtr::of(other.get_border())
-```
-
-Equal identities are proof of equal values. **The converse does not hold and must not be assumed.**
-The cascade may run on several worker threads, and each worker may build its own copy of a logically
-identical group. So a cache keyed on identity is a fast path with a **content-hashed fallback**
-behind it, never the only answer. The next section is the framework's own instance of that pattern.
-
-Two further rules follow from the same design:
-
-- **Anonymous boxes share too.** A box that CSS requires but no element declares is built by
-  `inherited_style(parent)`, which takes the parent's own inherited allocations and one shared set
-  of initial values. A document of a thousand paragraphs allocates none of them a thousand times. A
-  copy would agree with the parent on every property and be a stranger to all of them, and the run's
-  glyphs would claim a colour slot that no element owns.
+- **Equal pointers prove equal values, but unequal pointers prove nothing.** Cascade workers can each
+  build their own copy of an identical group, so a cache keyed on pointer identity needs a
+  content-hashed fallback. [Paint-style lowering](#paint-style-lowering) is an example.
 - **An address is an identity only while the allocation lives.** A table that outlives a frame holds
-  `PinnedGroup`, which keeps a reference to the group it names, so the address cannot be reissued
-  under it. The text colour slots are keyed that way (`crates/zgui-text-style/src/style/paint.rs`).
+  a `PinnedGroup`, which keeps the group alive so its address cannot be reused. Text colour slots are
+  keyed this way.
 
-## The paint-style lowering cache
+See [Computed-style sharing](/docs/architecture/style-engine#computed-style-sharing) in the style
+engine.
 
-**Lowering** turns a computed style into the description the emit walk draws from: colours resolved,
-lengths in device pixels, shadows and borders in the form a primitive carries.
+## The box tree
 
-| The lowering | |
+Layout runs over the **box tree**: one or more boxes per element, plus anonymous boxes. Fragment
+reuse, geometry diffing, paint records and damage are all keyed by box.
+
+| | |
 |---|---|
-| Filled by | the emit walk, once per distinct style. |
-| Invalidated by | a change of device scale, which clears the whole cache. |
-| A miss costs | one lowering, plus a content hash on the identity-miss path. |
-| Bounded by | the distinct lowerings a window has performed since the last scale change. |
+| Filled by | the box builder |
+| Invalidated by | an element that owes a rebuild after a structural change |
+| A miss costs | building that element's boxes and splicing them in; a whole build when the change cannot be confined |
+| Bounded by | the document |
 
-There are two lookups. `LoweringKey` names exactly ten group identities — background, border,
-effects, outline, svg, inherited box, text, box, inherited text, and the two custom-property maps —
-and comparing it is a handful of integer tests. Behind it is a map from a content hash to the
-entries holding that hash.
+**A whole build gives every box a new identity**, so nothing keyed by box can be reused: every
+fragment compares as changed and the damage becomes the whole window. zgui therefore splices each
+changed element's boxes into the existing tree, rewrites text runs in place where it can, and builds
+the whole tree only when a change cannot be confined to the element. The most common case that still
+falls back to a whole build is an out-of-flow box whose layout parent and paint parent differ.
+[Updating the box tree](/docs/architecture/layout-engine#updating-the-box-tree) has the rules.
 
-An identity miss lowers, hashes the lowering, and on a content hit **throws its own work away** and
-aliases the new identity onto the entry that already exists. The hash is therefore paid only on the
-path that had already paid for a lowering (`crates/zgui-paint/src/lower/cache.rs`).
+Counters: `BoxesRebuilt`, and `BoxTreeBuilds` for whole-tree builds (the first one included). The
+`b.why` latency mark records how many elements owed a rebuild, how many were spliced, and whether the
+whole tree was built.
 
-The result is a `PaintStyleRef`, which is a `Copy` index rather than a pointer. That is what lets it
-be recorded beside a fragment's paint record and compared next frame.
+## Per-box layout
 
-Counters: `StylesLowered` and `StylesLoweredFromCache`.
+Layout algorithms ask a box several questions before placing it: how narrow it can be, how wide it
+wants to be, how tall it is at a given width. Each unanswered question is a nested layout of the
+box's subtree, so each box caches its answers.
 
-## The box tree: patch or rebuild
-
-The **box tree** is what layout runs over: one or more boxes per element, plus the anonymous boxes
-CSS requires. There is no cache here. There is a splice path, and the difference between using it
-and not using it is the largest single difference in the frame.
-
-A box's name is what fragment reuse, geometry diffing, the per-fragment paint record and damage
-scissoring are all keyed on. A frame that rebuilds the tree from the root is a frame in which none
-of them can hit: every fragment compares as changed, and the damage collapses to the root's ink,
-which is the whole window (`crates/zgui-runtime/src/window/frame.rs`).
-
-So the stage asks **which elements** owe a rebuild, not whether any does — the obligation propagates
-to the root, so the root answers yes for a change three panels away. In order:
-
-<Steps>
-
-<Step>
-
-Splice each marked element's own boxes in where its old ones were.
-
-</Step>
-
-<Step>
-
-Rewrite the runs whose characters moved.
-
-</Step>
-
-<Step>
-
-Build the whole tree only when the splice reports a change it cannot confine, or the rewrite reports one it cannot express.
-
-</Step>
-
-</Steps>
-
-A subtree may be spliced only when it is **confined**: the boxes it holds are exactly the boxes its
-own elements generate, nothing outside it is laid out from inside it, and the box that goes in takes
-part in its container the same way the box that came out did. Each of those is proved, not assumed.
-The largest case declined today is a box whose layout parent and paint parent are different boxes —
-an out-of-flow box positioned against an ancestor further up than the element it was written inside.
-That is a rebuild from the root, which is correct and slower
-(`crates/zgui-layout/src/boxtree/patch/subtree/mod.rs`).
-
-Counter: `BoxesRebuilt`. The frame writes a `b.why` latency mark saying how many elements owed a
-rebuild, how many were spliced, and whether the whole tree was built.
-
-## The per-box layout cache
-
-The layout algorithms probe a box many times before placing it: how narrow it can be, how wide it
-wants to be, how tall it is at a given width. Each probe is a whole nested layout of that box's
-subtree unless something answers it.
-
-| The layout answers | |
+| | |
 |---|---|
-| Filled by | every layout question a box answers. |
-| Invalidated by | `BoxLayout::forget_layout`, which clears both exact caches and the intrinsic answers. Marking a box dirty reaches it, and so does a change of device scale. |
-| A miss costs | one nested layout of that box's subtree, re-entered from the top. |
-| Bounded by | one exact full-layout answer, sixteen exact size-only answers, and one intrinsic answer per axis. |
+| Filled by | every layout question a box answers |
+| Invalidated by | marking the box dirty, and a change of device scale, which empties every box's cache |
+| A miss costs | one nested layout of the box's subtree |
+| Bounded by | one final-layout answer, 11 size answers, one intrinsic answer per axis |
 
-The full-layout cache holds one answer under an exact key. Performing layout writes geometry onto
-everything below the box. A wider full-layout cache could return the correct outer size while the
-descendants still had positions from another question.
+- **One final layout.** Performing a layout writes positions into every descendant, so only the most
+  recent answer can be trusted.
+- **Eleven size answers**, which exist mainly for grids: track sizing asks each item several
+  min-content and max-content questions. When all eleven are full, the least recently used is
+  evicted, which costs a measurement and never a wrong answer.
+- **Equivalent questions share an answer.** A growing sibling does not evict answers that cannot
+  depend on it.
+- **Intrinsic answers persist.** A box sized by `fit-content`, `min-content` or `max-content` keeps
+  its min-content and max-content answer per axis across frames and viewport changes, so a settled
+  document measures nothing.
 
-The size-only cache holds sixteen answers keyed on the complete `LayoutInput`
-(`crates/zgui-layout/src/tree/store/measured/mod.rs`).
+See [Measurement caches](/docs/architecture/layout-engine#measurement-caches).
 
-It exists because of grids. Grid track sizing measures every item at min-content and max-content
-with several area estimates. The complete key keeps their answers separate. One row arriving in the scroll workload relays out 29
-nodes: the row that arrived, not its scrollport (`docs/performance.md`).
+Counters: `SizesHeld` against `SizesMeasured`, `LayoutsHeld` against `NodesRelaidOut`.
 
-Sixteen is sized for the questions a grid item is asked in one pass, with room over. Past that the
-oldest answer makes way, which costs one measurement and never an answer. The bound matters because
-a window being dragged asks a new question of every box on every frame.
+## Shaped paragraphs
 
-A size-only slot holds only a size. On a hit, `cache_get` restores the box's last reported baseline
-so the result matches the computation it replaces.
+**Shaping** turns characters into positioned glyphs. It is the most expensive text stage, and it is
+cached separately from **breaking**, which decides where lines end.
 
-Counters: `SizesHeld` against `SizesMeasured`, and `LayoutsHeld` against `NodesRelaidOut`.
-
-The intrinsic cache holds the min-content and max-content result for each axis. These probes
-do not use a known size, a parent size, or a containing block. The answer depends only on the box's
-subtree, device scale, and reserved gutters. It can remain valid across layout passes and viewport
-changes.
-
-The intrinsic pre-pass keeps a roster of boxes that use content keywords. It visits only entries
-without a held answer, deepest first. A document with no content keywords checks an empty roster. A
-settled document with content keywords takes no new measurements. A style change, text change,
-scale change, or gutter decision clears the affected intrinsic answers with the other layout cache
-entries.
-
-## The paragraph shaping cache
-
-**Shaping** turns characters into positioned glyphs for a face. It is the most expensive stage in
-the pipeline, and it is split from **breaking**, which is deciding where the lines end.
-
-| The shaped paragraph | |
+| | |
 |---|---|
-| Filled by | a layout pass reaching a paragraph whose key has not been shaped. |
-| Invalidated by | inactive LRU eviction, a brush-slot split affecting its context, or an explicit cache reset. |
-| A miss costs | one shaping pass over the paragraph. |
-| Bounded by | a soft limit of 16 384 entries; active inline resolutions are pinned. |
+| Filled by | layout reaching a paragraph that has not been shaped |
+| Invalidated by | eviction of inactive entries, an element moving to a different text-paint slot, or an explicit reset |
+| A miss costs | one shaping pass over the paragraph |
+| Bounded by | 16 384 entries, soft; paragraphs in the current layout are never evicted |
 
-`ParagraphKey` hashes the text, the device scale, the ordered list of runs with their extents and
-shaping keys, the atomic inlines and their offsets, the base direction, and the map back to the
-source text. Two contexts with equal keys shape to the same glyphs.
+The key covers the text, the device scale, the runs and their shaping properties, the widths of
+inline boxes, and the base direction. Two things are deliberately **not** in it:
 
-Two things are deliberately **not** in the key:
+- **The colour.** The key holds the text-paint slot the glyphs draw through, not the colour in the
+  slot. Recolouring text, through a theme change or a colour transition, rewrites the slot and
+  reshapes nothing. An element whose colour diverges from others sharing its slot gets a slot of its
+  own, which reshapes that element's paragraphs only.
+- **The width.** Width belongs to breaking, so a resize re-breaks lines without reshaping.
 
-- **The brush.** A colour is an index into a table the shaped result does not own, so re-theming a
-  document costs a table write and never a shape.
-- **The breaking width.** That is the other key, and it is why a resize re-breaks rather than
-  re-shapes.
+An edited paragraph leaves its old entry behind until the budget needs room, and eviction removes only
+inactive entries, least recently used first. When a frame has 16 or more paragraphs to shape, they
+are shaped on the layout workers before layout runs; fewer are shaped on the frame thread, where
+that is cheaper. See [The paragraph cache](/docs/architecture/text-engine#the-paragraph-cache).
 
-Entries live across frames and record a monotonic last-use value. An edited paragraph leaves its old
-entry behind under its old key until the budget needs space. Current inline resolutions retain the
-paragraph identifiers they name, which gives the budget an exact active set. It removes only
-inactive entries, coldest first.
-
-The flattened paragraph computes its stable `ContentKey` once and keeps it in a `OnceLock`.
-Intrinsic measurement folds the current atomic-inline widths into that key to make a
-`ParagraphKey`. Candidate-width probes do not hash the large string again. `TextBytesShaped`
-records the byte volume that reached an actual shaping pass; read it beside `TextShaped` to
-distinguish one long paragraph from many short labels.
+Counters: `TextShaped` and `TextBytesShaped` (one long paragraph and one short label are each one
+shape, but not the same work), `ParagraphsEvicted`, `ParagraphsForgotten`.
 
 ## The recall buffer
 
-Each shaped paragraph remembers the widths it has already been broken at.
+Each shaped paragraph remembers the last **four** widths it was broken at.
 
-| The breaking results | |
+| | |
 |---|---|
-| Filled by | every breaking pass, under a `BreakingKey`. |
-| Invalidated by | a fifth distinct width, which drops the oldest. |
-| A miss costs | one breaking pass over the shaped glyphs. |
-| Bounded by | four results per paragraph (`REMEMBERED`, `crates/zgui-text/src/paragraph/recall.rs`). |
+| Filled by | every breaking pass |
+| Invalidated by | a fifth distinct width, which drops the oldest |
+| A miss costs | one breaking pass over the shaped glyphs |
+| Bounded by | four results per paragraph |
 
-Four, and the derivation is stated: a layout algorithm asks the same three questions in a row — how
-narrow, how wide, how tall at the width given — and then asks them again on the next iteration.
-Three makes the second round free. The fourth slot is there because a nested grid adds a candidate
-width of its own.
+Layout asks three questions in a row (how narrow, how wide, how tall at the final width) and repeats
+them on its next iteration, so three slots make the repeat free. The fourth covers the extra width a
+nested grid adds. See
+[Line breaking](/docs/architecture/text-engine#line-breaking).
 
-While this buffer held one key, the same probing evicted it three times per paragraph per pass:
-**662 re-breaks per keystroke, 1 013 per resize step and 2 441 per glide tick** over the 1 851-box
-gallery, for one paragraph that changed (`docs/perf/gallery-interactions.md`).
-
-`Plan::Owed` is the single place a breaking pass is decided on, and the only place
-`Counter::TextRebroken` moves, so a shaper cannot report a cheap pass and take an expensive one.
-
-## The glyph cache
-
-A **glyph** is one drawn shape of one character in one face at one size. Rasterising one runs the
-face's hinting program.
-
-| The rasterised glyph | |
-|---|---|
-| Filled by | the emit walk placing a glyph. |
-| Invalidated by | eviction of its tile from the atlas, and a lost device, which clears the whole cache with the atlas. Atlas eviction reports removed keys immediately. |
-| A miss costs | one rasterisation and one upload. |
-| Bounded by | the atlas for tile-backed entries, plus 4 096 blank answers and 4 096 recent eviction tombstones. |
-
-`GlyphKey` carries the face, the glyph index, the size, the subpixel phase, the synthesis, and which
-of the three coverage forms was asked for. The same letter at the same phase anywhere on the page is
-one tile, however many times it appears — and a paragraph scrolled by a whole pixel keeps every one
-of them, because a whole pixel does not change the phase.
-
-The cache exists on top of the atlas rather than inside it because the atlas answers a narrower
-question. A tile says which texture holds the pixels and where. It does not say **where those pixels
-go relative to the glyph's origin**, and that is in the rasterised image. A frame holding the tile
-and not the placement rasterises again to learn where to put it — which is the whole cost of
-rasterising, paid on every frame, for a cache hit.
-
-**Absence is a cached answer in its own right.** A space rasterises to an image with no pixels.
-Nothing is inserted into the atlas for one, so a cache that only remembered tiles would never
-remember spaces, and every space on the page would run the face's hinting program again on every
-full repaint. These answers own no tile, so the cache bounds them independently at 4 096 entries.
-
-Two answers are **not** remembered, because both are states of the world rather than properties of
-the glyph: a key whose face could not be resolved, and a key the atlas had no room for. A face
-registered later, or an eviction, makes the same key succeed.
-
-The atlas now returns every key it evicts. `ContentCache` removes the matching placement record in
-the same operation and keeps a bounded tombstone for the counter. The next lookup therefore takes a
-normal miss path against consistent caches, while `RebuiltAfterEviction` still identifies the
-repeated rasterisation. A stale glyph entry cannot survive after its tile has been reused.
-
-What a miss costs, measured on the maintainer's machine (`docs/perf/endtoend.md`, taken while the
-defect in the first row was open):
-
-| Tree | Per glyph |
-|---|---:|
-| a fresh scaler identity per glyph, defeating the face's own hinting cache | 74.8 µs |
-| a stable scaler identity — the line that ships today | **32.0 µs** |
-| and the rasterisation memoised, which is what this cache does | 0.32 µs |
-
-Counters: `GlyphsPlaced` and `GlyphsRasterised`, plus `RebuiltAfterEviction`, which counts the
-rasterisations caused by a tile being freed while it was still wanted. Anything other than zero
-`GlyphsRasterised` on a repaint of unchanged text is a cache that is not being consulted.
-
-## The atlas
-
-An **atlas** is one large texture that many small pictures are packed into, so that a thousand
-glyphs are one texture bind rather than a thousand.
-
-| The tiles | |
-|---|---|
-| Filled by | glyph and small-vector rasterisation, and image attachment, during the emit walk. |
-| Invalidated by | eviction, and a lost device. |
-| A miss costs | producing the content again and uploading it. |
-| Bounded by | `soft_bytes`; the window installs 64 MiB. |
-
-One atlas serves glyphs, pictures, and small vector masks together because they compete for the same
-texture memory. A split decided in advance would be wrong for a text-heavy, image-heavy, or
-icon-heavy document.
-
-Defaults (`crates/zgui-atlas/src/atlas/limits.rs`):
-
-| Limit | Default | Why |
-|---|---:|---|
-| `texture_size` | 1024 | small enough that a document using a handful of glyphs reserves little, large enough that a text-heavy one is not allocating every few dozen glyphs |
-| `max_texture_size` | 4096 | a conservative default; each window replaces it with the device's reported limit |
-| `max_textures_per_pool` | 16 | past it, allocation fails and the caller evicts and retries |
-| `soft_bytes` | none | eviction that nothing bounds has no criterion |
-
-The window sets it: `ATLAS_SOFT_BYTES = 64 * 1024 * 1024`
-(`crates/zgui-runtime/src/window/mod.rs`).
-
-The limit is **soft**. It is a level the atlas returns below, not a ceiling an allocation is refused
-at. Everything one frame draws is hot, and refusing an allocation because the frame is large would
-drop glyphs off the screen. So a frame whose own working set is larger than the level stays over it.
-
-Five promises hold the policy together:
-
-- **Tile space comes back.** Removing an entry returns its rectangle to the allocator it came from.
-- **Eviction is by generation, newest kept.** Each frame is a generation, and touching an entry
-  moves it to the current one. One step frees exactly the unreferenced, untouched entries sharing
-  the oldest generation.
-- **Reference counts saturate rather than wrap.** Releasing an entry already at zero does nothing.
-- **Uploads are deferred.** Bytes queue and leave in one flush.
-- **Eviction reports its keys.** The glyph cache removes the placement metadata for each freed tile
-  before another frame can use it.
-
-Resident bytes fall only when a whole texture empties, so `evict_to_soft_limit` loops over
-generations and one step may free a great many tiles and no bytes at all. It stops the moment a step
-frees nothing, which is the state where everything left is held or is in this frame's working set.
-
-<Callout type="warn">
-The ordering rule is not negotiable. Tiles are allocated while the emit walk runs and uploaded in
-one batch afterwards. A frame that drew without flushing would sample texels that were never
-written — which on most devices is not a blank glyph but whatever the texture held before. The frame
-loop flushes between emitting and drawing, and enforces the budget after both.
-</Callout>
-
-Decoded pictures are budgeted separately as `DecodedImages`, with a 64 MiB soft level. The active
-variant of each source shown by a live image element is pinned. Other size variants of that source
-are evictable first. Sources that no element shows are then evicted in coldest-first order. After a
-large variant reaches its texture, the loader releases its host copy, so its pinned decoded-byte
-count becomes zero. The loader maintains exact held-byte and evictable-byte totals, so taking a
-budget report does not scan all sources.
-
-Counters: `AtlasTilesEvicted`, `RecordTilesRetained` and `RecordTilesReleased`. A growing gap
-between the last two is an atlas in which nothing is evictable.
-
-## The vector cache
-
-A **drawing** arrives as path notation on an element. What a rasteriser wants is curves already
-placed in the fragment's own space.
-
-| The placed drawing | |
-|---|---|
-| Filled by | the emit walk reaching a drawing fragment. |
-| Invalidated by | different notation, or a different placement matrix; and the per-frame retain, which drops every node the document no longer holds. |
-| A miss costs | a parse, a fit, and a re-encode in the rasteriser. |
-| Bounded by | the live nodes, and 16 384 entries. |
-
-The entry holds the notation, the read document, the six coefficients of the matrix the curves were
-placed with, and the result. Comparing the matrix rather than the box and the view box separately is
-deliberate: two different boxes that fit to the same matrix produce the same curves.
-
-The colour is not in the placement key. A hover that recolours an icon re-places nothing and
-re-reads nothing.
-
-Eligible small solid paths use a second cache. Paint rasterizes one monochrome coverage tile when a
-path has one solid fill or stroke, no local clip, and a mask of at most 64 KiB of texels, no wider
-than 1024 and no taller than 256. The key excludes colour, translation, mirrors, and quarter turns;
-it includes the density needed for scale. These changes reuse the tile. A new scale needs a new tile
-only when it needs a different density. Arbitrary rotations, shears, and non-uniformly scaled
-strokes use the general vector path.
-
-Other drawings use the general vector pass. Their placed curves remain memoized by node, and stable
-allocation identity lets the rasterizer reuse encoded geometry. An unchanged vector item replays
-from its paint record instead of being encoded each frame. A moved item re-encodes because its
-curves are in device coordinates. The renderer shelf-packs disjoint pass regions into compact
-scratch space, so far-apart paths do not reserve the device pixels between them.
-
-## The per-fragment paint record
-
-A **fragment** is one rectangle of one box after layout, in absolute coordinates. The **display
-list** is the frame's drawing instructions as a value. This cache owns a copy of the primitives
-each fragment produced, so that an unchanged fragment costs a replay instead of an encoding. It
-is the cache the whole "what does an unchanged frame cost" story rests on.
-
-| The record | |
-|---|---|
-| Filled by | every fragment the emit walk encodes. |
-| Invalidated by | a compared paint input changing, a change of kind or size, explicit fragment retirement, or budget eviction. |
-| A miss costs | encoding that fragment again from its lowered style and geometry. |
-| Bounded by | 64 MiB, soft. Records selected this frame are pinned. |
-
-The record lives in the paint stage, not on the fragment. The emit walk is a pure reader of the
-fragment tree — that is what lets the fragment tree have exactly one writer — so the record carries
-enough of the fragment's own state to decide for itself whether it still stands. A record that
-decides for itself cannot be invalidated by the wrong phase, or left valid by a phase that forgot.
-
-The comparison is one `Copy` value. In addition to the fields below, it includes the custom-element
-revision, outside-content revision, and device scale. These inputs can change while the fragment's
-node and geometry stay stable.
-
-| Field | Without it |
-|---|---|
-| `style` | a restyled fragment replays its old colours |
-| `clip` | a fragment replays through a chain it is no longer inside |
-| `transform` | a fragment replays in a coordinate system that is not its own |
-| `transform_hash` | a moving box keeps its name, so a movement is invisible to the record |
-| `decorations` | changing `text-decoration` on a paragraph replays every line inside it |
-| `text_fill` | editing the gradient on a heading replays every line inside it |
-| `anim` | the shared style does not move while an animation runs, so every animation is frozen at its first frame |
-| `alpha` | a panel fading out is a panel whose contents never fade |
-| `highlights` | a caret never blinks |
-
-The record also compares what the fragment was **drawing**, not only where. A fragment's kind
-carries the identifier of the paragraph a line belongs to, and a paragraph is interned by the
-shaping of its characters — so one changed character issues a new identifier while the line stays
-exactly where it was. A counter going from `1` to `7` is the whole failure: same width, same line,
-same geometry, and the old digit back on the screen.
-
-### Replay
-
-```rust
-pub enum Reuse {
-    /// Nothing usable was recorded: encode from the style and the geometry.
-    Encode,
-    /// The record stands; replay it with the fragment's movement applied.
-    Replay(Size<DevicePx, Device>),
-}
-```
-
-The offset is zero for a fragment that did not move at all, which is the commonest case and is still
-a replay. What a replay saves is the encoding, not the movement. A scrolled list's rows take the
-same path with a non-zero offset.
-
-The record owns an `Arc<ChunkPrims>` captured before clip culling and draw-order insertion. Four
-rules govern replay:
-
-- **Draw order is not replayed.** Every re-emitted primitive goes through the ordinary push path, so
-  it is ordered against this frame's neighbours.
-- **The capture is complete.** Replay runs through this frame's clip and cull, so a fragment that
-  was outside a scrollport can enter it without re-encoding.
-- **Movement is measured from the encoding.** The record's border-box origin does not move after a
-  replay, so repeated moves do not accumulate error.
-- **A still vector replays.** A moved vector re-encodes because its curves are in device space.
-
-A record takes **one hold on each distinct raster its chunk draws**. That is what makes eviction
-safe: a replay re-emits instances that already carry a rectangle of a texture and looks nothing up,
-so without the hold, a static label's tiles look exactly like content that left the screen a hundred
-frames ago. Distinct, because a hold that counted repetitions would have to be given back exactly as
-many times, and one miscount is either a tile that can never be freed or one freed while it is being
-drawn.
-
-Records survive unvisited frames and own their side-table and atlas holds. Layout reports retired
-fragment keys. Under memory pressure, the cache evicts the least recently selected records that are
-not part of the current working set. Counters include `ChunksRetainedUnvisited`, `PaintChunkBytes`,
-`ChunksEvicted`, `FragmentsRetired`, `ChunksTranslated`, and `ChunksReencoded`.
-
-## The scene's side tables
-
-The scene has no retained primitive log. Paint records own the bytes they replay. Clips, paints,
-text paints, and coordinate systems are still persistent and interned: the same content returns the
-same identifier, and an identifier resolves to its content while a scene or paint record refers to
-it. In debug builds, recorded content hashes are checked against what the indices resolve to.
-
-Each table is generation-marked and reference-counted, and frees the coldest generation of entries
-that nothing refers to and this frame did not touch. A coordinate system is named after the box that
-establishes it, so moving a box is a write into a node rather than a new identity, and a thousand
-untransformed rows resolve to one node.
-
-## The bounds tree
-
-**Draw order** is the number that decides what is drawn over what. The bounds tree assigns it by
-asking which already-inserted rectangles a new one overlaps.
-
-| The order | |
-|---|---|
-| Filled by | every primitive pushed this frame. |
-| Invalidated by | `begin_frame`, which clears it. |
-| A miss costs | nothing: there is no lookup, only insertion. |
-| Bounded by | the primitives emitted this frame, never the document. |
-
-Two guarantees come out of it:
-
-- **Disjoint content reuses low orders.** A page of a hundred non-overlapping boxes ends up with a
-  hundred primitives at order one, which a renderer draws in one batch.
-- **Equal order implies no overlap.** That is why the sequence of primitive kinds at equal order is
-  free to be chosen for batching rather than for correctness.
-
-Nodes are twelve-wide rather than binary, because a shallower tree touches fewer nodes per query,
-and the per-node work is a rectangle test. The descent path and the search stack are reusable
-buffers, so an insert allocates nothing and a query allocates nothing.
-
-Because the tree is cleared each frame, its cost tracks the frame and not the document.
-`docs/performance.md` reports `bounds_tree_inserts` equal to `primitives_emitted` in every scenario:
-zero on idle, 9 975 over the hover storm, 844 on cold start.
+Counter: `TextRebroken`.
 
 ## The hit index
 
-**Hit testing** is deciding which element is under a point. The index answers it.
+The hit index answers which element is under a point.
 
-| The entries | |
+| | |
 |---|---|
-| Filled by | the fragment pass, entry by entry. |
-| Invalidated by | a restack, or churn past a quarter of the entries. |
-| A miss costs | a rebuild: every fragment, in painting order. |
-| Bounded by | one entry per fragment, and one spatial hierarchy per coordinate system. |
+| Filled by | the fragment pass, one entry per fragment, updated in place |
+| Invalidated by | a change of paint order, or churn past a quarter of the entries |
+| A miss costs | a rebuild over every fragment, in paint order |
+| Bounded by | one entry per fragment, one spatial tree per coordinate system |
 
-Entries have identity: one per fragment, updated in place. The index **carries** the painting order
-rather than assigning one, so its contents do not depend on the order entries were added in, and one
-entry can be moved without touching any other. That is what makes the incremental path sound as well
-as cheap.
+A scroll or transform moves a whole run of entries by the same vector, which does not count as churn,
+so scrolling never rebuilds the index. See [The hit index](/docs/architecture/layout-engine#the-hit-index).
 
-Three writes, and only one of them counts as churn:
+Counters: `HitEntriesUpdated`, `HitEntriesMovedInPlace`, `HitEntriesReinserted`, `HitIndexRebuilds`.
+The scroll scenario holds hit-index rebuilds at zero.
 
-| Write | Used for | Churn |
-|---|---|---|
-| `update` | a change of shape | only when the hierarchy actually moved the entry between nodes |
-| `translate` | a change of position and nothing else | never |
-| `carry` | one entry of a run moving together | never |
+## Paint-style lowering
 
-`translate` is exempt because every entry of a scrolled container or a transformed subtree moves by
-the same vector and keeps its neighbours, so the hierarchy above them is as good afterwards as
-before. Counting those would make a scroll and a transform transition rebuild the whole document's
-index every few frames.
+**Lowering** turns a computed style into what the paint stage draws from: colours resolved, lengths in
+device pixels, shadows and borders in primitive form.
 
-`carry` writes the entry immediately and defers the repair of the hierarchy above it. Until
-`settle` runs, the hierarchy answers for the rectangles the run's entries had before the movement,
-so **nothing may query the index between the walk and the settle**. The fragment pass settles once,
-at the end of its walk, and settling costs nothing when no run was started.
+| | |
+|---|---|
+| Filled by | the paint walk, once per distinct style |
+| Invalidated by | a change of device scale, which clears it |
+| A miss costs | one lowering, plus a content hash when the pointer lookup misses |
+| Bounded by | the distinct lowerings since the last scale change |
 
-`should_rebuild` fires when churn passes a quarter of the entries (`CHURN_FRACTION`). A quarter is
-the point where the hierarchy has been reshaped enough that a fresh build produces a better one.
+The cache is looked up by the style's group pointers first and by a hash of the lowered content
+second, so styles that are equal but separately allocated still share one entry. The result is a
+`PaintStyleRef`, a `Copy` index that a paint record can store and compare on the next frame. The
+lookup is described under
+[Computed-style sharing](/docs/architecture/style-engine#computed-style-sharing).
 
-Measured: the deferred settle is **35.5 ns per moved box**, which is the largest single attributable
-cost in a glide frame, larger than either duty inside the walk (`docs/perf/glide-split.md`). That
-measurement was taken on the unvirtualised probe, a document the repository describes as one no
-application would ship, so read it as a split rather than as a scroll cost.
+Counters: `StylesLowered` against `StylesLoweredFromCache`.
 
-The gate is a count: `scroll.translation.hit_rebuilds` has a ceiling of **0** and measures 0
-(`docs/performance.md`).
+## Paint records
 
-Counters: `HitEntriesUpdated`, `HitEntriesMovedInPlace`, `HitEntriesReinserted`,
-`HitIndexRebuilds`.
+A **fragment** is one rectangle of one box after layout. Each fragment's **paint record** keeps a copy
+of the primitives it produced, so an unchanged fragment costs a replay instead of an encoding.
 
-## The cache budget registry
+| | |
+|---|---|
+| Filled by | every fragment the paint walk encodes |
+| Invalidated by | a change in any compared paint input, a change of kind or size, fragment retirement, or budget eviction |
+| A miss costs | encoding the fragment again from its lowered style and geometry |
+| Bounded by | 64 MiB, soft; records used this frame are never evicted |
 
-Retained state without a budget only grows. Seven registry entries state what they hold, in what unit,
-and what level they come back below when a level applies.
+A record compares one small signature of everything that can change the painting: the lowered style,
+clip, transform, decorations, animations, inherited opacity, caret and selection highlights, the
+device scale, and what the fragment draws. A text line carries its paragraph's identity, so one
+changed character re-encodes the line even at the same width.
 
-| Cache | Unit | Level | Why that level |
+A replay can be offset, which is how a scrolled row is drawn without encoding. Replays still go
+through this frame's clipping, culling and draw-order assignment, so a row that was outside a
+scrollport can enter it without re-encoding. A record holds each atlas tile its primitives draw, so
+eviction cannot free a tile a replay still needs. Records survive frames that do not visit them;
+under memory pressure the least recently used records outside the current frame are evicted. See
+[Recording and replay](/docs/architecture/paint-and-scene#recording-and-replay).
+
+Counters: `ChunksTranslated` against `ChunksReencoded`, `ChunksRetainedUnvisited`, `ChunksEvicted`,
+`FragmentsRetired`, and the gauge `PaintChunkBytes`.
+
+## The glyph cache
+
+A **glyph** is one character's shape in one face at one size. Rasterising it runs the face's hinting
+program.
+
+| | |
+|---|---|
+| Filled by | the paint walk placing a glyph |
+| Invalidated by | eviction of its atlas tile, and a lost device |
+| A miss costs | one rasterisation and one upload |
+| Bounded by | the atlas for tiled entries, plus 4 096 blank answers and 4 096 eviction records |
+
+The key holds the face, glyph index, size, subpixel phase, synthesis and coverage form, so the same
+letter at the same phase is one tile however often it appears, and text scrolled by whole pixels
+keeps all its tiles. The cache stores each glyph's placement as well as its tile, so a repaint never
+rasterises just to find out where the pixels go. It also stores **blank glyphs**: a space has no
+pixels and no tile, and without a separate answer every space would be rasterised on every full
+repaint. See [The glyph cache](/docs/architecture/text-engine#the-glyph-cache).
+
+| Per glyph (`docs/perf/endtoend.md`) | |
+|---|---:|
+| rasterised | 32.0 µs |
+| served from this cache | 0.32 µs |
+
+Counters: `GlyphsPlaced` against `GlyphsRasterised`, and `RebuiltAfterEviction` for glyphs rasterised
+again because their tile was freed. Any `GlyphsRasterised` on a repaint of unchanged text means the
+cache is not being used.
+
+## The atlas
+
+An **atlas** is a large texture that many small images are packed into, so a thousand glyphs draw from
+one texture. One atlas serves glyphs, pictures, small vector masks and path-glyph sheets, because they
+compete for the same memory and a fixed split would suit some documents and not others.
+
+| | |
+|---|---|
+| Filled by | glyph, mask and path-glyph rasterisation, and image upload, during the paint walk |
+| Invalidated by | eviction, and a lost device |
+| A miss costs | producing the content again and uploading it |
+| Bounded by | a soft limit of 64 MiB per window (`ATLAS_SOFT_BYTES`) |
+
+A new texture is 1 024 pixels square, or larger for content that does not fit, up to the device's
+maximum texture size. A pool holds at most 16 textures (`crates/zgui-atlas/src/atlas/limits.rs`). The limit is **soft**: the atlas evicts back towards it but
+never refuses an allocation the current frame needs, so a frame whose working set is larger than the
+limit stays over it.
+
+- Each frame is a generation. Eviction frees the untouched, unreferenced entries of the oldest
+  generation, one generation at a time.
+- Memory is returned only when a whole texture empties.
+- Eviction reports every key it frees, so the glyph and mask caches drop their entries at once.
+
+Decoded pictures have a separate budget (`DecodedImages`, 64 MiB soft). The variant of each source a
+live image shows is kept; other variants go first, then sources nothing shows, coldest first. See
+[Atlases](/docs/architecture/renderer#atlases).
+
+Counters: `AtlasTilesEvicted`, `RecordTilesRetained` and `RecordTilesReleased`. A growing gap between
+the last two means something holds tiles and never releases them.
+
+## Vector caches
+
+Vector content (the `vector` element, path notation, SVG documents and `canvas` scenes) is drawn by
+the cheapest [route](/docs/architecture/paint-and-scene#vector-routes) that can draw each shape, and
+each route has its own cache.
+
+| Store | Holds | Keyed by | Bound |
 |---|---|---|---|
-| `PaintChunks` | bytes | 64 MiB | unvisited live fragments retain compiled primitives; cold chunks are cheap to encode again |
-| `GlyphAtlas` | bytes | 64 MiB | several times a text-heavy document's glyphs, well under an unbounded atlas |
-| `DecodedImages` | bytes | 64 MiB | active variants are pinned until their large host copies are released; other variants can be decoded again |
-| `ParagraphShaping` | entries | 16 384 | the largest document whose every element is live, with room |
-| `VectorResources` | entries | 16 384 | the same, for what the per-frame retain does not bound |
-| `RenderTargets` | bytes | none | group targets and the scroll-shift scratch; the pool enforces its own ceiling |
-| `DeviceMemory` | bytes | none | pinned renderer allocations and zgui-owned callback-surface textures |
+| parsed drawings | the shapes read from one source text | the text; shared by every element drawing it | while any element draws it |
+| placed drawings | one drawing per node, with its fit | the source and the six coefficients of the fit matrix | the live nodes; 16 384 entries (`VectorResources`) |
+| recognitions and shape payloads | analytic quads and mark payloads recognised from a shape | the shared path allocation | 4 096 entries; entries no frame looks up expire after a few frames |
+| series payloads | one built payload per series part | the data allocation | 64 entries, 600 frames unused |
+| mask tiles | coverage for small solid paths | geometry and density, not colour or position | the atlas; a per-frame budget for new masks |
+| path-glyph sheets | each repeated outline at 16 subpixel positions | the outline and its style, per device scale | the atlas; at most 64 new sheets per frame |
+| CPU layers | whole drawings rasterised into the atlas's image pool | the drawing, scale and 1/16-pixel phase | four surfaces of RGBA8, 16–128 MiB (`VectorLayers`) |
+| general encodings | one encoding per distinct path, paint and style | the shared path allocation | 64 MiB, least recently drawn first |
 
-`DeviceMemory` subtracts the pooled-target bytes that `RenderTargets` already reports. It includes
-zgui-owned callback-surface textures. Producer-owned surface textures are available through
-`Window::embed_memory_report()` for diagnostics, but they are not added to zgui-owned device
-memory and are never released by the budget.
+Three properties follow from the keys:
 
-Where 16 384 comes from is stated rather than guessed
-(`crates/zgui-runtime/src/budget/limits.rs`). It is derived from the two workloads that bound it
-from either side: the still table, at 833 rows of six elements and about five thousand nodes, is the
-largest document held entirely live; the scroll list, at ten thousand rows, is the most distinct
-content a run leaves behind. 16 384 is above both, so no workload the project runs evicts. It is not
-a measured capacity and does not claim to be.
+- **Colour is never part of a geometry key**, so a recoloured drawing reuses all its geometry.
+- **Geometry is identified by its allocation**, so the same source text or `Arc` reaches the same
+  entries everywhere.
+- **Moving reuses everything.** Shapes stay in their own coordinate space and the fit travels beside
+  them, so a new box size is a new fit, not a new path, and a moved drawing replays at an offset
+  (`VectorReplaysMoved`).
 
-The trait every registered cache implements:
+New rasterisation is also budgeted per frame. Content over the budget is drawn by another route or a
+frame or two later, and counted (`VectorMaskBudgetOverflow`, `VectorLayersDeferred`,
+`VectorLayerTilesDeferred`). [Writing fast interfaces](/docs/performance/writing-fast-interfaces#drawing)
+turns these properties into guidelines.
 
-```rust
-pub trait Budgeted {
-    fn id(&self) -> CacheId;
-    fn limit(&self) -> Option<u64>;
-    fn report(&self) -> CacheReport;
-    fn observe(&mut self, epoch: SceneEpoch);
-    fn evict(&mut self, units: u64, epoch: SceneEpoch) -> u64;
-    fn forget(&mut self);
-}
-```
+## Scene side tables
 
-`forget` is required rather than provided. The only body a trait could supply for "drop everything"
-without knowing what is held is one that drops nothing, so a provided method would silently register
-a cache that cannot be emptied — and "every cache empty" has to be a state a window can be put into,
-both for memory pressure and for comparing a window that has been drawing with one built fresh.
+Clips, paints, shader parameters and coordinate systems are interned in persistent tables: the same
+content returns the same identifier. Text paints are mutable slots, so a text colour can change
+without reshaping. Each table is reference-counted and generation-marked, and frees the coldest
+entries nothing refers to. A coordinate system is named after the box that establishes it, so moving
+a box writes one entry, and a thousand untransformed rows share one.
+
+## The bounds tree
+
+The bounds tree assigns **draw order** by finding which already-inserted rectangles a new one
+overlaps. It is cleared each frame, so its cost follows the primitives emitted, never the document.
+Content that does not overlap shares low orders, so a hundred disjoint boxes all get order one and
+can be drawn in one batch. Inserts and queries reuse their buffers and do not allocate. See
+[Draw order](/docs/architecture/paint-and-scene#draw-order).
+
+## Caches keyed on device pixels
+
+A change of device pixel ratio invalidates everything measured in device pixels
+(`crates/zgui-runtime/src/window/scale.rs`):
+
+| State | What a scale change does |
+|---|---|
+| computed styles | nothing; they are in CSS pixels |
+| per-box layout | emptied explicitly |
+| shaped paragraphs | keyed by scale, so they miss and reshape |
+| rasterised glyphs | keyed by device size, so they miss and rasterise |
+| lowered paint styles | cleared on the first lowering at the new scale |
+| paint records | carry the scale in their signature, so they re-encode |
+| scroll offsets | multiplied by the change, so the view stays in place |
+
+The layout cache has to be emptied explicitly because it is keyed by the question, and some
+questions, such as a min-content probe, carry no size and look identical at every scale.
+
+## The budget registry
+
+Retained state without a budget only grows. Eight caches register with each window's budget
+registry, each with its unit and level:
+
+| Cache | Unit | Level |
+|---|---|---|
+| `PaintChunks` | bytes | 64 MiB |
+| `VectorLayers` | bytes | four surfaces of RGBA8, clamped to 16–128 MiB |
+| `GlyphAtlas` | bytes | 64 MiB |
+| `DecodedImages` | bytes | 64 MiB |
+| `ParagraphShaping` | entries | 16 384 |
+| `VectorResources` | entries | 16 384 |
+| `RenderTargets` | bytes | none; the target pool enforces its own ceiling |
+| `DeviceMemory` | bytes | none; pinned renderer allocations and zgui-owned callback-surface textures |
+
+16 384 sits above the two workloads that bound it: the largest document held entirely live (about
+5 000 nodes) and the most distinct content a run leaves behind (a 10 000-row scroll list). No
+workload in the repository evicts at that level; it is a margin, not a measured capacity
+(`crates/zgui-runtime/src/budget/limits.rs`).
+
+`DeviceMemory` excludes pooled targets already reported by `RenderTargets`. Textures owned by an
+embedded surface's producer are reported by `Window::embed_memory_report()` and never released by the
+budget.
 
 ### How a cache comes back under its level
 
-The step runs once a frame, after the emit walk and after the atlas flush. Before the walk it would
-be measured against the previous frame's working set; before the flush it would discard uploads the
-frame is about to draw from.
+Once per frame, after the paint walk and the atlas flush, the registry records what each cache did,
+collects what each holds (with its pinned share and rebuild cost), and enforces the level on caches
+that are over it. On an ordinary frame that is none.
 
-<Steps>
+Eviction takes speculative content first, then the coldest content, with ties broken by the lowest
+rebuild cost. Rebuild cost is only the tie-break: ordering by it alone would evict the glyphs on
+screen, which are cheap precisely because they are drawn every frame.
 
-<Step>
-
-`observe` records what each cache did this frame, from its own monotonic lookup total and from whether anything still holds its content.
-
-</Step>
-
-<Step>
-
-`report` collects what each is holding, in its own unit, with its pinned share and its rebuild cost.
-
-</Step>
-
-<Step>
-
-`enforce` visits only the caches that are over a level — which is no caches at all, on every frame of an ordinary document.
-
-</Step>
-
-</Steps>
-
-The order is **the speculative class first, whatever its last use; then coldest last use first, ties
-broken by lowest rebuild cost**. The tie-break is second and not first on purpose. Ordering by
-rebuild cost alone would evict the cheapest thing to reproduce, which is a glyph on screen in every
-frame — cheap precisely because it is rasterised constantly, and re-rasterised on the very next
-frame at the cost of the eviction plus the rebuild plus the upload.
-
-What "coming back under" means differs by cache:
-
-- **Paint chunks** keep the current frame's selected records pinned and evict other records from
-  the oldest selection forward. Eviction releases their scene-table and atlas holds.
-- **The atlas** frees cold generations until resident bytes are under the level, and stops at the
-  frame's working set and at anything a paint record holds.
-- **Decoded images** remove inactive variants of shown sources first, then remove unseen sources in
-  coldest-first order. The active variant stays pinned while it has host bytes. Large variants give
-  those bytes back after upload; the texture then carries the picture.
-- **Paragraph shaping** removes inactive entries in least-recently-used order. Current inline
-  resolutions pin their keys because cached sizes and baselines depend on them. A document whose
-  active text exceeds the level stays over it. An explicit reset still drops all shaping and marks
-  the whole layout tree dirty, because that operation can remove active results.
-- **Vector resources** drop all of them too, at a small fraction of the cost: a drawing is produced
-  again from the same box and the same notation, and nothing measured from it is invalidated.
-
-### Idle maintenance
-
-After each normal frame, the window schedules maintenance for two seconds later. Another normal
-frame moves that deadline forward. A continuously active window therefore keeps its working set.
-
-When the deadline arrives, the runtime does not run layout, paint, rendering, or presentation. It
-releases unused group targets and scroll-shift scratch, persistent primitive arenas, retained remap
-and table buffers, completed upload chunks, and reproducible vector scratch. The composed target and
-initialized fixed renderer state remain. A later frame recreates the released working memory and
-restores chunk residence from retained CPU paint records.
-
-### The gate
-
-`cargo xtask budget` runs four targets against real windows on the headless platform. Two of them
-are one claim in two halves — neither is safe without the other
-(`xtask/src/budget/subject.rs`):
-
-| Target | Claim |
+| Cache | When over its level |
 |---|---|
-| `evict_budget` | a cache over its soft limit comes back under it within a bounded number of frames, and does not thrash doing so |
-| `evict_replay` | no cached range is replayed naming a raster the cache behind it no longer holds |
-| `evict_pinned` | eviction at its most aggressive still cannot take a raster something is holding |
-| `budget_registry` | every registered cache reports itself, comes back under a level it is over, and can be emptied |
+| paint chunks | evicts records not used this frame, oldest first, releasing their holds |
+| vector layers | removes layers nothing holds, then drops the coldest records that hold layers |
+| atlas | frees cold generations; stops at the frame's working set and anything a record holds |
+| decoded images | removes inactive variants, then unseen sources, coldest first |
+| paragraph shaping | removes inactive entries, least recently used first; active text stays |
+| vector resources | drops all placements; they are rebuilt from the same source and box |
 
-The anti-thrash half is what makes the first claim mean anything: a policy that freed the working
-set on every frame would hold any limit there is and would rasterise the whole page again on every
-frame. So the test states both bounds (`crates/zgui-runtime/tests/evict_budget.rs`):
+Two seconds after the last frame, an idle window also releases its working memory (unused offscreen
+targets, scratch buffers, completed uploads) without drawing; see
+[Idle maintenance](/docs/architecture/the-frame#idle-maintenance).
 
-- a window held to **2 MiB**, driven through 200 turns of **250 characters nothing has drawn
-  before** — fifty thousand distinct rasterisations;
-- resident bytes may sit over the limit for at most **4 turns in a row**, because texture memory
-  comes back only when a whole texture empties;
-- over a later 60-frame window, rasters made again after being freed must be under **a twentieth**
-  of the glyphs placed.
-
-### Reading it from an application
+### Read and change the limits
 
 ```rust
 let report = window.last_budget_report();
@@ -696,122 +400,49 @@ for line in report.lines() {
 }
 ```
 
-`Window::last_budget_report` hands back the report the frame's own budget step already took, so
-reading it costs nothing. `Window::cache_limits` and `Window::set_cache_limits` read and move the
-entry-counted levels; the atlas's own level is a byte figure set on the content cache.
-`Window::forget_caches` drops everything droppable, damages the whole surface and asks for a frame.
+`Window::last_budget_report` returns the report the frame's budget step already took, so it costs
+nothing. `Window::cache_limits` and `Window::set_cache_limits` read and change the levels in
+`CacheLimits` (shaped paragraphs, placed drawings, decoded-image bytes, paint-chunk bytes); the atlas
+level is set with `ContentCache::set_soft_bytes`. `Window::forget_caches` drops everything that can
+be dropped, damages the whole surface and requests a frame.
 
-## Caches keyed on device pixels
+### The budget gate
 
-Four of these stores hold numbers in device pixels, so a change of device pixel ratio makes all four
-wrong at once. The cascade's own output is the exception
-(`crates/zgui-runtime/src/window/scale.rs`).
+`cargo xtask budget` runs four test targets against real windows on the headless platform:
 
-| State | What the change does |
+| Target | Claim |
 |---|---|
-| computed styles | nothing: `font-size: 12px` is twelve CSS pixels at every ratio |
-| the layout cache | emptied by hand, in full |
-| shaped paragraphs | keyed by the ratio, so a new ratio misses and re-shapes |
-| rasterised glyphs | keyed by their size in device pixels, so a new ratio misses and re-rasterises |
-| lowered paint styles | cleared on the first lowering at a new scale |
-| retained paint chunks | carry the encoded scale in their signature, so a new ratio re-encodes them |
+| `evict_budget` | a cache over its soft limit comes back under it within a bounded number of frames, without thrashing |
+| `evict_replay` | no replayed record uses a raster its cache no longer holds |
+| `evict_pinned` | the most aggressive eviction cannot take a raster something holds |
+| `budget_registry` | every registered cache reports itself, comes back under its level, and can be emptied |
 
-The layout cache has to be emptied by hand because it is keyed by the *question*, and a min-content
-probe carries no size at all — so it asks a question that is identical at every ratio and would be
-answered from a slot computed at the old one. The symptom is a document that half rescales. The
-[cost model](/docs/performance/cost-model) has the measured cost of a ratio change.
+`evict_budget` holds a window to 2 MiB and drives 200 turns of 250 never-seen characters. Resident
+bytes may stay over the limit for at most 4 turns in a row, and over a later 60-frame window,
+re-rasterised glyphs must be under a twentieth of glyphs placed.
 
-## Memory
-
-### Arenas
-
-Nodes, boxes and fragments live in arenas whose addresses hold still
-(`crates/zgui-arena/src/lib.rs`). Three ideas:
-
-- **An address, once handed out, holds still.** Values are stored in blocks of 512 that are
-  allocated whole and never moved or resized, so a reference stays valid while unrelated values are
-  inserted, removed and read.
-- **A handle is checked, not trusted.** A key packs a slot number, an occupancy counter and the
-  identity of the arena that minted it into eight bytes that are never all zero — so an `Option` of
-  a key is eight bytes too. A key to a value that is gone resolves to nothing rather than to
-  whatever moved in afterwards.
-- **Removal is deferred by a frame.** Removing marks a value dead and leaves it in place; the recycle
-  step at the end of the frame drops it and offers the slot back. Passes that hold keys across each
-  other need no coordination beyond running inside the same frame.
-
-The frame recycles the layout box arena with the document arena. A full box-tree rebuild can hold
-the outgoing and incoming trees at the same time. After the end-of-frame recycle, later rebuilds
-reuse those slots. The arena capacity therefore stays bounded by that overlap instead of growing
-with each rebuild.
-
-Data that only some values carry lives in a side table indexed by the same key. `SlotVec` is dense,
-with one entry per slot. `PagedVec` is sparse and allocates a page on the first write. Layout uses
-64-box pages for its optional records. Replaced dimensions and identifiers, and custom-element
-tokens and revisions, therefore do not enlarge every hot `BoxNode`.
-
-### Interned names
-
-Element names, attribute names, class names, identifiers and custom property names are interned
-(`crates/zgui-interned/src/lib.rs`). Each becomes one shared copy plus an eight-byte handle, so a
-comparison is a pointer test and a name sits inside a hot per-node record without costing anything
-to copy.
-
-Two rules:
-
-- Interning is exact and case-sensitive. `"DIV"` and `"div"` are different names.
-- **Interned strings are never freed.** Names come from a vocabulary that is small and effectively
-  fixed. Interning attacker-controlled or unbounded text is the one use this is wrong for.
-
-### What grows with document size
+## What grows with the document
 
 | Per | Held |
 |---|---|
-| document node | one 8-byte invalidation word, one dirty-child record, the core record, and an entry in each side table that node uses |
-| box | one box node and one layout record: one exact full-layout answer, sixteen exact size-only answers, intrinsic answers for two axes, baselines, and any resolved inline lines; rare replaced and custom payloads use sparse columns |
-| fragment | one fragment, one hit entry in a dense table, and one paint record until retirement or budget eviction |
+| document node | an 8-byte invalidation word, a dirty-child record, the core record, and entries in the side tables it uses |
+| box | a box node and a layout record (the layout cache slots, baselines, any resolved inline lines) |
+| fragment | the fragment, a hit-index entry, and a paint record until retirement or eviction |
 | distinct style | one lowered paint description |
-| distinct paragraph | one shaped result, plus up to four breaking results |
-| distinct glyph key | one cache entry, and one atlas tile unless it rasterises to nothing |
+| distinct paragraph | one shaped result and up to four breaking results |
+| distinct glyph key | one cache entry, and one atlas tile unless it is blank |
 | interned name | one shared copy, for the life of the process |
 
-The shipped gallery is 1 851 boxes and 2 363 fragments, of which 325 boxes — 17.6 % — are anonymous
-(`docs/perf/gallery-scale.md`).
+The shipped gallery is 1 851 boxes and 2 363 fragments, 17.6 % of the boxes anonymous.
 
-Three of these do **not** follow only the current frame's live working set, which is why the budget
-exists:
+Three stores hold more than the current frame's working set, which is why the budget exists: shaped
+paragraphs (every distinct string a virtualised list has shown), paint records (fragments that are
+not visited keep theirs), and interned names. **Interned names are never freed**, so never intern
+unbounded or user-supplied text; see [Interned names](/docs/architecture/the-document#interned-names).
 
-- **Shaped paragraphs.** A virtualised list holds a screenful of rows, but every distinct string
-  that has scrolled past leaves a shaped result behind under its own key until inactive LRU
-  eviction brings the cache back to its level.
-- **Paint chunks.** An unvisited live fragment keeps its compiled painting so that returning to it
-  does not re-encode it. The 64 MiB soft level evicts the coldest unselected records.
-- **Interned names.** They are never freed at all.
-
-## Threading
-
-The frame is coordinated on the UI thread. A reusable `LayoutPool` moves large, cold, independent
-layout subtrees and eligible plain-text shaping jobs to at most eight workers. All document writes,
-reactive work, fragment composition, paint, render submission, and accessibility publication remain
-on the UI thread.
-
-Parallel layout starts only for a batch with at least eight cold roots and at least 256 planned
-boxes. Cache-hot work, nested batches, and trees with a custom layout source stay serial. Text with
-atomic inline boxes also shapes during layout because it needs their geometry. These gates avoid
-paying worker coordination for small or already-cached work.
-
-What does cross a thread boundary:
-
-| Crossing | What happens |
-|---|---|
-| a signal written on another thread | observers are marked and the loop is pinged; the effects run inside the next frame, on the UI thread |
-| a future resolving, a decode finishing, a background build completing | the same edge: work is marked ready, and the loop is woken |
-| a node's invalidation word | every method takes a shared reference, so a cell can be marked from a worker thread while a walk reads it |
-
-A wake from outside a frame goes to the platform. A wake from inside one is folded into "another
-frame is owed", so a frame that raises several of those costs one more frame and not several.
-
-Nothing in the frame blocks on the device. The only blocking call is acquiring the surface texture,
-measured at a median of 0.028 ms over 2 705 acquisitions (`docs/perf/present.md`).
+Nodes, boxes and fragments live in arenas with stable addresses, and the box arena is recycled, so a
+whole box-tree rebuild reuses slots instead of growing. See
+[Stable addresses](/docs/architecture/the-document#stable-addresses).
 
 ## Next
 
@@ -819,21 +450,21 @@ measured at a median of 0.028 ms over 2 705 acquisitions (`docs/perf/present.md`
   <Card
     title="Measurements"
     href="/docs/performance/measurements"
-    description="The bands, the budgets, the standing gates, and how to run the suite yourself."
+    description="Measure your own application, and the benchmarks and gates behind the numbers."
   />
   <Card
     title="Writing fast interfaces"
     href="/docs/performance/writing-fast-interfaces"
-    description="The practical rules that follow from what these caches are keyed on."
+    description="Guidelines that follow from what these caches are keyed on."
   />
   <Card
-    title="The cost model"
+    title="Cost model"
     href="/docs/performance/cost-model"
-    description="What each kind of change costs, and what that cost is proportional to."
+    description="What each kind of change costs, in numbers."
   />
   <Card
     title="Paint and scene"
     href="/docs/architecture/paint-and-scene"
-    description="The display list, the stacking-order walk, and how a recorded range is replayed."
+    description="The display list, the stacking-order walk, and how a paint record is replayed."
   />
 </Cards>

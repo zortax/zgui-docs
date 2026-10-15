@@ -1,38 +1,35 @@
 ---
 title: Reactivity in views
-description: Which parts of a view update and which do not — the reactive hole, reactive attributes, and how the framework decides.
+description: Which parts of a view update when state changes — reactive holes, reactive attributes, and what stays fixed.
 ---
 
-A view is built once. The parts of it that change afterwards are the ones whose value is a closure
-or a signal. This page explains exactly how that decision is made. It assumes
-[Views](/docs/learn/views) and [Signals](/docs/learn/signals).
+A view is built once. After that, only the parts you give as a closure or a signal update when
+state changes; everything else stays as it was built.
 
-## The rule
+## What updates
 
-**Whether a piece of a view is static or dynamic is decided by its type, not by how it was
-written.** There is no keyword, no attribute and no annotation.
+**The type of a value decides whether it updates.** There is no keyword or annotation.
 
 ```rust
-text {{count.get().to_string()}}          // a String   — written once, never again
-text {{move || count.get().to_string()}}  // a closure  — written again on every change
+text {{count.get().to_string()}}          // a String: written once
+text {{move || count.get().to_string()}}  // a closure: rewritten when `count` changes
 ```
 
-Both compile. The first reads the signal while the view is being built, gets a `String`, and writes
-it into a text node. Nothing subscribed, so nothing ever updates it.
+Both compile. The first reads the signal while the view is built and writes the resulting string
+once. Nothing subscribes, so it never updates.
 
-The second passes a closure. A closure is what the framework recognises as a **reactive hole**: it
-runs the closure inside a tracking context, so the reads inside it subscribe, and re-runs it when
-they change.
+The second passes a closure. zgui runs it in a tracking context, so the signals it reads are
+subscribed, and runs it again when they change.
 
 <Callout type="warn">
-This is the framework's most common bug, and its symptom is always the same: the interface renders
-correctly once and then never changes. When something will not update, check for a missing
+If part of the interface renders correctly once and then never changes, look for a missing
 `move ||`.
 </Callout>
 
-## Reactive holes as children
+## Reactive holes
 
-A closure child is a hole in the document that the framework keeps filled.
+A closure child is called a **reactive hole**: a place in the document that zgui fills with the
+closure's result and refills when a signal it read changes.
 
 ```rust
 use zgui::prelude::*;
@@ -51,47 +48,22 @@ fn Status() -> impl IntoView {
 }
 ```
 
-Two holes, both reading the same signal, and nothing wires them together. Writing `count` re-runs
-both and nothing else in the window.
+Both holes read `count`. Writing `count` re-runs those two closures and nothing else in the window.
 
-What happens on a run:
+A hole runs as follows:
 
-<Steps>
+- **The first run is synchronous**, while the view is built, so there is no empty first frame.
+- **Later runs happen at the flush.** Several writes before the flush cause one run.
+- **An unchanged result writes nothing.** If the closure returns the same string as last time, the
+  text node is not touched.
+- **Output is updated in place.** When the closure returns the same kind of view as last time, the
+  existing nodes are updated rather than replaced. Attributes the new description does not mention
+  keep their old values. Listeners are replaced rather than added, so a handler is never attached
+  twice.
 
-<Step>
+### Holes that return elements
 
-**The first run is synchronous.** It happens while the view is being built, so the view is complete
-before it is mounted. There is no empty first frame.
-
-</Step>
-
-<Step>
-
-**Every later run waits for the flush.** A write marks the hole; the frame runs it once, however
-many writes arrived.
-
-</Step>
-
-<Step>
-
-**An unchanged value writes nothing.** A text node remembers the last string it was given. If the
-closure produces the same string, the document is not touched, so nothing below is invalidated
-either.
-
-</Step>
-
-<Step>
-
-**The node is reused, not replaced.** Rebuilding a hole cancels the old effect and starts a new one
-in place. No node moves, and nothing below the hole is disturbed.
-
-</Step>
-
-</Steps>
-
-### A hole may produce anything
-
-The closure's return type only has to be a view. That includes whole subtrees:
+A hole can return any view, not only text:
 
 ```rust
 text {{move || format!("{} of {}", done.get(), total.get())}}
@@ -106,57 +78,57 @@ box {{move || {
 ```
 
 <Callout type="info">
-For a two-way branch, prefer [`if`](/docs/learn/control-flow). It compares the **answer**, so
-writing a signal that does not flip the boolean swaps nothing. A closure hole re-runs whenever any
-signal it read changed, and rebuilds what it produced.
+For a two-way choice, prefer [`if`](/docs/learn/control-flow). It only rebuilds when the boolean
+answer flips. A closure hole re-runs whenever any signal it read changes, and rebuilds what it
+returns each time, including any components inside it.
 </Callout>
 
 ## Reactive attributes
 
-The same rule applies inside the parentheses. An attribute value that is a constant is written once
-with no effect behind it. A value that is a signal or a closure gets exactly one effect.
+The same rule applies to attributes. A constant is written once with no effect behind it. A signal
+or closure gets one effect that keeps the value up to date.
 
 ```rust
-// Static: written at build time, no effect created.
+// Constant: written at build time.
 box(class = "panel")
 box(style:width = "200px")
 
-// Dynamic: one effect each.
+// Reactive: one effect each.
 box(class:open = move || open.get())
-box(style:width = move || format!("{}px", width.get()))
+box(style:width = move || Some(format!("{}px", width.get())))
 box(state:disabled = move || busy.get())
 ```
 
-A signal handle may be passed directly, with no closure:
+You can pass a signal directly when its value type already matches:
 
 ```rust
-let width: Signal<String> = /* … */;
+let open: Signal<bool> = /* … */;
 
-box(style:width = width)     // the signal itself is a reactive value
+box(class:open = open)       // same as `move || open.get()`
 ```
 
-Both are accepted, and both create one effect. A closure is needed only when there is a computation
-between the signal and the value.
+Use a closure when there is a computation between the signal and the value.
 
 <Callout type="info">
-Because a constant creates no effect, a view full of static attributes costs nothing to keep. The
-framework knows an attribute is constant from its type and skips the machinery entirely.
+`style:`, `var:` and `attr:` take an `Option<String>`, where `None` removes the value. A literal is
+wrapped for you, but a closure must return the `Option` itself:
+`move || Some(format!("{}px", width.get()))`.
 </Callout>
 
-### What may be a reactive value
+### Which values are reactive
 
-| You pass | Meaning |
+| You pass | Result |
 |---|---|
 | a literal, or anything `Into<T>` | constant |
-| a closure `Fn() -> T` | dynamic |
-| a signal, memo, or anything readable as a `T` | dynamic |
+| a closure `Fn() -> T` | reactive |
+| a signal, memo, or other readable `Copy` handle of `T` | reactive |
 
-That last row is what lets a component declare a prop once and accept all three from its callers.
-See [Derived state](/docs/learn/derived-state).
+A component prop can accept all three in the same way. See
+[Derived state](/docs/learn/derived-state).
 
-## Common shapes
+## Common patterns
 
-### A class that follows a condition
+### Toggle a class on a condition
 
 ```rust
 row(
@@ -165,18 +137,18 @@ row(
 )
 ```
 
-`class` sets the fixed part of the class list. `class:done` adds and removes one class as the
-closure's answer flips. The two do not conflict; the fixed part is never rewritten.
+`class` sets the fixed classes. `class:done` adds and removes one class as the closure's result
+changes. The fixed classes are never rewritten.
 
-### Text assembled from several signals
+### Combine several signals in one text
 
 ```rust
 label {{move || format!("{} of {} done", done.get(), total.get())}}
 ```
 
-One hole, two subscriptions. Writing either signal re-runs the hole once.
+One hole with two subscriptions. A write to either re-runs it once.
 
-### A value that is expensive to compute
+### Share an expensive value
 
 ```rust
 let summary = Memo::new(move |_| expensive(rows.get()));
@@ -186,40 +158,32 @@ view! {
 }
 ```
 
-A memo computes once per change and caches. Several holes reading the same memo share the one
-computation. See [Derived state](/docs/learn/derived-state).
+A memo computes once per change and caches the result, so several holes can share it. See
+[Derived state](/docs/learn/derived-state).
 
-## What is not reactive
-
-These are static, and it is worth recognising them:
+## What does not update
 
 ```rust
-// The element name. There is no "reactive element name"; use `if` or `Dynamic`.
+// An element name. To switch elements, use `if` or `Dynamic`.
 column { … }
 
 // A value read outside a closure, even if it came from a signal.
 let label = count.get().to_string();
 view! { text {{label}} }
 
-// A listener. It is attached once and never re-attached.
+// A listener. It is attached once.
 control(on:click = handler)
 
-// Anything inside a `_untracked` read.
-text {{move || count.get_untracked().to_string()}}   // runs once, subscribes to nothing
+// An untracked read. This hole runs once and subscribes to nothing.
+text {{move || count.get_untracked().to_string()}}
 ```
 
-The last one is worth a second look: the closure makes it a hole, but the read inside subscribes to
-nothing, so the hole is never marked. It runs once and then sits idle. Use `_untracked` only where
-not subscribing is the point.
+## When a hole is removed
 
-## Where the effect lives
-
-A reactive hole is an effect, and an effect's lifetime is the scope that owns it. Because the hole
-was created inside the view, the view keeps it. When the surrounding component or branch is
-removed, the effect is disposed of in the same frame, and any timers under it stop that frame.
-
-You do not have to store anything. This is only worth knowing because it is different if you create
-an effect by hand — see [Effects and lifecycle](/docs/learn/effects-and-lifecycle).
+A reactive hole belongs to the scope it was built in. When its component or branch is removed, the
+hole's effect is disposed of in the same frame, along with anything created under it, such as
+timers. You do not need to keep a handle to it. Effects you create by hand work differently; see
+[Effects and lifecycle](/docs/learn/effects-and-lifecycle).
 
 ## Next
 

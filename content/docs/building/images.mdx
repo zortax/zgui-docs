@@ -1,10 +1,10 @@
 ---
 title: Images
-description: Load raster images from files or memory, control their size, and understand decoding and caching.
+description: Load raster images from files or memory, size and fit them with CSS, label them for screen readers, and understand decoding and caching.
 ---
 
-The `image` element loads encoded raster data and draws it in its content box. The standard app
-wiring supports PNG, JPEG, WebP, and GIF. For GIF, zgui draws the first frame.
+The `image` element draws encoded raster data in its content box. The standard app supports PNG,
+JPEG, WebP, and GIF. A GIF draws its first frame.
 
 ## Load a file
 
@@ -31,30 +31,28 @@ view! {
 }
 ```
 
-`src` is a local path, not an HTTP URL. zgui first reads the image header to get the natural size.
-It does not decode pixels for this step. After layout gives the element a content box, zgui decodes
-a suitable resolution off the UI thread. Each completion wakes the frame loop. The image can get
-its natural size before its pixels are ready.
+`src` is a local path, not an HTTP URL. zgui first reads only the file header to learn the natural
+size. After layout, it decodes the pixels off the UI thread at the size the element needs, and the
+frame updates when the decode finishes. Layout can therefore use the natural size before the
+pixels are ready.
 
-The source can be reactive:
+`src` can be reactive:
 
 ```rust
 image(src = move || selected_path.get())
 ```
 
-Changing or removing `src` detaches the old content. A failed source stays blank. zgui writes a
-warning with the `zgui::images` tracing target and does not retry the same failed source each
-frame.
+Changing or removing `src` detaches the old content. A source that fails to load stays blank, logs
+a warning with the `zgui::images` tracing target, and is not retried every frame.
 
 ## Load bytes from memory
 
-Use `zgui_image::ImageBytes` when no file path exists. Add the matching workspace crate to the
-application:
+Use `zgui_image::ImageBytes` when the image has no file path. Add the crate:
 
 ```toml title="Cargo.toml"
 [dependencies]
-zgui = { git = "https://github.com/zortax/zgui" }
-zgui-image = { git = "https://github.com/zortax/zgui" }
+zgui = "0.1"
+zgui-image = "0.1"
 ```
 
 ```rust
@@ -64,22 +62,23 @@ let src = picture.url();
 let view = image(src = src);
 ```
 
-Keep `picture` alive while the element can need the bytes. The URL is a registry key. Dropping the
-last `ImageBytes` clone unregisters the data. A later decode of that URL then fails.
+The URL is a registry key. Keep `picture` alive while an element may need it: dropping the last
+`ImageBytes` clone unregisters the bytes, and later decodes of that URL fail.
 
-## Sizing
+## Size and fit
 
-The source pixel dimensions are the natural size in CSS pixels. A 640 by 480 file has a natural
-size of 640 by 480 CSS pixels and a 4:3 natural ratio. The natural size does not change with the
-window scale factor or with the resolution that zgui decodes for display.
-
-CSS still has final control:
+The natural size is the source's pixel size, in CSS pixels. A 640 by 480 file is 640 by 480 CSS
+pixels with a 4:3 ratio, regardless of the window scale factor or the resolution zgui decodes.
+CSS can override it:
 
 ```css
 .preview { width: 100%; aspect-ratio: 16 / 9; }
 ```
 
-Use `object-fit` to control how the picture meets its content box. Its initial value is `fill`.
+Until the header has been read, the image has no natural size. Give it an explicit size if a late
+layout change is not acceptable.
+
+`object-fit` controls how the picture fills the content box. The initial value is `fill`.
 
 ```css
 .avatar  { width: 96px; height: 96px; object-fit: cover; }
@@ -89,50 +88,62 @@ Use `object-fit` to control how the picture meets its content box. Its initial v
 
 | Value | Result |
 |---|---|
-| `fill` | Stretches the picture to the box. The aspect ratio can change. |
-| `contain` | Preserves the ratio and fits the whole picture in the box. |
-| `cover` | Preserves the ratio and fills the box. The box clips the excess. |
-| `none` | Uses the natural size. The box can clip the picture. |
-| `scale-down` | Uses the smaller result of `none` and `contain`. |
+| `fill` | Stretches the picture to the box. The ratio can change. |
+| `contain` | Keeps the ratio and fits the whole picture inside the box. |
+| `cover` | Keeps the ratio and fills the box. The excess is clipped. |
+| `none` | Draws at the natural size. The box can clip it. |
+| `scale-down` | The smaller of `none` and `contain`. |
 
-`object-position` places a fitted picture in the space that remains. Its initial value is
-`50% 50%`. Percentages and lengths are supported. Rounded corners and the element's content frame
-clip the fitted picture. A `contain` letterbox shows the element background.
+`object-position` places the fitted picture in the remaining space. It accepts percentages and
+lengths; the initial value is `50% 50%`. Rounded corners and the content box clip the picture, and
+a `contain` letterbox shows the element's background.
 
-Before the header probe finishes, an image has no natural width or height. Give layout an explicit
-size when a late size change is not acceptable.
+## Describe an image for screen readers
 
-## Display-sized decoding and cache sharing
+The accessibility tree does not read `alt`. Set `a11y:label` on a meaningful image, as the avatar
+example above does, and `a11y:hidden = true` on a decorative one:
 
-zgui measures the laid-out content box in device pixels and decodes for that demand. A thumbnail
-does not keep the source-resolution pixels in memory. The fit mode is part of the demand:
-`fill`, `contain`, and `scale-down` need no more detail than the box; `cover` includes the part of
-the scaled picture that the box clips; and `none` requests the source at the display scale.
+```rust
+image(class = "divider", src = "assets/flourish.png", a11y:hidden = true)
+```
 
-The loader rounds the long edge up through size classes: 64, 128, 256, 512, 1024, and 2048 device
-pixels. This prevents a one-pixel layout change from starting another decode. A demand above the
-ladder uses the source size, up to the GPU device's texture limit. The decoder never upscales past
-the source resolution.
+## Decoding and caching
 
-The source string identifies an image. Elements with the same source share the best sufficient
-decoded variant and its texture tile. A larger use can add a larger size-class variant; it does not
-decode once per element. While that decode runs, zgui continues to draw the best smaller variant.
+zgui decodes for the device-pixel size of the laid-out box, so a thumbnail does not hold the full
+source in memory. The fit matters: `fill`, `contain`, and `scale-down` need no more than the box,
+`cover` includes the clipped overflow, and `none` decodes at the source size times the display
+scale.
 
-Variants up to a 512-pixel long edge share filtered atlas textures. Larger variants get a texture
-with mip levels, which keeps minification smooth. After an upload, zgui releases large decoded host
-buffers. It keeps small buffers of at most 64 KiB because they are cheap to retain. If eviction or
-device loss removes a tile whose host buffer was released, zgui decodes that variant again.
+The decoded size is rounded up to a long edge of 64, 128, 256, 512, 1024, or 2048 device pixels,
+so a one-pixel layout change does not start another decode. Larger demands use the source size, up
+to the GPU's texture limit. zgui never upscales past the source.
 
-The memory budget removes unused variants before active ones and removes unused sources from the
-coldest to the newest. The probed natural size remains, so cache eviction does not change layout.
+The `src` string identifies an image. Elements with the same source share decoded variants and
+textures. A larger use adds a larger variant; while it decodes, zgui draws the best smaller one.
 
-Code that calls `zgui_image::decode` or `decode_scaled` directly chooses `Limits`; its default
-maximum dimension is 2048 pixels. The standard app instead uses the current GPU device limit.
+Variants up to 512 pixels on the long edge share atlas textures. Larger ones get their own texture
+with mipmaps for smooth minification. After upload, zgui frees the decoded pixels unless they are
+64 KiB or smaller; if a texture is later evicted or the device is lost, the variant is decoded
+again.
 
-Decoded texels are premultiplied, gamma-encoded sRGB RGBA. They are tightly packed, with the top
-row first. This detail matters only to code that works with `zgui-image` directly.
+Under memory pressure, zgui drops unused variants before used ones and the least recently used
+sources first. The natural size is kept, so eviction does not change layout.
 
-## Accessibility
+Calling `zgui_image::decode` or `decode_scaled` directly takes a `Limits` value whose default
+maximum dimension is 2048 pixels. Decoded texels are premultiplied, sRGB-encoded RGBA, tightly
+packed, top row first.
 
-`alt` is stored as an ordinary attribute, but the accessibility tree does not use it. Set
-`a11y:label` for meaningful content. Set `a11y:hidden = true` for decorative content.
+## Next
+
+<Cards>
+  <Card
+    title="Vector and canvas"
+    href="/docs/building/vector-and-canvas"
+    description="Icons and SVG documents, and shapes and plots drawn from Rust."
+  />
+  <Card
+    title="Accessibility"
+    href="/docs/building/accessibility"
+    description="Roles, names, keyboard access and testing what screen readers see."
+  />
+</Cards>

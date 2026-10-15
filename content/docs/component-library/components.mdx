@@ -1,142 +1,200 @@
 ---
-title: The components
-description: The zgui-ui inventory with props, then a button, a dialog and a select taken apart into the elements, signals, contexts and sheets they are made of.
+title: Components
+description: Reference for every zgui-ui component, grouped by family, with props, defaults, variants and keyboard behaviour.
 ---
 
-`zgui-ui` is a library of styled components. It sits on layer L8, it depends on `zgui` and its three
-sibling crates and on nothing else, and it is optional: every component in it is written with the
-API [the guide](/docs/learn/views) already covers.
+Every public component in `zgui-ui`, grouped by family, with its props and defaults. For
+installation and theming, see the [overview](/docs/component-library). All names are in
+`zgui_ui::prelude` unless a section says otherwise.
 
-This page is the inventory with props, and then three components taken apart — a button, a dialog
-and a select — down to the elements, signals, contexts, portals and sheets each one is made of.
+## Props on every component
 
-## What every component does the same way
+Every component that renders an element also takes these props. The tables below leave them out.
 
-Three rules hold across the crate (`crates/zgui-ui/src/lib.rs`).
+| Prop | Type | Effect |
+|---|---|---|
+| `class` | `Classes` | classes merged after the component's own |
+| attribute bundle | `Attrs`, `#[prop(attrs)]` | any `attr:`, `on:`, `a11y:`, `style:` the caller writes, applied after the component's own |
+| `children` | `Children` or `ChildrenFn` | the content |
 
-**Appearance is a `variants!` table and a `style!` sheet.** Each component declares its axes once.
-The table lowers to a class list and to one `data-` attribute per axis, and the sheet selects on the
-attributes. Nothing computes a class name at run time and nothing branches on a variant in Rust.
-
-**Interaction state belongs to the style engine.** There is no `hovered`, no `focused` and no
-`pressed` signal anywhere in the crate. `:hover`, `:focus-visible`, `:active`, `:disabled`,
-`:checked`, `:indeterminate`, `:placeholder-shown` and `:invalid` are states the engine already
-holds. A component that kept a second copy would disagree with the first one on the frame the
-pointer leaves.
-
-**A caller can always add to the element.** Every component takes `class` and an attribute bundle,
-and merges the caller's values **after** its own, so the caller wins.
+The caller's values are applied last, so they win:
 
 ```rust
-use zgui::prelude::*;
-use zgui_ui::prelude::*;
-
 view! {
     Button(class = "w-full", attr:data-testid = "save", a11y:label = "Save changes") {"Save"}
 }
 ```
 
-### Who owns a value
+## How to read the tables
 
-Every component with a value takes three props: `value` (or `checked`, `pressed`, `open`, `index`),
-a `default_…`, and `on_change` (or `on_open_change`). The type of the first decides ownership.
+- `Signal<T>` means `Signal<T, LocalStorage>`, declared `into`, so a plain `T` works too.
+- `Option<T>` props take a `T`; write `label = "Name"`, not `label = Some(…)`.
+- `Binding<T>` is a value prop; see [Who owns a value](#who-owns-a-value).
+- In the Children column, **yes** means the component takes children and **opt** means they are
+  optional. **fn** means `ChildrenFn`: the content is built again each time a surface opens. **—**
+  means the component takes no children.
 
-| What the caller writes | Who owns the value |
+## Who owns a value
+
+A component with a value takes three props: the value (`value`, `checked`, `pressed`, `open`,
+`index` or `page`), a `default_…`, and an `on_…change` observer. What you pass as the value decides
+who owns it.
+
+| You pass | Owner |
 |---|---|
-| nothing | the component, starting at `default_…` |
-| an `RwSignal<T, LocalStorage>` | both: the component shows it and writes back to it |
-| `Binding::controlled(read, write)` | the caller; the control moves only when `write` moves `read` |
+| nothing | the component, starting from `default_…` |
+| an `RwSignal<T, LocalStorage>` | shared: the component reads it and writes it back |
+| `Binding::controlled(read, write)` | you: the control moves only when `write` changes `read` |
 
-A read-only `Signal` at one of these props is a compile error. There is no
-`From<Signal<…>> for Binding`, and `crates/zgui-ui-primitives/src/state/binding.rs` carries a
-`compile_fail` doctest that asserts it. `on_change` is told in all three cases, after the binding
-has been asked, and observes rather than drives.
+Passing a read-only `Signal` is a compile error. The observer runs in all three cases, after the
+value is written. Writes that arrive after the component's scope is disposed are ignored.
 
 <Callout type="warn">
-`on_change`, `on_open_change` and `on_select` are **props, not listeners**. Write `on_change = f`,
-never `on:change = f`. They do not capture and do not bubble.
+`on_change`, `on_open_change`, `on_page_change` and `on_select` are **props**, not event listeners.
+Write `on_change = f`, never `on:change = f`.
 </Callout>
 
-### How to read the tables
-
-Every component below also takes the tail that is left out of the rows:
-
-| Prop | Type | What it does |
-|---|---|---|
-| `class` | `Classes` | classes merged after the component's own |
-| the bundle | `Attrs`, declared `#[prop(attrs)]` | every attribute the caller wrote, replayed onto the component's own element, after its own |
-| `children` | `Children` or `ChildrenFn` | what is inside |
-
-Reading the prop cells:
-
-- `Signal<T>` means `Signal<T, LocalStorage>`. Every one is `#[prop(into)]`, so a plain `T` and a
-  signal are both accepted.
-- `Binding<T>` is the ownership prop from the table above.
-- `Option<T>` props take a `T`, never `Some(T)`.
-- **fn** in the children column means `ChildrenFn`: the child list is built again each time the
-  surface opens, because a surface that was unmounted has to be built a second time.
-- A row with no children column entry renders no children.
-
-## The inventory
-
-### The atoms
+## Basics
 
 | Component | Props | Children |
 |---|---|---|
 | `Button` | `variant: ButtonVariant = Default`, `size: ButtonSize = Md`, `disabled: Signal<bool> = false`, `node_ref: Option<NodeRef>` | yes |
+| `ButtonGroup` | `orientation: ButtonGroupOrientation = Horizontal` | yes |
+| `ButtonGroupText` | — | yes |
+| `ButtonGroupSeparator` | — | — |
 | `Badge` | `variant: BadgeVariant = Default` | yes |
 | `Label` | `control: Option<NodeRef>`, `node_ref: Option<NodeRef>` | yes |
+| `Kbd`, `KbdGroup` | — | yes |
 | `Separator` | `orientation: SeparatorOrientation = Horizontal`, `decorative: bool = true` | — |
 | `Skeleton` | — | — |
+| `Spinner` | `label: String = "Loading"` | — |
+| `AspectRatio` | `ratio: f32 = 1.0` | yes |
 | `Avatar` | `src: Signal<Option<String>> = None`, `size: AvatarSize = Md`, `label: Option<String>` | yes |
+| `AvatarImage` | `src: Signal<Option<String>> = None` | — |
+| `AvatarFallback`, `AvatarGroupCount` | — | yes |
+| `AvatarBadge` | `label: Option<String>` | opt |
+| `AvatarGroup` | `size: AvatarSize = Md` | yes |
 
-`ButtonVariant` is `Default`, `Secondary`, `Destructive`, `Outline`, `Ghost`, `Link`. `ButtonSize`
-is `Sm`, `Md`, `Lg`, `Icon`. `BadgeVariant` is `Default`, `Secondary`, `Destructive`, `Outline`.
-`AvatarSize` is `Sm`, `Md`, `Lg`.
+| Enum | Values |
+|---|---|
+| `ButtonVariant` | `Default`, `Secondary`, `Destructive`, `Outline`, `Ghost`, `Link` |
+| `ButtonSize` | `Xs`, `Sm`, `Md`, `Lg`, `Icon`, `IconXs`, `IconSm`, `IconLg` (the `Icon…` sizes are square) |
+| `BadgeVariant` | `Default`, `Secondary`, `Destructive`, `Success`, `Warning`, `Outline`, `Ghost`, `Link` |
+| `AvatarSize` | `Sm`, `Md`, `Lg` |
+| `ButtonGroupOrientation`, `SeparatorOrientation` | `Horizontal`, `Vertical` |
 
-### The containers
+- <kbd>Enter</kbd> and <kbd>Space</kbd> press a `Button` as an ordinary click, so one `on:click`
+  serves pointer, keyboard and accessibility actions.
+- `disabled` removes the button from the focus order and from pointer hit testing, and tells
+  assistive technology.
+- `Outline` buttons have no fill at rest and no shadow; they take the colour of the surface behind
+  them and tint on hover.
+- `Spinner` is a status region named by `label`. Use `Progress` when the amount done is known.
+
+## Content
 
 | Component | Props | Children |
 |---|---|---|
+| `Card` | — | yes |
+| `CardHeader`, `CardTitle`, `CardDescription`, `CardAction`, `CardContent`, `CardFooter` | — | yes |
 | `Alert` | `variant: AlertVariant = Default`, `live: bool = true`, `icon: bool = true` | yes |
 | `AlertTitle`, `AlertDescription` | — | yes |
-| `Card` | — | yes |
-| `CardHeader`, `CardTitle`, `CardDescription`, `CardContent`, `CardFooter` | — | yes |
+| `Empty`, `EmptyHeader`, `EmptyTitle`, `EmptyDescription`, `EmptyContent` | — | yes |
+| `EmptyMedia` | `variant: EmptyMediaVariant = Default` | yes |
+| `Item` | `variant: ItemVariant = Default`, `size: ItemSize = Md` | yes |
+| `ItemGroup`, `ItemHeader`, `ItemContent`, `ItemTitle`, `ItemDescription`, `ItemActions`, `ItemFooter` | — | yes |
+| `ItemMedia` | `variant: ItemMediaVariant = Default` | yes |
+| `ItemSeparator` | — | — |
 | `Progress` | `value: Signal<Option<f64>> = None`, `max: f64 = 100.0`, `label: Option<String>` | — |
 
-`Progress` with `value = None` is the indeterminate case. `Alert(live = true)` gives the element
-role `Alert` and a polite live region; `live = false` makes it a `Group`.
+| Enum | Values |
+|---|---|
+| `AlertVariant` | `Default`, `Destructive` |
+| `EmptyMediaVariant` | `Default`, `Icon` |
+| `ItemVariant` | `Default`, `Outline`, `Muted` |
+| `ItemSize` | `Md`, `Sm` |
+| `ItemMediaVariant` | `Default`, `Icon`, `Image` |
 
-`Card` and `Alert` use a `box` root. Their children participate in normal layout. They do not use
-the replaced `surface` element; that element is only for pixels from another renderer.
+- `Alert(live = true)` is announced through a polite live region; `live = false` makes it a plain
+  group.
+- `Progress(value = None)` is indeterminate.
 
-### The text fields
+## Text fields
 
 | Component | Props | Children |
 |---|---|---|
 | `Input`, `Textarea` | `value: Binding<String>`, `default_value: Option<String>`, `on_change`, `placeholder: Option<String>`, `disabled`, `read_only`, `required`, `invalid` (all `Signal<bool> = false`), `label: Option<String>`, `labelled_by: Option<NodeRef>`, `node_ref` | — |
-| `InputOtp` | `value: Binding<String>`, `default_value`, `on_change`, `on_complete: Option<UnsyncCallback<String>>`, `length: usize = 6`, `disabled: Signal<bool> = false`, `label`, `labelled_by`, `node_ref` | — |
+| `InputGroup` | `disabled`, `invalid` (`Signal<bool> = false`) | yes |
+| `InputGroupAddon` | `align: InputGroupAddonAlign = InlineStart` | yes |
+| `InputGroupText` | — | yes |
+| `InputGroupButton` | `variant: ButtonVariant = Ghost`, `size: InputGroupButtonSize = Xs`, `disabled` | yes |
+| `InputGroupInput`, `InputGroupTextarea` | `value: Binding<String>`, `default_value: String = ""`, `on_change`, `placeholder: String = ""`, `disabled`, `invalid`, `node_ref` | — |
+| `InputOtp` | `value: Binding<String>`, `default_value`, `on_change`, `on_complete: Option<UnsyncCallback<String>>`, `length: usize = 6`, `groups: Option<Vec<usize>>`, `disabled`, `invalid`, `label`, `labelled_by`, `node_ref` | — |
+| `InputOtpGroup` | — | yes |
+| `InputOtpSeparator` | — | — |
 
-`Input` and `Textarea` render the `field` element. The text lives in the framework's editing model
-over that element, not in the component.
+`InputGroupAddonAlign` is `InlineStart`, `InlineEnd`, `BlockStart`, `BlockEnd`.
+`InputGroupButtonSize` is `Xs`, `Sm`, `IconXs`, `IconSm`.
 
-### The choices
+- The text is held by zgui's editing model on the `field` element, not by the component.
+- A `read_only` field refuses every edit and draws no caret, but its text can still be selected and
+  copied with the pointer and the keyboard.
+- `InputOtp` draws its own boxes. `groups = vec![3, 3]` splits six boxes into two runs with a dash
+  between them. `on_complete` runs when every box is filled.
+
+## Forms and fields
 
 | Component | Props | Children |
 |---|---|---|
-| `Checkbox` | `checked: Binding<Checked>`, `default_checked: Checked = No`, `on_change`, `disabled: Signal<bool> = false`, `labelled_by`, `node_ref` | — |
-| `Switch` | `checked: Binding<bool>`, `default_checked: bool = false`, `on_change`, `disabled`, `labelled_by`, `node_ref` | — |
-| `Toggle` | `pressed: Binding<bool>`, `default_pressed: bool = false`, `on_change`, `variant: ToggleVariant = Default`, `size: ToggleSize = Md`, `disabled`, `label`, `node_ref` | yes |
-| `ToggleGroup` | `value: Binding<Vec<String>>`, `default_value`, `on_change`, `selection: ToggleSelection = Single`, `disabled`, `orientation: Orientation = Horizontal`, `label` | yes |
-| `ToggleGroupItem` | `value: String`, `variant`, `size`, `disabled`, `label`, `node_ref` | yes |
+| `Field` | `orientation: FieldOrientation = Vertical`, `invalid`, `disabled` (`Signal<bool> = false`) | yes |
+| `FieldSet`, `FieldGroup`, `FieldContent`, `FieldLabel`, `FieldTitle`, `FieldDescription`, `FieldError` | — | yes |
+| `FieldLegend` | `variant: FieldLegendVariant = Legend` | yes |
+| `FieldSeparator` | — | opt |
+| `Form` | `on_submit: Option<UnsyncCallback<()>>`, `label`, `submit_on_enter: bool = true`, `node_ref` | yes |
+| `FormField` | `name: String`, `validate: Option<Validator>` | yes |
+| `FormItem`, `FormLabel`, `FormDescription` | — | yes |
+| `FormMessage` | — | opt |
+| `FormSubmit` | `variant: ButtonVariant = Default`, `size: ButtonSize = Md`, `disabled`, `node_ref` | yes |
+
+`FieldOrientation` is `Vertical`, `Horizontal`. `FieldLegendVariant` is `Legend`, `Label`.
+
+- `Field` only handles layout and labelling. `Form` adds validation and submission:
+  <kbd>Enter</kbd> submits, and the first invalid field receives focus.
+- `use_form_field()` returns the enclosing `FormField`'s context.
+
+## Choices
+
+| Component | Props | Children |
+|---|---|---|
+| `Checkbox` | `checked: Binding<Checked>`, `default_checked: Checked = No`, `on_change`, `disabled`, `invalid`, `labelled_by`, `node_ref` | — |
+| `Switch` | `checked: Binding<bool>`, `default_checked: bool = false`, `on_change`, `disabled`, `size: SwitchSize = Md`, `labelled_by`, `node_ref` | — |
 | `RadioGroup` | `value: Binding<String>`, `default_value`, `on_change`, `disabled`, `orientation: Orientation = Vertical`, `label` | yes |
-| `RadioGroupItem` | `value: String`, `disabled`, `label`, `labelled_by`, `node_ref` | — |
+| `RadioGroupItem` | `value: String`, `disabled`, `invalid`, `label`, `labelled_by`, `node_ref` | — |
+| `Toggle` | `pressed: Binding<bool>`, `default_pressed: bool = false`, `on_change`, `variant: ToggleVariant = Default`, `size: ToggleSize = Md`, `disabled`, `label`, `node_ref` | yes |
+| `ToggleGroup` | `value: Binding<Vec<String>>`, `default_value`, `on_change`, `selection: ToggleSelection = Single`, `variant: ToggleVariant = Default`, `size: ToggleSize = Md`, `spacing: f32 = 0.0`, `disabled`, `orientation: Orientation = Horizontal`, `label` | yes |
+| `ToggleGroupItem` | `value: String`, `variant: Option<ToggleVariant>`, `size: Option<ToggleSize>`, `disabled`, `label`, `node_ref` | yes |
 | `Slider` | `value: Binding<f64>`, `default_value: f64 = 0.0`, `on_change`, `min: f64 = 0.0`, `max: f64 = 100.0`, `step: f64 = 1.0`, `disabled`, `label`, `labelled_by`, `node_ref` | — |
+| `NativeSelect` | `value: Binding<String>`, `default_value`, `on_change`, `placeholder`, `size: NativeSelectSize = Md`, `disabled`, `invalid`, `node_ref` | fn |
+| `NativeSelectOption` | `value: String`, `text: Option<String>`, `disabled: bool = false` | yes |
+| `NativeSelectOptGroup` | `label: String` | yes |
 
-`Checked` is `No`, `Yes`, `Mixed`. `Mixed` sets `UiState::INDETERMINATE`, which `:indeterminate`
-matches.
+| Enum | Values |
+|---|---|
+| `Checked` | `No`, `Yes`, `Mixed` (`Mixed` matches `:indeterminate`) |
+| `SwitchSize`, `NativeSelectSize` | `Sm`, `Md` |
+| `ToggleVariant` | `Default`, `Outline` |
+| `ToggleSize` | `Sm`, `Md`, `Lg` |
+| `ToggleSelection` | `Single`, `Multiple` |
+| `Orientation` | `Horizontal`, `Vertical`, `Both` (from `zgui-ui-primitives`) |
 
-### The disclosures
+- `RadioGroup` and `ToggleGroup` are one tab stop; the arrow keys move between items. In a radio
+  group the arrow keys also select.
+- `Slider`: the arrow keys move one `step`, Page Up/Down move ten steps, Home/End go to the ends.
+- `ToggleGroupItem` uses the group's `variant` and `size` unless it sets its own. `spacing` is the
+  gap between items in spacing steps; at `0.0` the items join into one strip.
+- Outlined toggles and all fields (input, select, checkbox, radio) have no fill of their own.
+
+## Disclosure
 
 | Component | Props | Children |
 |---|---|---|
@@ -147,132 +205,197 @@ matches.
 | `AccordionTrigger` | `level: usize = 3` | yes |
 | `AccordionContent` | — | yes |
 | `Tabs` | `value: Binding<String>`, `default_value: String = ""`, `on_change`, `orientation: Orientation = Horizontal`, `activation: TabsActivation = Automatic`, `label`, `node_ref` | yes |
-| `TabsList` | `label: Option<String>` | yes |
+| `TabsList` | `variant: TabsListVariant = Default`, `label` | yes |
 | `TabsTrigger` | `value: String`, `disabled` | yes |
 | `TabsContent` | `value: String`, `keep_mounted: bool = false` | fn |
 
-`AccordionTrigger(level)` is the heading level a reader is told, so an accordion inside a section
-does not claim to be a top-level heading.
+`AccordionSelection` is `Single`, `Multiple`. `TabsActivation` is `Automatic`, `Manual`.
+`TabsListVariant` is `Default`, `Line`.
 
-### Getting about
+- `AccordionTrigger(level)` sets the heading level announced to screen readers.
+- With `TabsActivation::Manual`, the arrow keys move focus and <kbd>Enter</kbd> or <kbd>Space</kbd>
+  shows the panel.
+- `TabsContent` builds its content only while its tab is selected. Set `keep_mounted` to keep input
+  or scroll state in hidden panels.
+
+## Navigation
 
 | Component | Props | Children |
 |---|---|---|
 | `Menubar` | `label: Option<String>` | yes |
 | `MenubarMenu` | `value: String` | yes |
-| `MenubarTrigger` | — | yes |
+| `MenubarTrigger`, `MenubarLabel`, `MenubarShortcut` | — | yes |
 | `MenubarContent` | `placement: Placement = Placement::BOTTOM` | fn |
 | `MenubarItem` | `on_select`, `disabled`, `shortcut: Option<String>` | yes |
-| `MenubarLabel`, `MenubarSeparator` | — | yes / — |
+| `MenubarCheckboxItem` | `checked: Binding<bool>`, `default_checked: bool = false`, `on_change`, `disabled`, `close_on_select: bool = false` | yes |
+| `MenubarRadioItem` | `value: String`, `disabled`, `close_on_select: bool = true` | yes |
+| `MenubarSeparator` | — | — |
 | `NavigationMenu` | `value: Binding<String>`, `default_value: String = ""`, `on_change`, `label: String = "Main"`, `node_ref` | yes |
-| `NavigationMenuList` | — | yes |
+| `NavigationMenuList`, `NavigationMenuTrigger` | — | yes |
 | `NavigationMenuItem` | `value: String` | yes |
-| `NavigationMenuTrigger` | — | yes |
 | `NavigationMenuContent` | — | fn |
 | `NavigationMenuLink` | `active: Signal<bool> = false` | yes |
+| `NavigationMenuIndicator` | — | — |
 | `Breadcrumb` | `label: String = "Breadcrumb"` | yes |
 | `BreadcrumbList`, `BreadcrumbItem`, `BreadcrumbLink`, `BreadcrumbPage` | — | yes |
-| `BreadcrumbSeparator` | `children: Option<Children>` | optional |
+| `BreadcrumbSeparator` | — | opt |
 | `BreadcrumbEllipsis` | `label: String = "More"` | — |
 | `Pagination` | `label: String = "Pagination"` | yes |
 | `PaginationContent`, `PaginationItem` | — | yes |
 | `PaginationLink` | `page: Option<usize>`, `current: Signal<bool> = false` | yes |
-| `PaginationPrevious`, `PaginationNext` | `disabled: Signal<bool> = false`, `label: String` | — |
+| `PaginationPrevious` | `disabled`, `label: String = "Previous page"`, `text: String = "Previous"` | — |
+| `PaginationNext` | `disabled`, `label: String = "Next page"`, `text: String = "Next"` | — |
 | `PaginationEllipsis` | `label: String = "More pages"` | — |
-| `SidebarProvider` | `open: Binding<bool>`, `default_open: bool = true`, `on_open_change`, `side: SidebarSide = Left`, `collapse: SidebarCollapse = Icon`, `shortcut: bool = true` | yes |
-| `Sidebar` | `label: String = "Sidebar"`, `children: Option<Children>` | optional |
-| `SidebarHeader`, `SidebarContent`, `SidebarFooter`, `SidebarGroup`, `SidebarGroupLabel`, `SidebarInset` | — | yes |
-| `SidebarMenu`, `SidebarMenuItem` | — | yes |
-| `SidebarMenuButton` | `active: Signal<bool> = false`, `disabled`, `label` | yes |
-| `SidebarTrigger` | `label: String = "Toggle sidebar"` | — |
 
-`page_window(current, pages, slots) -> Vec<Slot>` in `zgui_ui::pagination` computes which page
-numbers and which gaps to draw. `Slot` is `Page(usize)` or `Gap`.
+`MenubarGroup` and `MenubarRadioGroup` are `MenuGroup` and `MenuRadioGroup` (see
+[Aliases](#aliases)); submenus inside a menubar use `MenuSub`.
 
-### The surfaces that move
+`zgui_ui::pagination::page_window(current, pages, slots)` returns the `Vec<Slot>` to draw, where
+`Slot` is `Page(usize)` or `Gap`.
+
+### Sidebar
+
+| Component | Props | Children |
+|---|---|---|
+| `SidebarProvider` | `open: Binding<bool>`, `default_open: bool = true`, `on_open_change`, `side: SidebarSide = Left`, `collapse: SidebarCollapse = Icon`, `variant: SidebarVariant = Sidebar`, `shortcut: bool = true` | yes |
+| `Sidebar` | `label: String = "Sidebar"`, `side`, `collapsible`, `variant` (each `Option`, overriding the provider) | opt |
+| `SidebarHeader`, `SidebarContent`, `SidebarFooter`, `SidebarInset` | — | yes |
+| `SidebarGroup`, `SidebarGroupLabel`, `SidebarGroupContent` | — | yes |
+| `SidebarGroupAction` | `label`, `disabled` | yes |
+| `SidebarInput` | `value: Binding<String>`, `default_value`, `on_change`, `placeholder`, `disabled`, `labelled_by`, `node_ref` | — |
+| `SidebarSeparator` | — | — |
+| `SidebarMenu`, `SidebarMenuItem`, `SidebarMenuSub`, `SidebarMenuSubItem`, `SidebarMenuBadge` | — | yes |
+| `SidebarMenuButton` | `active: Signal<bool> = false`, `disabled`, `size: SidebarMenuSize = Default`, `variant: SidebarMenuVariant = Default`, `tooltip: Option<String>`, `label` | yes |
+| `SidebarMenuAction` | `label`, `disabled`, `hover_only: bool = false` | yes |
+| `SidebarMenuSubButton` | `active`, `disabled`, `size: SidebarSubSize = Md`, `label` | yes |
+| `SidebarMenuSkeleton` | `icon: bool = false`, `width: Option<u8>` | — |
+| `SidebarTrigger`, `SidebarRail` | `label: String = "Toggle sidebar"` | — |
+
+| Enum | Values |
+|---|---|
+| `SidebarSide` | `Left`, `Right` |
+| `SidebarCollapse` | `Icon`, `Offcanvas`, `None` |
+| `SidebarVariant` | `Sidebar`, `Floating`, `Inset` |
+| `SidebarMenuSize` | `Default`, `Sm`, `Lg` |
+| `SidebarMenuVariant` | `Default`, `Outline` |
+| `SidebarSubSize` | `Md`, `Sm` |
+
+- With `shortcut` on, the primary modifier + <kbd>B</kbd> (<kbd>Cmd</kbd> on macOS,
+  <kbd>Ctrl</kbd> elsewhere) collapses and expands the sidebar from anywhere in the window.
+- `SidebarMenuButton(tooltip)` is shown beside the button while the sidebar is collapsed to icons.
+- The sidebar is a desktop panel at every width; there is no mobile sheet.
+
+## Scrolling and panels
 
 | Component | Props | Children |
 |---|---|---|
 | `ScrollArea` | `orientation: Orientation = Vertical`, `label`, `node_ref` | yes |
 | `ScrollBar` | `orientation: Orientation = Vertical` | — |
 | `ResizablePanelGroup` | `direction: Orientation = Horizontal`, `on_change: Option<UnsyncCallback<Vec<f64>>>`, `label`, `node_ref` | yes |
-| `ResizablePanel` | `default_size: f64 = 0.0`, `min_size: f64 = 0.0`, `max_size: f64 = 100.0`, `label`, `node_ref` | yes |
-| `ResizableHandle` | `step: f64 = 5.0`, `label` | — |
+| `ResizablePanel` | `default_size: f64 = 0.0`, `min_size: f64 = 0.0`, `max_size: f64 = 100.0`, `min_pixels: f64 = 0.0`, `label`, `node_ref` | yes |
+| `ResizableHandle` | `step: f64 = 5.0`, `with_handle: bool = false`, `label` | — |
 | `Carousel` | `index: Binding<usize>`, `default_index: usize = 0`, `on_change`, `orientation: Orientation = Horizontal`, `wrap: bool = false`, `label`, `node_ref` | yes |
 | `CarouselContent`, `CarouselItem` | — | yes |
-| `CarouselPrevious`, `CarouselNext` | `label: String` | — |
+| `CarouselPrevious` | `label: String = "Previous slide"` | — |
+| `CarouselNext` | `label: String = "Next slide"` | — |
 
-### Data
+- `ScrollBar` draws nothing itself. zgui draws the bar (a transparent track and a slim thumb);
+  `ScrollBar` adds the accessible role, a focus stop and the keys: arrows scroll by a line, Page
+  Up/Down by a screen, Home/End to the ends.
+- Panel sizes are percentages of the group, applied as each panel's `flex-basis`. When the declared
+  sizes do not add up to 100, the group distributes the rest.
+- `min_pixels` is a minimum size in CSS pixels. It is converted to a percentage whenever the group
+  is resized, and the larger of `min_pixels` and `min_size` applies.
+- When a panel is removed, the remaining panels are resized from their declared sizes.
+- `ResizableHandle`: the arrow keys move it by `step` percentage points, Home/End go to the panel's
+  minimum and maximum, and <kbd>Enter</kbd> collapses the panel before it or restores it.
+
+## Data
 
 | Component | Props | Children |
 |---|---|---|
 | `Table` | `columns: Signal<String> = "1fr"`, `interactive: bool = false`, `sticky_header: bool = false`, `rows: Option<Signal<usize>>`, `columns_count: Option<Signal<usize>>`, `label`, `labelled_by`, `node_ref` | yes |
-| `TableCaption`, `TableHeader`, `TableBody`, `TableFooter` | `node_ref` on all but the caption | yes |
+| `TableCaption` | — | yes |
+| `TableHeader`, `TableBody`, `TableFooter` | `node_ref` | yes |
 | `TableRow` | `index: Option<Signal<usize>>`, `selected: Option<Signal<bool>>`, `node_ref` | yes |
 | `TableHead` | `index`, `align: CellAlign = Start`, `sort: Signal<ColumnSort> = None`, `node_ref` | yes |
 | `TableCell` | `index`, `align: CellAlign = Start`, `header: bool = false`, `node_ref` | yes |
 | `DataTable<T, I>` | `rows: Signal<Vec<T>>`, `columns: Vec<Column<T>>`, `row_id: I`, `selectable: bool = false`, `filterable: bool = false`, `row_match: Option<RowMatch<T>>`, `page_size: usize = 0`, `virtualized: bool = false`, `row_size: f32 = 40.0`, `body_height: Option<f32>`, `resizable: bool = true`, `empty: String = "No results."`, `label`, `on_model: Option<UnsyncCallback<DataModel<T>>>`, `node_ref` | — |
-| `ColumnResizer` | `header: NodeRef`, `label: String`, `on_resize: UnsyncCallback<f32>`, `step: f32 = 8.0` | — |
-| `VirtualList<V, F>` | `count: Signal<usize>`, `row_size: Signal<f32> = 32.0`, `overscan: usize = 4`, `row: F`, `label`, `node_ref` | — |
-| `Chart` | `series: Signal<Vec<Series>>`, `kind: ChartKind = Bar`, `width: f64 = 480.0`, `height: f64 = 240.0`, `ticks: usize = 5`, `legend: bool = true`, `label`, `node_ref` | — |
-| `Calendar` | `value: Binding<Option<Date>>`, `default_value`, `on_change`, `default_month: Option<Date>`, `today: Option<Date>`, `available: Option<DateFilter>`, `disabled`, `label`, `node_ref` | — |
+| `ColumnResizer` | `header: NodeRef`, `label: String`, `on_resize: UnsyncCallback<f32>`, `step: f32 = 8.0`, `edge: GripEdge = Trailing`, `on_reset: Option<UnsyncCallback<()>>` | — |
+| `VirtualList<V, F>` | `count: Signal<usize>`, `row_size: Signal<f32> = 32.0`, `overscan: usize = 4`, `row: F` (`Fn(usize) -> V`), `label`, `node_ref` | — |
+
+`CellAlign` is `Start`, `Center`, `End`. `ColumnSort` is `None`, `Ascending`, `Descending`.
+`GripEdge` is `Trailing`, `Leading`.
+
+`Table` is presentational: one CSS grid with table roles. `DataTable` is driven by a model that
+sorts, filters, selects, pages and virtualises.
+
+```rust
+let columns = vec![
+    Column::new("item", "Item", |line: &Line| line.item.clone())
+        .sortable_by(|a: &Line, b: &Line| a.item.cmp(&b.item)),
+    Column::new("cost", "Cost", |line: &Line| format!("{}p", line.pence))
+        .aligned(CellAlign::End)
+        .sized("120px"),
+];
+view! {
+    DataTable(
+        rows = lines,
+        columns = columns,
+        row_id = |line: &Line| line.id.to_string(),
+        label = "Invoice lines",
+        selectable = true,
+        filterable = true,
+        page_size = 25_usize
+    )
+}
+```
+
+- `on_model` gives you the `DataModel<T>`: `set_sort`, `set_filter`, `go_to_page`,
+  `set_page_size`, `selection`, `set_all_selected` and more. `set_sort(state)` restores a saved
+  `SortState`; a state naming a missing or unsortable column is refused.
+- `virtualized = true` builds only the visible rows, so `row_size` must match the row's styled
+  height. Paging and virtualisation are alternatives; setting both virtualises.
+- `ColumnResizer` reports the new width through `on_resize` instead of applying it. The arrow keys
+  move it by `step` pixels. `edge = Leading` puts the grip on the leading edge, for a column to the
+  right of a flexible one. A double click calls `on_reset`, where you can restore the column's
+  default width.
+- `VirtualList` builds the visible rows plus `overscan` on each side. `row_size` may be a signal;
+  changing it moves the rows and the scroll extent together. The extent is capped at
+  `zgui_ui::virtualize::MAX_EXTENT` (4,000,000 CSS pixels); beyond that the scrollbar maps rows
+  proportionally, so use `VirtualWindow::offset_of(index)` to scroll a row into view.
+
+### Charts and dates
+
+| Component | Props | Children |
+|---|---|---|
+| `Chart` | `series: Signal<Vec<Series>>`, `kind: ChartKind = Bar`, `width: f64 = 480.0`, `height: f64 = 240.0`, `ticks: usize = 5`, `legend: bool = true`, `tooltip: bool = true`, `indicator: ChartIndicator = Dot`, `label`, `node_ref` | — |
+| `ChartContainer` | `node_ref` | yes |
+| `ChartTooltipContent` | `label`, `entries: Vec<ChartEntry>`, `indicator: ChartIndicator = Dot`, `hide_label: bool = false`, `hide_indicator: bool = false` | — |
+| `ChartLegendContent` | `entries: Vec<LegendEntry>`, `align: LegendAlign = Bottom`, `label: String = "Series"` | — |
+| `Calendar` | `value: Binding<Option<Date>>`, `default_value`, `on_change`, `mode: CalendarMode = Single`, `range: Binding<Option<DateRange>>`, `default_range`, `on_range_change`, `months: usize = 1`, `default_month: Option<Date>`, `today: Option<Date>`, `available: Option<DateFilter>`, `disabled`, `label`, `node_ref` | — |
 | `CalendarDay` | `date: Date`, `in_month: bool`, `today: bool`, `unavailable: bool = false`, `on_choose: UnsyncCallback<Date>` | — |
-| `DatePicker` | `value: Binding<Option<Date>>`, `default_value`, `on_change`, `open: Binding<bool>`, `on_open_change`, `today`, `available`, `placeholder: String = "Pick a date"`, `disabled`, `label`, `labelled_by`, `node_ref` | — |
+| `DatePicker` | `Calendar`'s props except `default_month`, plus `open: Binding<bool>`, `on_open_change`, `placeholder: String = "Pick a date"`, `labelled_by` | — |
 
-`Table` and `DataTable` are different things. `Table` is presentational: one CSS grid, plus the
-roles a reader needs. `DataTable<T, I>` is generic and model-driven, and sorts, filters, pages,
-selects and virtualises through `DataModel<T>`.
+`ChartKind` is `Bar`, `Line`, `Area`. `ChartIndicator` is `Dot`, `Line`, `Dashed`. `LegendAlign` is
+`Bottom`, `Top`. `CalendarMode` is `Single`, `Range`.
 
-`Column<T>::new(...)` builds a column, with `.sortable_by(…)` and `.sized(track)`. `VirtualList`
-builds only the rows in view plus `overscan` at each edge.
+- Each chart mark is a focusable element with an accessible name, so <kbd>Tab</kbd> moves through
+  the data. Series colours come from `--zui-color-chart-1` … `-5`.
+- A chart is sized by `width` and `height` in CSS pixels; it does not resize to fit its box.
+- `Calendar(mode = CalendarMode::Range)` reads and writes `range` instead of `value`. `months` shows
+  several months side by side.
 
-`row_size` is reactive. A plain `f32` makes it constant; a signal updates the row positions and the
-scroll extent together. The declared size must match the row style because the list selects rows
-before it builds them.
-
-The extent is capped at `zgui_ui::virtualize::MAX_EXTENT`, which is 4,000,000 CSS pixels. A longer
-list maps the scrollbar proportionally across all rows. Use `VirtualWindow::offset_of(index)` when
-you scroll a row into view; `index as f32 * row_size` is wrong for a compressed list.
-
-Use `DataModel::set_sort(state)` to restore a saved `SortState` without cycling a header. A state
-with no key restores arrival order. A state that names a missing or unsortable column is refused,
-and the current sort stays unchanged.
-
-### Toasts
-
-| Component | Props | Children |
-|---|---|---|
-| `Toaster` | `corner: ToastCorner = BottomRight`, `limit: usize = 3`, `label: String = "Notifications"`, `dismiss_label: String = "Dismiss"` | yes |
-| `ToastItem` | `queued: Queued`, `dismiss_label: String = "Dismiss"` | — |
-
-`Toaster` wraps the interface rather than sitting beside it, because it publishes the queue as a
-context and a context only flows down. `use_toaster() -> Option<ToastQueue>` reaches it, and
-`queue.push(Toast::new("Saved"))` shows one.
-
-### Forms
-
-| Component | Props | Children |
-|---|---|---|
-| `Form` | `on_submit: Option<UnsyncCallback<()>>`, `label`, `submit_on_enter: bool = true`, `node_ref` | yes |
-| `FormField` | `name: String`, `validate: Option<Validator>` | yes |
-| `FormItem`, `FormLabel`, `FormDescription` | — | yes |
-| `FormMessage` | `children: Option<Children>` | optional |
-| `FormSubmit` | `variant`, `size`, `disabled`, `node_ref` | yes |
-
-### Settings
+## Settings
 
 | Component | Props | Children |
 |---|---|---|
 | `Settings` | `page: Binding<String>`, `default_page: String = ""`, `on_page_change`, `label`, `node_ref` | yes |
 | `SettingsPages` | `label` | yes |
-| `SettingsPage` | `value: String`, `disabled: Signal<bool> = false` | yes |
+| `SettingsPage` | `value: String`, `disabled` | yes |
 | `SettingsPane` | `value: String`, `keep_mounted: bool = false` | fn |
 | `SettingsGroup`, `SettingsGroupLabel`, `SettingsGroupDescription` | — | yes |
-| `SettingsItem` | `label: String`, `description: Option<String>`, `disabled: Signal<bool> = false`, `control: Option<NodeRef>` | yes |
-
-`Settings` uses the same controlled, two-way, and uncontrolled value protocol as `Tabs`. The page
-list is a vertical tab list. Up and Down wrap; Home and End select an edge; disabled pages are
-skipped. Horizontal arrows remain available to controls in the pane.
+| `SettingsItem` | `label: String`, `description: Option<String>`, `disabled`, `control: Option<NodeRef>` | yes |
 
 ```rust
 Settings(default_page = "appearance", label = "Preferences") {
@@ -291,118 +414,243 @@ Settings(default_page = "appearance", label = "Preferences") {
 }
 ```
 
-Each pane element always exists because its page has an accessibility relation to it. By default,
-the pane content exists only while selected. Set `keep_mounted` when hidden content must keep local
-input or scroll state.
+- The page list is a vertical tab list: Up/Down wrap, Home/End go to the ends, and disabled pages
+  are skipped. Left and right arrows are left to the controls in the pane.
+- Spread `{..use_settings_item_attrs()}` on the control so its label and description are announced.
+- Pass the same `NodeRef` to `SettingsItem(control)` and to the control's `node_ref` so that
+  pressing the label focuses the control.
+- An item's `disabled` fades the row and blocks the pointer. Disable the control too, so assistive
+  technology reports the same state.
 
-Spread `{..use_settings_item_attrs()}` on the child control so its label and description are
-announced. To make a press on the label focus the control, give the same `NodeRef` to
-`SettingsItem(control = ...)` and to the control's `node_ref`. An item-level `disabled` value fades
-the row and blocks its pointer input; also disable the child control so accessibility APIs report
-the same state.
+## Toasts
 
-### The surfaces that take the window over
+| Component | Props | Children |
+|---|---|---|
+| `Toaster` | `corner: ToastCorner = BottomRight`, `limit: usize = 3`, `label: String = "Notifications"`, `dismiss_label: String = "Dismiss"` | yes |
+| `ToastItem` | `queued: Queued`, `dismiss_label: String = "Dismiss"` | — |
+
+Wrap your interface in a `Toaster`; it provides the toast queue as a context. Anything inside it
+gets the queue with `use_toaster()`:
+
+```rust
+let toasts = use_toaster();
+view! {
+    Button(on:click = move |_| {
+        if let Some(toasts) = toasts {
+            toasts.push(
+                Toast::new("Project deleted")
+                    .kind(ToastKind::Success)
+                    .action("Undo", move || restore()),
+            );
+        }
+    }) {"Delete"}
+}
+```
+
+| `Toast` builder | Effect |
+|---|---|
+| `Toast::new(title)` | a toast with a title |
+| `.description(text)` | a second line |
+| `.kind(ToastKind)` | `Normal`, `Success`, `Info`, `Warning`, `Error`, `Loading`; sets the icon and how urgently it is announced |
+| `.duration(d)`, `.persistent()` | how long it stays (default `Toast::DEFAULT_DURATION`, 4 s), or until dismissed |
+| `.action(label, f)` | a button that runs `f` |
+| `.destructive_action(label, f)` | the same, drawn in the destructive fill (`ToastActionTone::Destructive`) |
+| `.cancel(label, f)` | a button that dismisses the toast |
+
+- `push` returns a `ToastId`. `replace(id, toast)` shows a new message in the same place and
+  restarts its timer; use it to report progress in one toast. `dismiss(id)` and `clear()` remove
+  toasts with their exit animation.
+- Beyond `limit`, the oldest toasts are removed. Toasts are drawn on the toast overlay band, above
+  everything else. `ToastCorner` is `BottomRight`, `BottomLeft`, `TopRight`, `TopLeft`.
+
+## Modal surfaces
 
 | Component | Props | Children |
 |---|---|---|
 | `Dialog`, `AlertDialog`, `Sheet`, `Drawer` | `open: Binding<bool>`, `default_open: bool = false`, `on_open_change` | yes |
 | `DialogContent` | `dismiss_on_outside_press: Signal<bool> = true`, `dismiss_on_escape: Signal<bool> = true`, `dismiss_control: bool = true` | fn |
-| `AlertDialogContent` | `dismiss_on_escape: Signal<bool> = true` | fn |
-| `SheetContent` | `side: SheetSide = Right`, `dismiss_on_outside_press`, `dismiss_on_escape` | fn |
-| `DrawerContent` | `handle: bool = true`, `dismiss_on_outside_press`, `dismiss_on_escape` | fn |
+| `AlertDialogContent` | `dismiss_on_escape: Signal<bool> = true`, `size: AlertDialogSize = Default` | fn |
+| `SheetContent` | `side: SheetSide = Right`, `dismiss_on_outside_press`, `dismiss_on_escape`, `dismiss_control: bool = true` | fn |
+| `DrawerContent` | `direction: SheetSide = Bottom`, `handle: bool = true`, `dismiss_on_outside_press`, `dismiss_on_escape` | fn |
 | `DialogTrigger` | `variant: ButtonVariant = Default`, `size: ButtonSize = Md` | yes |
 | `DialogClose` | `variant: ButtonVariant = Ghost`, `size: ButtonSize = Md` | yes |
-| `DialogDismiss`, `DrawerHandle` | — | — |
-| `DialogHeader`, `DialogTitle`, `DialogDescription`, `DialogFooter` | — | yes |
-| `AlertDialogTrigger`, `AlertDialogAction` | `variant = Default`, `size = Md` | yes |
+| `DialogHeader`, `DialogTitle`, `DialogDescription` | — | yes |
+| `DialogFooter` | `close_control: bool = false` | yes |
+| `DialogDismiss`, `SheetDismiss`, `DrawerHandle` | — | — |
+| `SheetHeader`, `SheetTitle`, `SheetDescription`, `SheetFooter` | — | yes |
+| `AlertDialogTrigger` | `variant = Default`, `size = Md` | yes |
+| `AlertDialogAction` | `variant = Default`, `size = Md`, `node_ref` | yes |
 | `AlertDialogCancel` | `variant = Outline`, `size = Md` | yes |
+| `AlertDialogMedia` | — | yes |
 
-An alert dialog has no `dismiss_on_outside_press` prop because it does not have the behaviour: a
-stray press past a destructive confirmation must not count as an answer.
+`SheetSide` is `Top`, `Right`, `Bottom`, `Left`. `AlertDialogSize` is `Default`, `Sm` (narrow,
+centred, answers sharing the width).
 
-### The surfaces that float beside a control
+- Content is built only while open, and stays mounted until its exit animation ends.
+- <kbd>Escape</kbd> closes the surface and <kbd>Tab</kbd> stays inside it. On close, focus returns to
+  the trigger unless something else has taken focus in the meantime.
+- `DialogTitle` labels the surface and `DialogDescription` describes it. A dialog with no title is
+  announced as unlabelled.
+- `dismiss_control` draws a close button in the surface's corner (`DialogDismiss`).
+  `DialogFooter(close_control = true)` adds a "Close" button to the footer.
+- A press outside an alert dialog does not close it, so a stray click cannot answer it.
+  <kbd>Escape</kbd> still closes it.
+- On `AlertDialogAction`, `AlertDialogCancel` and `DialogClose`, your `on:click` runs **before** the
+  surface closes. `AlertDialogAction(node_ref)` records the button so you can focus it.
+- `Drawer` has no drag-to-dismiss gesture; `DrawerHandle` is decorative.
+
+## Anchored surfaces
 
 | Component | Props | Children |
 |---|---|---|
-| `Popover`, `DropdownMenu`, `ContextMenu`, `MenuSub` | `open: Binding<bool>`, `default_open: bool = false`, `on_open_change` | yes |
-| `Tooltip`, `HoverCard` | the same three, plus `delay: Duration`, `close_delay: Duration` | yes |
-| `PopoverContent` | `placement: Signal<Placement> = Placement::BOTTOM`, `offset: f32 = 6.0`, `dismiss_on_outside_press`, `dismiss_on_escape` | fn |
-| `TooltipContent` | `placement = Placement::TOP`, `offset: f32 = 6.0` | fn |
-| `HoverCardContent` | `placement = Placement::BOTTOM`, `offset: f32 = 8.0` | fn |
+| `Popover` | `open: Binding<bool>`, `default_open: bool = false`, `on_open_change` | yes |
+| `PopoverContent` | `placement: Signal<Placement> = Placement::BOTTOM`, `offset: f32 = 4.0`, `dismiss_on_outside_press`, `dismiss_on_escape` | fn |
+| `PopoverHeader`, `PopoverTitle`, `PopoverDescription` | — | yes |
+| `Tooltip` | `open`, `default_open`, `on_open_change`, `delay: Option<Duration>`, `close_delay: Option<Duration>` | yes |
+| `TooltipProvider` | `delay: Duration = 0 ms`, `close_delay: Duration = 150 ms` | yes |
+| `TooltipTrigger` | — | yes |
+| `TooltipContent` | `placement = Placement::TOP`, `offset: f32 = tooltip::DEFAULT_OFFSET`, `arrow: bool = true` | fn |
+| `TooltipArrow` | — | — |
+| `HoverCard` | `open`, `default_open`, `on_open_change`, `delay: Duration = 700 ms`, `close_delay: Duration = 300 ms` | yes |
+| `HoverCardTrigger` | — | yes |
+| `HoverCardContent` | `placement = Placement::BOTTOM`, `offset: f32 = 4.0` | fn |
+
+`Placement`, `Side` and `Align` come from [`zgui-ui-primitives`](/docs/component-library/primitives#the-placement-types).
+A surface flips to the other side when it does not fit, and slides along the edge to stay on
+screen.
+
+### Tooltips
+
+- A tooltip opens on hover, or when its trigger receives focus from the **keyboard**. Focus from a
+  pointer press, from code or from an opening focus trap does not show it. <kbd>Escape</kbd> hides it
+  without moving focus.
+- A tooltip describes a control and cannot contain interactive content. Use `HoverCard` or
+  `Popover` for that.
+- `TooltipProvider` sets the delays for every tooltip inside it; a `Tooltip`'s own `delay` wins.
+  Under one provider only one tooltip shows at a time: moving to the next trigger opens it at once
+  and drops the previous one without an exit animation.
+- The arrow points at the centre of the trigger. `DEFAULT_OFFSET` leaves room for it plus a 4 px
+  gap; with the arrow on, a smaller offset is increased to fit the arrow. Set `arrow = false` to
+  drop it, or place `TooltipArrow` yourself.
+- Colours come from `--zui-color-tooltip`, `-tooltip-foreground` and `-tooltip-border`. By default
+  a tooltip inverts the page.
+
+## Menus
+
+| Component | Props | Children |
+|---|---|---|
+| `DropdownMenu`, `ContextMenu`, `MenuSub` | `open: Binding<bool>`, `default_open: bool = false`, `on_open_change` | yes |
+| `DropdownMenuTrigger` | `variant: ButtonVariant = Default`, `size: ButtonSize = Md`, `disabled` | yes |
 | `DropdownMenuContent` | `placement = Placement::new(Side::Bottom, Align::Start)`, `offset: f32 = 4.0` | fn |
+| `ContextMenuTrigger` | — | yes |
 | `ContextMenuContent` | `placement = Placement::new(Side::Bottom, Align::Start)` | fn |
-| `MenuSubContent` | `placement = Placement::new(Side::Right, Align::Start)` | fn |
-| `DropdownMenuTrigger` | `variant`, `size` | yes |
-| `TooltipTrigger`, `HoverCardTrigger`, `ContextMenuTrigger`, `MenuSubTrigger` | `disabled` on the submenu trigger only | yes |
-| `MenuContent` | `state: OverlayState`, `placement = Placement::BOTTOM`, `offset: f32 = 4.0`, `dismiss_on_outside_press` | fn |
-| `MenuItem` | `disabled`, `destructive: bool = false`, `close_on_select: bool = true`, `on_select`, `shortcut: Option<String>` | yes |
-| `MenuCheckboxItem` | `checked: Binding<bool>`, `default_checked`, `on_change`, `disabled`, `close_on_select` | yes |
+| `MenuItem` | `disabled`, `destructive: bool = false`, `inset: bool = false`, `close_on_select: bool = true`, `on_select`, `shortcut: Option<String>` | yes |
+| `MenuCheckboxItem` | `checked: Binding<bool>`, `default_checked: bool = false`, `on_change`, `disabled`, `close_on_select: bool = true` | yes |
 | `MenuRadioGroup` | `value: Binding<String>`, `default_value`, `on_change`, `label` | yes |
-| `MenuRadioItem` | `value: String`, `disabled`, `close_on_select` | yes |
+| `MenuRadioItem` | `value: String`, `disabled`, `close_on_select: bool = true` | yes |
 | `MenuGroup` | `label: Option<String>` | yes |
-| `MenuLabel`, `MenuShortcut` | — | yes |
+| `MenuLabel` | `inset: bool = false` | yes |
+| `MenuShortcut` | — | yes |
 | `MenuSeparator` | — | — |
-| `MenuTypeahead` | — | yes |
+| `MenuSubTrigger` | `disabled`, `inset: bool = false` | yes |
+| `MenuSubContent` | `placement = Placement::new(Side::Right, Align::Start)` | fn |
 
-A dropdown menu and a context menu differ in what opens them and in nothing else. Both fill their
-surface with the `menu` components in the table above.
+A dropdown menu and a context menu differ only in what opens them. Both are filled with the `Menu…`
+parts.
 
-### The lists one thing is chosen from
+- The arrow keys move through the items and wrap; typing a letter jumps to a matching item;
+  <kbd>→</kbd> opens a submenu, and <kbd>←</kbd> closes it and returns focus to its trigger. <kbd>↓</kbd>/<kbd>↑</kbd> on a `DropdownMenuTrigger` also open it.
+- A disabled `DropdownMenuTrigger` does not open and leaves the focus order.
+- A submenu opens when the pointer rests on its trigger for `menu::sub::OPEN_DELAY` (120 ms), or
+  immediately when the trigger is pressed.
+- `ContextMenuTrigger` opens at the pointer on a right-click or press-and-hold. To open it from
+  the keyboard, call `ContextMenuPlace::current()` inside the trigger and `open_at(point)` with a
+  point in window CSS pixels, such as the corner of the focused row.
+- `MenuItem(inset = true)` lines a plain item up with the labels of checkbox and radio items.
+
+## Listboxes
 
 | Component | Props | Children |
 |---|---|---|
-| `Select` | `value: Binding<String>`, `default_value`, `on_change`, `open: Binding<bool>`, `default_open`, `on_open_change` | yes |
-| `SelectTrigger` | `disabled`, `label`, `labelled_by` | yes |
+| `Select`, `Combobox` | `value: Binding<String>`, `default_value`, `on_change`, `open: Binding<bool>`, `default_open`, `on_open_change` | yes |
+| `SelectTrigger` | `disabled`, `invalid`, `size: SelectTriggerSize = Md`, `label`, `labelled_by` | yes |
 | `SelectValue` | `placeholder: Option<String>` | — |
-| `SelectContent` | `placement = Placement::new(Side::Bottom, Align::Start)`, `offset: f32 = 4.0` | fn |
+| `SelectContent`, `ComboboxContent` | `placement = Placement::new(Side::Bottom, Align::Start)`, `offset: f32 = 4.0` | fn |
 | `SelectItem` | `value: String`, `text: Option<String>`, `disabled` | yes |
-| `Combobox` | the same six as `Select` | yes |
 | `ComboboxInput` | `placeholder`, `disabled`, `label`, `labelled_by` | — |
-| `ComboboxContent` | `placement = Placement::new(Side::Bottom, Align::Start)`, `offset: f32 = 4.0` | fn |
 | `ComboboxItem` | `value: String`, `text: Option<String>`, `disabled`, `on_select: Option<UnsyncCallback<()>>` | fn |
 | `ComboboxEmpty` | — | fn |
 | `Command` | `value: Binding<String>`, `default_value`, `on_change` | yes |
+| `CommandInput` | `placeholder`, `disabled`, `label: String = "Search"`, `labelled_by` | — |
 | `CommandList`, `CommandGroup` | `label: Option<String>` | yes |
-| `CommandDialog` | `open: Binding<bool>`, `default_open`, `on_open_change`, `title: String = "Commands"` | fn |
+| `CommandDialog` | `open: Binding<bool>`, `default_open`, `on_open_change`, `title: String = "Commands"`, `dismiss_control: bool = true` | fn |
 
-### What those are built out of
+`SelectTriggerSize` is `Sm`, `Md`.
 
-These are public, and they are what a surface of your own is written from. `AnchoredSurface`,
-`ModalSurface`, `OverlaySurface` and `OverlayState` are exported from the crate root. `Elevated`,
-`Confined`, `Scrim` and `ListboxCatalogueOf` are reachable at their module path, `zgui_ui::overlay`
-or `zgui_ui::listbox`, and are absent from the prelude.
+- Focus stays on the trigger or input while the arrow keys move through the list; the highlighted
+  option is announced as the active descendant. <kbd>Enter</kbd> chooses, <kbd>Escape</kbd> closes.
+- `SelectValue` shows the chosen option's text, taken from the option itself.
+- While a select is closed, its option bodies are built once more out of sight so the trigger can
+  show the chosen value's text. Side effects in an option body therefore run twice.
+- `Command` is a command palette built on the combobox. Inside `CommandDialog` it fills the dialog's height.
+- There is no chip (multi-value) combobox and no scroll buttons on a long select list.
+
+## Building blocks for your own surfaces
+
+These are in the crate root or their module, not in the prelude.
 
 | Component | Props | Children |
 |---|---|---|
 | `ModalSurface` | `state: OverlayState`, `role: Role = Dialog`, `dismiss_on_outside_press`, `dismiss_on_escape`, `scrim: bool = true` | fn |
 | `AnchoredSurface` | `state: OverlayState`, `layer: OverlayLayer = Popover`, `placement: Signal<Placement> = Placement::BOTTOM`, `offset: f32 = 4.0`, `role: Role = GenericContainer`, `trap: Option<FocusTrapOptions>`, `dismiss_on_outside_press`, `dismiss_on_escape` | fn |
 | `OverlaySurface` | `state: OverlayState`, `role: Role = GenericContainer`, `modal: bool = false` | yes |
-| `Elevated` | `at: SurfaceElevation` | fn |
-| `Confined` | `trap: Option<FocusTrapOptions>` | fn |
-| `Scrim` | — | — |
-| `ListboxCatalogueOf` | — | fn |
+| `MenuContent` | `state: OverlayState`, `placement = Placement::BOTTOM`, `offset: f32 = 4.0`, `dismiss_on_outside_press` | fn |
+| `MenuTypeahead`, `MenubarArrows` | — (`MenubarArrows` takes `bar: Option<RovingContext>`) | yes |
+| `zgui_ui::overlay::Elevated` | `at: SurfaceElevation` | fn |
+| `zgui_ui::overlay::Confined` | `trap: Option<FocusTrapOptions>` | fn |
+| `zgui_ui::overlay::Scrim` | — | — |
+| `zgui_ui::listbox::ListboxCatalogueOf` | — | fn |
 
-### Aliases
+`OverlayState` holds a surface's open state and its trigger and content handles.
+`OverlayState::new(open, default_open, on_open_change).provide()` provides one as context; parts
+below get it with `OverlayState::current()`. `zgui_ui::support` has `variant_attrs` and the editing helpers the
+components use.
 
-Several names are the same component twice. They are `pub use` re-exports, not wrappers.
+A modal surface is composed of these layers, from the outside in:
 
-| Written as | Actually |
+| Layer | From | Job |
+|---|---|---|
+| `Portal(layer)` | `zgui` | draws on an overlay band, outside any clipping ancestor |
+| `Elevated` | `zgui-ui` | stacks a surface opened from another one above it (`--zui-overlay-depth`) |
+| `Presence` | primitives | keeps the surface mounted until its exit animation ends |
+| `Scrim` + `DismissableLayer` | `zgui-ui` + primitives | dims the window; closes on <kbd>Escape</kbd> or a press outside |
+| `FocusScope` | primitives | keeps <kbd>Tab</kbd> inside and restores focus |
+| `OverlaySurface` | `zgui-ui` | the `surface` element, its `data-state` and its role |
+
+`AnchoredSurface` has the same layers, with a `Popper` positioner instead of the scrim, and an
+optional focus trap. See [Primitives](/docs/component-library/primitives) for each behaviour.
+
+## Aliases
+
+These names are re-exports (`pub use`) of another component, not wrappers.
+
+| Written as | Is |
 |---|---|
 | `SheetTrigger`, `DrawerTrigger`, `PopoverTrigger` | `DialogTrigger` |
 | `SheetClose`, `DrawerClose`, `PopoverClose` | `DialogClose` |
-| `AlertDialogTitle`, `SheetTitle`, `DrawerTitle` | `DialogTitle` |
-| `AlertDialogHeader`, `AlertDialogFooter`, `AlertDialogDescription`, and the `Sheet`/`Drawer` equivalents | `DialogHeader`, `DialogFooter`, `DialogDescription` |
+| `AlertDialogHeader`, `AlertDialogTitle`, `AlertDialogDescription`, `AlertDialogFooter` | the `Dialog…` parts |
+| `DrawerHeader`, `DrawerTitle`, `DrawerDescription`, `DrawerFooter` | the `Sheet…` parts |
 | `SelectGroup`, `SelectLabel`, `SelectSeparator` | `MenuGroup`, `MenuLabel`, `MenuSeparator` |
-| `CommandInput`, `CommandItem`, `CommandEmpty` | `ComboboxInput`, `ComboboxItem`, `ComboboxEmpty` |
+| `ComboboxGroup`, `ComboboxLabel`, `ComboboxSeparator` | `MenuGroup`, `MenuLabel`, `MenuSeparator` |
+| `MenubarGroup`, `MenubarRadioGroup` | `MenuGroup`, `MenuRadioGroup` |
+| `CommandItem`, `CommandEmpty` | `ComboboxItem`, `ComboboxEmpty` |
 | `CommandSeparator`, `CommandShortcut` | `MenuSeparator`, `MenuShortcut` |
 
-## Deconstruction 1: `Button`
+## How a component is built
 
-The whole component, from `crates/zgui-ui/src/button/mod.rs`:
+`Button`, from `crates/zgui-ui/src/button/mod.rs`, is a typical component:
 
 ```rust
-const SHEET: &str = "zui-button";
-
 #[component]
 pub fn Button(
     #[prop(default = ButtonVariant::Default)] variant: ButtonVariant,
@@ -413,7 +661,7 @@ pub fn Button(
     #[prop(attrs)] attrs: Attrs,
     children: Children,
 ) -> impl IntoView {
-    install_stylesheet(SHEET, ButtonStyle::CSS);
+    install_stylesheet("zui-button", ButtonStyle::CSS);
     let element = node_ref.unwrap_or_default();
     let variants = ButtonVariants { variant, size };
     let own = variant_attrs(variants.classes(), variants.data_attributes())
@@ -429,470 +677,35 @@ pub fn Button(
 }
 ```
 
-What it is made of:
-
-| Ingredient | What it is |
-|---|---|
-| elements | one `control` |
-| signals of its own | none |
-| contexts | none |
-| portals | none |
-| primitives | none |
-| CSS | `ButtonStyle`, a `style!` sheet installed once under the name `zui-button` |
-
-The `variants!` table is the appearance, and its output is asserted in the crate's own doctest:
-
-```rust
-let quiet = ButtonVariants { variant: ButtonVariant::Ghost, size: ButtonSize::Sm };
-assert_eq!(quiet.class_list(), "zui-button zui-button--ghost zui-button--sm");
-assert_eq!(quiet.data_attributes(), [("data-variant", "ghost"), ("data-size", "sm")]);
-```
-
-The sheet selects on those `data-` attributes, and every interaction state is CSS
-(`crates/zgui-ui/src/button/style.rs`):
-
-```css
-:scope[data-variant="ghost"] { background-color: transparent; color: var(--zui-color-foreground); }
-:scope[data-variant="ghost"]:hover { background-color: var(--zui-color-accent); }
-:scope:active { transform: translateY(1px); }
-:scope:focus-visible { outline: 2px solid var(--zui-color-ring); outline-offset: 2px; }
-:scope:disabled { opacity: 0.5; pointer-events: none; }
-```
-
-`disabled` is written once, as `UiState::DISABLED`. That one state is what `:disabled` matches,
-what takes the control out of the focus order, what takes it out of the pointer's reach, and what a
-reader is told. There is no second copy.
-
-<Callout type="info">
-Enter and Space are not handled here. Activating whatever has focus is the framework's own
-behaviour, and it arrives as an ordinary click — so `on:click`, forwarded through the attribute
-bundle, is reached by the pointer, by the keyboard and by an accessibility action alike.
-</Callout>
-
-**To replace it yourself:** one `control`, a `variants!` table, a sheet and one `A11yBinding` —
-about 110 lines, which is what `crates/zgui-ui/src/button/` measures (109 code lines over `mod.rs`
-and `style.rs`, blank and comment lines excluded).
-
-## Deconstruction 2: `Dialog`
-
-A dialog is an **overlay**: a surface drawn over the rest of the window, on a paint band of its own,
-that takes the interaction over until it is answered.
-
-`Dialog` itself renders no element. It publishes two contexts and returns its children
-(`crates/zgui-ui/src/dialog/mod.rs`):
-
-```rust
-#[component]
-pub fn Dialog(
-    #[prop(into, optional)] open: Binding<bool>,
-    #[prop(default = false)] default_open: bool,
-    #[prop(optional)] on_open_change: Option<UnsyncCallback<bool>>,
-    children: Children,
-) -> impl IntoView {
-    OverlayState::new(open, default_open, on_open_change).provide();
-    SurfaceLabels::provide();
-    view! { {children.into_view_once()} }
-}
-```
-
-`OverlayState` is `Copy` and holds three things every part needs: whether it is open, the trigger,
-and the surface.
-
-```rust
-pub struct OverlayState {
-    open: Controllable<bool>,
-    trigger: NodeRef,
-    content: NodeRef,
-}
-```
-
-That is why `DialogClose`, three components down in the footer, closes the dialog without a setter
-threaded through anything: it calls `OverlayState::current()` and then `state.close()`.
-`SurfaceLabels` is the same trick for the other direction — the surface publishes two empty
-`NodeRef` handles on the way down, and `DialogTitle` and `DialogDescription` bind themselves to them
-on the way up, so the surface can point at a title it did not create.
-
-### The composition
-
-`DialogContent` adds a role, the two label relations and two classes, then hands everything to
-`ModalSurface`, which is the whole of what a dialog, an alert dialog, a sheet and a drawer share
-(`crates/zgui-ui/src/overlay/modal.rs`):
-
-```rust
-view! {
-    Portal(layer = {at.layer()}) {
-        Elevated(at = at) {
-            Presence(present = open, surface = {state.content()}) {
-                if move || scrim {
-                    Scrim()
-                } else {}
-                DismissableLayer(
-                    layer = {OverlayLayer::Modal},
-                    class = "zui-overlay-layer",
-                    on_dismiss = dismiss,
-                    dismiss_on_outside_press = dismiss_on_outside_press,
-                    dismiss_on_escape = dismiss_on_escape
-                ) {
-                    FocusScope(options = {FocusTrapOptions::MODAL}, class = "zui-overlay-scope") {
-                        OverlaySurface(
-                            state = state,
-                            role = role,
-                            modal = true,
-                            class = {class.get_value()},
-                            {..attrs.get_value()}
-                        ) {
-                            {children.get_value().view()}
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-```
-
-Six layers, and the order is the design. A **headless primitive** is a component from
-`zgui-ui-primitives` that carries one behaviour and no appearance;
-[Primitives](/docs/component-library/primitives) covers them properly.
-
-| Layer | Where it is from | What it answers |
-|---|---|---|
-| `Portal(layer = at.layer())` | `zgui` | which band it is painted on, and it escapes every clipping and transforming ancestor of the trigger |
-| `Elevated(at)` | `zgui-ui` | how deep it is on that band, published as `--zui-overlay-depth` |
-| `Presence(present, surface)` | primitive | whether the exit animation has finished, so the surface unmounts after its fade rather than during it |
-| `DismissableLayer(on_dismiss, …)` | primitive | whether a press or an Escape belongs to this surface or to one above it |
-| `FocusScope(options)` | primitive | that Tab stays inside, and that focus goes back to the trigger afterwards |
-| `OverlaySurface(state, role, modal)` | `zgui-ui` | the `surface` element itself, its `data-state`, and what it means to a reader |
-
-Two details in that block repay reading twice.
-
-**The scrim is a sibling of the dismissable layer, not a wrapper around it.** A press on the scrim
-has to count as a press *outside* the surface. That sibling relationship is the whole of "press the
-backdrop to close".
-
-**`Scrim` is its own component.** It reads `use_presence()`, and a context is only reachable from a
-scope below the one that published it. Written inline it would vanish on the frame the dialog closed
-and take its own fade with it. `OverlaySurface` is its own component for the same reason.
-
-### The elements, the signals and the sheets
-
-| Ingredient | What it is |
-|---|---|
-| elements | `box` for `Elevated`, `DismissableLayer`, `FocusScope` and the scrim; `surface` for the panel; `control` for the corner dismiss; two `Button`s for the trigger and the close |
-| signals | one `Controllable<bool>` inside `OverlayState`; the presence state signal inside `Presence` |
-| contexts | `OverlayState`, `SurfaceLabels`, `SurfaceElevation`, `PresenceContext` |
-| portals | one, on the band that `SurfaceElevation::raise(OverlayLayer::Modal)` settled on |
-| primitives | `Presence`, `DismissableLayer`, `FocusScope` |
-| CSS | `OverlayStyle` under the name `zui-overlay`, `DialogStyle` under `zui-dialog` |
-
-The behaviour boxes are told to leave the layout alone, and the depth becomes a `z-index`
-(`crates/zgui-ui/src/overlay/style.rs`):
-
-```css
-.zui-overlay-layer, .zui-overlay-scope, .zui-overlay-depth { display: contents; }
-.zui-overlay-scrim, .zui-overlay-positioner, .zui-surface { z-index: var(--zui-overlay-depth, 0); }
-```
-
-The depth has to be stated because mount order is the reverse of what is wanted: a surface opened
-from inside another is built while that one's content is, so it reaches the band first and would
-otherwise be painted underneath the surface that opened it. `SurfaceElevation::raise` gives the
-higher of the two bands and one more depth:
-
-```rust
-pub fn raise(wanted: OverlayLayer) -> Self {
-    match Self::current() {
-        Some(under) => Self {
-            band: wanted.max(under.band),
-            depth: under.depth.saturating_add(1),
-        },
-        None => Self { band: wanted, depth: 0 },
-    }
-}
-```
-
-So a select opened inside a dialog rises to the modal band and one step above it. You cannot get a
-popover to draw under the dialog that opened it.
-
-The surface's motion composes two custom properties rather than one `transform`, because placement
-and entry are independent:
-
-```css
-.zui-surface {
-    transform: var(--zui-surface-place, translate(0px, 0px))
-               var(--zui-surface-motion, translateY(0px) scale(1));
-}
-.zui-surface[data-state="closed"] { opacity: 0; --zui-surface-motion: translateY(-2px) scale(0.98); }
-```
-
-`DialogStyle` then sets `--zui-surface-place: translate(-50%, -50%)` to centre the panel on the
-window. A shared rule writing `transform` outright would discard that centring.
-
-**To replace it yourself:** the open-state context, the label handles, the elevation model, the
-scroll lock, the shared surface sheet and the three behaviours it composes — about 1 600 code lines
-(`crates/zgui-ui/src/dialog/` 296, `crates/zgui-ui/src/overlay/` 681, plus `Presence` 267,
-`DismissableLayer` 317 and `FocusScope` 54 in `zgui-ui-primitives`, blank and comment lines
-excluded).
-
-## Deconstruction 3: `Select`
-
-A **listbox** is a list of options with a keyboard that never leaves the control that opened it. The
-arrow keys walk the options while the caret stays on the trigger, and the option being walked is
-named to a reader through `active_descendant` rather than by being focused. Moving focus into the
-list would take the caret out of the field.
-
-`Select` renders no element either. It publishes two contexts:
-
-```rust
-let surface = OverlayState::new(open, default_open, on_open_change).provide();
-Listbox::new(surface, value, default_value, on_change).provide();
-view! { {children.into_view_once()} }
-```
-
-`Listbox` is the registry, and its fields are the whole state of the control
-(`crates/zgui-ui/src/listbox/registry.rs`):
-
-```rust
-pub struct Listbox {
-    collection: Collection,                                      // the options, in tree order
-    options: RwSignal<BTreeMap<ItemId, ListboxOption>, LocalStorage>,
-    active: RwSignal<Option<ItemId>, LocalStorage>,              // the one the arrows are on
-    value: Controllable<String>,                                 // the one that is chosen
-    filter: RwSignal<String, LocalStorage>,
-    labels: ListboxLabels,                                       // what each value reads as
-    surface: OverlayState,
-    dismisses: bool,
-}
-```
-
-`Collection` is the primitive that keeps registered items **in tree order**, recomputed on read.
-Registration order would be wrong, because a keyed list rebuilds only the rows that moved.
-
-### The four parts
-
-`SelectTrigger` renders one `control` and keeps the keyboard the whole time:
-
-```rust
-control(
-    node_ref = {state.trigger()},
-    class = {SelectStyle::CLASS},
-    class = "zui-select",
-    tabindex = {Focus::Sequential},
-    on:click = move |_| {
-        if !disabled.get_untracked() {
-            let was_open = state.is_open_untracked();
-            state.toggle();
-            if !was_open && let Some(listbox) = listbox {
-                listbox.highlight_chosen();
-            }
-        }
-    },
-    on:key_down = on_key_down,
-    {..own}, {..attrs}, class = class
-) {
-    {children.into_view_once()}
-    Icon(icon = CHEVRON_DOWN, size = {IconSize::Sm}, class = "zui-select__chevron")
-}
-```
-
-Its key listener delegates to the registry and stops the event **only when the registry claimed the
-key**:
-
-```rust
-if let Some(listbox) = listbox
-    && listbox.handle(&ev.key)
-{
-    ev.prevent_default();
-    ev.stop_propagation();
-}
-```
-
-That is what leaves Tab alone. `action_for` is the whole key map, and it differs in one place
-between an open list and a closed one:
-
-```rust
-let down = Key::Named(NamedKey::ArrowDown);
-assert_eq!(action_for(&down, false), Some(ListboxAction::Step(1)));
-let enter = Key::Named(NamedKey::Enter);
-assert_eq!(action_for(&enter, true), Some(ListboxAction::Choose));
-assert_eq!(action_for(&enter, false), None, "a closed list has nothing to choose");
-```
-
-The trigger's semantics are one `A11yBinding`: role `ComboBox`, `has_popup(Listbox)`,
-`expanded(…)`, `controls(state.content())` and `active_descendant(…)` reading the registry's active
-node. The chevron is turned over in CSS, from the `data-state` the trigger already carries:
-
-```css
-:scope[data-state="open"] .zui-select__chevron { transform: rotate(180deg); }
-```
-
-`SelectValue` renders a `text` node whose content is `listbox.chosen_text()`, or the placeholder,
-and toggles `UiState::PLACEHOLDER_SHOWN`. The text comes from the option, not from a prop, so the
-trigger and the list cannot say different things about one value.
-
-`SelectContent` returns **two views side by side**, not one wrapper:
-
-```rust
-let list = view! {
-    AnchoredSurface(state = state, placement = placement, offset = offset,
-                    role = {Role::ListBox}, {..own}, {..attrs}, class = class) {
-        {children.get_value().view()}
-    }
-};
-let described = view! {
-    if move || !state.is_open() {
-        ListboxCatalogueOf {{children.get_value().view()}}
-    } else {}
-};
-(list.into_view(), described.into_view())
-```
-
-A wrapper would put a box in the caller's layout, and the list contributes nothing where it is
-written because it is portalled. The second view is the subtle part: while the list is closed the
-options are built once more, out of sight, purely so they register what their values *read as*.
-Without it a select handed a value would show its placeholder over it until somebody had opened the
-list and closed it again. The two are never mounted together, so nothing registers twice.
-
-`SelectItem` renders a `box` — deliberately not focusable — with `data-value`, `data-state`,
-`data-active`, `data-disabled`, `UiState::CHECKED`, `UiState::DISABLED`, an `A11yBinding` of role
-`ListBoxOption`, a click that chooses and a `pointer_enter` that highlights. The highlight is
-`data-active`, not `:hover` and not `:focus`:
-
-```css
-.zui-select__item[data-active="true"] {
-    background-color: var(--zui-color-accent);
-    color: var(--zui-color-accent-foreground);
-}
-```
-
-`:focus` would match nothing here. The caret never leaves the trigger, so the walked option has to
-be said out loud.
-
-### The list surface
-
-`AnchoredSurface` is the non-modal twin of `ModalSurface`: the same behaviours, in the same order,
-with a positioner innermost and the focus trap optional.
-
-<TreeDiagram
-  label="How an AnchoredSurface composes its overlay behaviours"
-  items={[
-    {
-      title: 'Portal(layer)',
-      children: [
-        {
-          title: 'Elevated(at)',
-          children: [
-            {
-              title: 'Presence(present, surface)',
-              children: [
-                {
-                  title: 'DismissableLayer',
-                  code: 'layer=Modal · exclude=state.trigger()',
-                  children: [
-                    {
-                      title: 'Popper',
-                      code: 'anchor · placement · offset · zui-overlay-positioner',
-                      children: [
-                        {
-                          title: 'Confined(trap)',
-                          children: [
-                            { title: 'OverlaySurface', code: 'state · role · modal=trap.is_some()' },
-                          ],
-                        },
-                      ],
-                    },
-                  ],
-                },
-              ],
-            },
-          ],
-        },
-      ],
-    },
-  ]}
-/>
-
-`Popper` is the primitive that places a floating surface: it measures the anchor, the surface and
-the window, solves place, then flip, then shift, and writes `data-side` and `data-align` for where
-it actually went. `exclude = state.trigger()` is load-bearing. Without it a press on the trigger
-counts as outside the surface, the layer dismisses, the press becomes a click, and the trigger
-opens again what it had closed.
-
-| Ingredient | What it is |
-|---|---|
-| elements | `control` for the trigger, `text` for the value, `box` per option and per indicator, `vector` through each `Icon`, `surface` for the list |
-| signals | `Controllable<String>` for the choice, `Controllable<bool>` for open, plus `options`, `active` and `filter` in the registry |
-| contexts | `OverlayState`, `Listbox`, `SurfaceElevation`, `PresenceContext` |
-| portals | one, floor `OverlayLayer::Popover`, raised to whatever it was opened inside |
-| primitives | `Popper`, `Presence`, `DismissableLayer`, `Collection` |
-| CSS | `SelectStyle` under `zui-select`, plus the shared `OverlayStyle` |
-
-**To replace it yourself:** the registry, the key map, the closed-list catalogue, the trigger and
-the anchored surface — about 1 100 code lines beyond the overlay machinery the dialog already
-needed (`crates/zgui-ui/src/select/` 344 and `crates/zgui-ui/src/listbox/` 448, plus `Popper` at 349
-in `zgui-ui-primitives`, blank and comment lines excluded).
-
-## What is settled and what is not
-
-<Status kind="unstable">The whole library</Status> Every crate here is at `version = "0.1.0"`
-(workspace `Cargo.toml`). No name in the inventory is promised to keep its spelling. The behaviour
-below is what the tree does today: 35 test binaries in `crates/zgui-ui/tests/`, five more in
-`crates/zgui-ui-primitives/tests/`, and device-backed cases under `crates/zgui-ui/tests/device/` and
-`crates/zgui-ui/tests/painted/`.
-
-Nothing in the library is a stub. Three components do less than their name suggests, and each
-limitation is visible in the source:
-
-| Component | Status | What is there, and what is not |
-|---|---|---|
-| `Drawer` | <Status kind="partial">partial</Status> | A bottom sheet with a scrim, Escape and outside-press dismissal. `DrawerHandle` is a mark: `box(class = "zui-drawer__handle", a11y:hidden = true)` with no listener. There is no drag-to-dismiss gesture. |
-| `Chart` | <Status kind="partial">partial</Status> | `Bar`, `Line` and `Area`. It is sized by the `width` and `height` props in CSS pixels, published as `--zui-chart-width` and `--zui-chart-height`, so it does not size itself to its box. Colour reaches the marks through `--zgui-fill` and `--zgui-stroke`; the SVG paint longhands are not properties this build generates. |
-| `Calendar`, `DatePicker` | <Status kind="partial">partial</Status> | One date. `value` is `Binding<Option<Date>>`, and there is no range type, so a date range is two of them and your own rule about which is which. |
-
-Everything else in the inventory is <Status kind="stable">complete</Status> in the sense that
-matters here: it renders, it is operable from the keyboard listed in
-`crates/zgui-ui/src/lib.rs`, and it has tests.
-
-## What it costs
-
-Each component calls `install_stylesheet(NAME, XStyle::CSS)` in its body with a stable name, so
-**one sheet is installed per component type however many instances exist**. Installing under a name
-replaces the sheet and keeps its place in the cascade. The repository asserts this by name:
-`a_second_instance_of_a_component_does_not_install_a_second_sheet`
-(`crates/zgui-ui-tokens/tests/theme.rs`).
-
-Beyond that, a component costs what its elements cost. There is no library-wide overhead to account
-for: a `Button` is one `control`, and one class toggled on one element is measured at 11.34 µs
-(`docs/performance.md`, taken apart in [the cost model](/docs/performance/cost-model)).
-
-Two costs are worth knowing before you meet them:
-
-- A surface kept mounted while closed, without setting `Popper`'s `active` prop to false, is placed
-  again on **every frame in which anything scrolls**. The default composition unmounts instead, so
-  this only applies to a surface of your own.
-- `SelectContent` mounts its option bodies a second time while the list is closed. A side effect
-  written in an option body runs twice, once per mount, never concurrently.
+- The `variants!` table becomes classes and one `data-` attribute per axis
+  (`zui-button zui-button--ghost zui-button--sm`, `data-variant="ghost"`, `data-size="sm"`). The
+  `style!` sheet selects on those attributes.
+- Hover, focus, press and disabled are CSS pseudo-classes, not signals.
+- `install_stylesheet` with a fixed name installs one sheet per component type, no matter how many
+  instances exist.
+- Stable class names (`zui-button`, `zui-icon`, …) are safe to select on from your own sheet.
 
 ## Next
 
 <Cards>
   <Card
-    title="Primitives"
-    href="/docs/component-library/primitives"
-    description="The eight headless behaviours the deconstructions above kept naming, and how to use them without the styled layer."
-  />
-  <Card
     title="Tokens and theming"
     href="/docs/component-library/tokens-and-theming"
-    description="Every custom property the sheets above read, and how to change them at run time."
+    description="The custom properties every component sheet reads, and how to change them."
+  />
+  <Card
+    title="Primitives"
+    href="/docs/component-library/primitives"
+    description="The headless behaviours under the overlays, lists and groups above."
   />
   <Card
     title="Icons"
     href="/docs/component-library/icons"
-    description="The 22 outlines, how an icon is sized and coloured, and adding one of your own."
+    description="The Icon component, the shipped set, and adding your own."
   />
   <Card
     title="Overlays and portals"
     href="/docs/building/overlays-and-portals"
-    description="The same overlay problem, solved by hand from the element vocabulary."
+    description="The same overlay problem, solved with the framework alone."
   />
 </Cards>

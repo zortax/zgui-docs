@@ -1,32 +1,31 @@
 ---
 title: Error handling
-description: How a zgui application fails — Result as a view, ViewError and ErrorBoundary, every zgui::Error variant, what panics, and what fails silently.
+description: Show errors in the interface with Result and ErrorBoundary, handle start-up errors, avoid panics, and find failures that only appear in logs.
 ---
 
-An application fails in two places. A view is asked for something it cannot produce, or the
-application never starts at all. The two have different types, different recovery and different
-tools. This page assumes [Control flow](/docs/learn/control-flow) and
-[Components](/docs/learn/components).
+Errors in a zgui application surface in different places, and each kind is handled differently:
 
 | Failure | Type | Where it surfaces | Recovery |
 |---|---|---|---|
-| A view cannot render. | `ViewError` | at the nearest `ErrorBoundary` | show a fallback in that part of the interface |
-| The application cannot start. | `zgui::Error` | the return value of `main` | none: report it and exit |
-| A rule of the framework was broken. | a panic | the process unwinds | fix the call; the list below names every one |
+| A view cannot render | `ViewError` | the nearest `ErrorBoundary` | show a fallback for that part of the interface |
+| The application cannot start | `zgui::Error` | the return value of `run` | report it and exit |
+| A framework rule was broken | a panic | the process unwinds | fix the call; see [Panics](#panics) |
+| Something fails silently | none | only in `tracing` logs, or nowhere | see [Troubleshooting](#troubleshooting) |
 
-## A `Result` is a view
+## Show an error from a `Result`
+
+A `Result` whose `Ok` value is a view is itself a view:
 
 ```rust
 impl<V: View, E: Display + 'static> View for Result<V, E>
 ```
 
-The bound on the error is `Display + 'static` and nothing else. It does not have to implement
-`std::error::Error`, and it does not have to be `Send`.
+The error only needs `Display + 'static`. It does not have to implement `std::error::Error` or be
+`Send`.
 
 ```rust
 use zgui::prelude::*;
 
-/// One reading, or the reason it could not be shown.
 #[component]
 fn Reading(line: Signal<String>) -> impl IntoView {
     view! {
@@ -45,72 +44,21 @@ fn parse(line: &str) -> Result<f32, String> {
 }
 ```
 
-The closure is a reactive hole, so the parse runs again whenever `line` changes. What the two arms
-do:
+The closure re-runs whenever `line` changes.
 
-| Arm | What happens |
-|---|---|
-| `Ok(view)` | The view is built where the `Result` was written. |
-| `Err(error)` | Nothing renders. The place is kept. `ViewError::new(error)` goes to the nearest boundary above. |
+- `Ok(view)` builds the view in place.
+- `Err(error)` renders nothing and sends `ViewError::new(error)` to the nearest `ErrorBoundary`
+  above.
 
-On a rebuild, an `Err` first removes whatever the `Ok` arm had built, then reports. A view that
-starts failing does not leave the last good render on screen.
+When a `Result` that was `Ok` becomes `Err`, the old content is removed first, so the last good
+render does not stay on screen.
 
 <Callout type="warn">
-A `Result` with no boundary above it renders nothing and drops the error. Nothing panics and
-nothing is logged. Put a boundary at the root of every application.
+With no boundary above, an `Err` renders nothing and the error is dropped silently. Put a boundary
+at the root of every application.
 </Callout>
 
-## `ViewError` and `report_error`
-
-```rust
-pub struct ViewError(/* private */);        // Clone + Debug + Display
-
-impl ViewError {
-    pub fn new(message: impl Display) -> Self;
-    pub fn message(&self) -> &str;
-}
-
-pub fn report_error(error: ViewError);
-```
-
-`ViewError` keeps the message and nothing else. It is deliberately thin: the view layer never
-inspects an error, it only carries it to a boundary that shows it or logs it.
-
-`ViewError` and `ErrorBoundary` are in the prelude. `report_error` is not — write
-`use zgui::view::report_error;`.
-
-Call `report_error` where a `Result` is not the shape you have:
-
-```rust
-use zgui::view::report_error;
-
-#[component]
-fn Panel(source: Signal<String>) -> impl IntoView {
-    if let Err(error) = check(&source.get_untracked()) {
-        report_error(ViewError::new(error));
-    }
-    view! { column(class = "panel") { /* … */ } }
-}
-```
-
-### Which boundary it finds
-
-`report_error` looks the boundary up through the **owner** — the scope chain that disposes of state
-(see [Context](/docs/learn/context)) — not through the element tree. Everything that runs under the
-scope it was written in reaches the right boundary.
-
-| Called from | Finds the boundary |
-|---|---|
-| a component body, while it builds | yes |
-| a reactive hole or an effect created below the boundary | yes |
-| an `on:` listener written below the boundary | yes: a listener runs in the scope it was written in |
-| a spawned task | no: its owner controls cancellation, but no owner is current while the task is polled |
-
-For work on a task, write the failure into a signal and let a `Result` in the view report it. That
-also puts the report on the UI thread, which is where a boundary can be read at all.
-
-## `ErrorBoundary`
+## Catch errors with `ErrorBoundary`
 
 ```rust
 impl<C, F> ErrorBoundary<C, F>
@@ -122,11 +70,8 @@ where
 }
 ```
 
-Children first, fallback second. Both produce an `AnyView`. The fallback is handed every error
-reported so far, in the order they arrived.
-
-`ErrorBoundary` has no attribute spelling, because its arguments are not attributes. Write it as a
-value in a braced child, the same way `Dynamic` is written.
+Children first, fallback second. The fallback receives every error reported so far, oldest first.
+`ErrorBoundary` has no attribute form; write it as a value in a braced child:
 
 ```rust
 use zgui::prelude::*;
@@ -153,74 +98,93 @@ fn Panel(line: Signal<String>) -> impl IntoView {
 }
 ```
 
-What happens, in order:
-
-<Steps>
-
-<Step>
-
-The boundary makes a scope of its own and puts an error list on it. Everything built below the
-boundary descends from that scope, at any depth.
-
-</Step>
-
-<Step>
-
-While the list is empty, the children show.
-
-</Step>
-
-<Step>
-
-A `Result` that fails, or a call to `report_error`, pushes one `ViewError` into the list.
-
-</Step>
-
-<Step>
-
-The list is a signal and the boundary reads it, so the next flush replaces the children with
-`fallback(&errors)`.
-
-</Step>
-
-</Steps>
-
-The swap is not instant, and it does not need to be: a failing `Result` renders nothing from the
-moment it fails, so nothing wrong is on screen while the swap is pending. An error reported by the
-boundary's own child is swapped at the first flush after the report. An error reported from inside a
-nested conditional is swapped at the flush after that, because the conditional's own build is what
-runs at the first one.
-
-### Where a boundary does not catch
-
-| Not caught | What to do instead |
-|---|---|
-| A panic, anywhere. | Panics are not errors. See [What panics](#what-panics). |
-| A `Result` you handled yourself. | Call `report_error` with the message. |
-| A failure in a spawned task. | Write it into a signal; report from the view. |
-| A failure below a nearer boundary. | That boundary catches it. See [Nesting](#nesting-boundaries). |
-| The application failing to start. | `zgui::Error`, returned from `main`. |
+The boundary provides an error list to everything built below it, at any depth. While the list is
+empty, the children show. Once an error is reported, the next flush replaces the children with
+the fallback. Nothing wrong is visible in between, because the failing `Result` already rendered
+nothing.
 
 <Callout type="error">
-A fallback must not fail. A fallback that reports an error writes into the list it reads, so the
-boundary's own task re-runs until the flush's iteration budget cuts it. The cut is reported once
-per flush at `error` level through `tracing`
-(`crates/zgui-reactive/src/executor/budget.rs`).
+A fallback must not report an error itself. It would write into the list it reads and re-run until
+the per-flush iteration budget stops it, which is logged at `error` level through `tracing`.
 </Callout>
 
-### Recovering
+## Report an error without a `Result`
 
-A boundary latches. Nothing clears the error list, so once the fallback shows it shows for as long
-as that boundary exists. To try again, unmount the boundary and build a new one. A keyed list does
-exactly that when its key changes:
+```rust
+pub struct ViewError(/* private */);        // Clone + Debug + Display
+
+impl ViewError {
+    pub fn new(message: impl Display) -> Self;
+    pub fn message(&self) -> &str;
+}
+
+pub fn report_error(error: ViewError);
+```
+
+A `ViewError` holds only a message. `ViewError` and `ErrorBoundary` are in the prelude;
+`report_error` is at `zgui::view::report_error`.
+
+Call `report_error` when you handle a `Result` yourself instead of returning it as a view:
+
+```rust
+use zgui::view::report_error;
+
+#[component]
+fn Panel(source: Signal<String>) -> impl IntoView {
+    if let Err(error) = check(&source.get_untracked()) {
+        report_error(ViewError::new(error));
+    }
+    view! { column(class = "panel") { /* … */ } }
+}
+```
+
+`report_error` finds the boundary through the current **owner** (see
+[Context](/docs/learn/context)), not through the element tree:
+
+| Called from | Reaches the boundary |
+|---|---|
+| a component body | yes |
+| a reactive hole or effect below the boundary | yes |
+| an `on:` listener below the boundary | yes: listeners run in the scope they were written in |
+| a spawned task | **no**: no owner is current while a task is polled |
+
+## Report a failure from a task
+
+Because a task has no owner, store its result in a signal and let a `Result` in the view report
+the error:
+
+```rust
+#[component]
+fn RowCount() -> impl IntoView {
+    let loaded = RwSignal::new(None::<Result<usize, String>>);
+
+    spawn(async move {
+        let result = background(async { count_rows().await }).await;
+        loaded.set(Some(result.map_err(|error| error.to_string())));
+    });
+
+    view! {
+        {move || loaded.get().map(|result| result.map(|count| view! {
+            label {{format!("{count} rows")}}
+        }))}
+    }
+}
+```
+
+`None` renders nothing while the task runs; `Some(Err(_))` reaches the nearest boundary.
+
+## Retry after a failure
+
+A boundary latches: once the fallback shows, it stays for as long as that boundary exists.
+Rebuilding the same boundary in place keeps its error list. To retry, replace the boundary with a
+new one. A keyed list does this when the key changes:
 
 ```rust
 let attempt = RwSignal::new(0_u32);
 
 view! {
     column(class = "panel") {
-        // A new attempt number is a new key, so the old boundary goes and a new one — with an
-        // empty error list — is built in its place.
+        // A new key builds a new boundary with an empty error list.
         for id in move || [attempt.get()], key = |id: &u32| *id {
             {ErrorBoundary::new(
                 move || AnyView::new(view! { Reading(line = line) }),
@@ -237,22 +201,17 @@ view! {
 }
 ```
 
-Rebuilding the same boundary in place — through `Dynamic`, or by letting a parent rebuild it — keeps
-the old error list, because the boundary reuses its state. The boundary has to be removed for the
-list to go.
+## Nest boundaries
 
-## Nesting boundaries
-
-The **nearest** boundary above the failing view catches. An outer boundary never learns of an error
-an inner one took.
+The **nearest** boundary above a failure catches it. Outer boundaries never see it.
 
 ```rust
 view! {
-    // A backstop: it catches whatever the panels do not.
+    // The backstop: catches whatever the panels do not.
     {ErrorBoundary::new(
         || AnyView::new(view! {
             column(class = "app") {
-                // Each panel fails on its own, and the rest of the window keeps working.
+                // Each panel fails on its own; the rest of the window keeps working.
                 {ErrorBoundary::new(left, panel_failure)}
                 {ErrorBoundary::new(right, panel_failure)}
             }
@@ -262,10 +221,23 @@ view! {
 }
 ```
 
-Put a boundary around each part of the interface that can fail without the rest failing, and one at
-the root. A window with only a root boundary answers any failure by replacing the whole interface.
+Put a boundary around each part of the interface that can fail independently, and one at the root.
+With only a root boundary, any failure replaces the whole window.
 
-## Failing to start
+## What a boundary does not catch
+
+| Not caught | Do instead |
+|---|---|
+| A panic | Panics are not errors. See [Panics](#panics). |
+| A `Result` you handled yourself | Call `report_error`. |
+| A failure in a spawned task | Write it into a signal and report from the view. See [Report a failure from a task](#report-a-failure-from-a-task). |
+| A failure below a nearer boundary | The nearer boundary catches it. See [Nest boundaries](#nest-boundaries). |
+| The application failing to start | Handle `zgui::Error` from `run`. See [Handle start-up errors](#handle-start-up-errors). |
+
+## Handle start-up errors
+
+`run` returns a `zgui::Error` when the application cannot start. Return it from `main`, or match on
+it:
 
 ```rust
 fn main() -> Result<(), zgui::Error> {
@@ -277,40 +249,14 @@ fn main() -> Result<(), zgui::Error> {
 }
 ```
 
-`zgui::Error` is an alias for `zgui_runtime::AppError`. It is `#[non_exhaustive]`, so a `match` on
-it needs a `_` arm.
-
-| Variant | Cause | Message |
-|---|---|---|
-| `Platform(PlatformError)` | The desktop refused something the application needs. | `the platform could not satisfy the application: …` |
-| `GpuUnavailable(GpuUnavailable)` | No graphics adapter on this machine could present to the window. | `no usable graphics device: N adapter(s) were tried and rejected` |
-| `ForeignExecutor` | Another asynchronous runtime already holds this process's executor slot. | `another async executor is already installed in this process` |
-| `Stylesheet(String)` | A style sheet a caller asked to be treated as fatal. | `the application stylesheet was rejected: …` |
-| `DocumentsExhausted` | The process has used every non-reusable document identity available for opened windows. | `this process has opened every window it can name` |
-
-`PlatformError` is itself `#[non_exhaustive]`, with four variants:
-
-| Variant | Message |
-|---|---|
-| `Unsupported(Unsupported)` | `the platform does not support this request` |
-| `SurfaceCreation(String)` | `the surface could not be created: …` |
-| `NoSuchSurface` | `that surface no longer exists` |
-| `Backend(String)` | the backend's own words |
-
-A failure found while the primary window opens happens after the platform backend has taken the
-application over. It is recorded, logged at `error` level under the `tracing` target `zgui::app`,
-and the loop is asked to exit; `run` then returns it. That is why `run` can report a failure that
-happened long after it was called.
-
-If an additional window cannot open, the runtime logs the error, marks that window's handle closed,
-and keeps the other windows running. `DocumentsExhausted` prevents a stale node handle from ever
-resolving in a later window after all document identities have been used.
+If the **first** window fails to open, the error is logged under the `tracing` target `zgui::app`,
+the event loop exits, and `run` returns the error. If a **later** window fails to open, the error
+is logged, that window's handle is marked closed, and the other windows keep running.
 
 ### No graphics adapter
 
-`Error::GpuUnavailable` carries every adapter that was considered and why each was rejected. There
-is no fallback: a window that opens and never paints looks like a program that has hung, so the
-framework reports the failure instead.
+`Error::GpuUnavailable` lists every adapter that was tried and why each was rejected. There is no
+fallback renderer: a window that opens and never paints looks like a hang.
 
 ```rust
 fn main() -> Result<(), zgui::Error> {
@@ -325,50 +271,81 @@ fn main() -> Result<(), zgui::Error> {
 }
 ```
 
-`candidates` is a `Vec<RejectedAdapter>`, and each entry has a `name` and a `reason`, in the order
-they were tried.
-
 ### No display server
 
-`Error::Platform(PlatformError::Backend(_))`, carrying the windowing system's own message. The
-selected desktop backend cannot connect — a session over SSH with no forwarded display is the usual
-cause. On Linux and BSD, automatic selection uses native Wayland only when a Wayland display is
-available and otherwise selects winit. An explicit `ZGUI_PLATFORM=wayland` requires the native
-connection. If that selected connection fails, zgui returns the error and does not silently start a
-different backend. Nothing is opened and nothing is drawn.
+The result is `Error::Platform(PlatformError::Backend(_))` with the windowing system's message,
+typically on an SSH session with no forwarded display. On Linux and the BSDs, zgui uses the native
+Wayland backend when a Wayland display is available and winit otherwise. `ZGUI_PLATFORM=wayland`
+or `ZGUI_PLATFORM=winit` forces one. If the chosen backend cannot connect, `run` returns the error;
+zgui does not silently switch to the other backend.
 
-### A bad style sheet
-
-Three different things, at three different times:
+### Stylesheet errors
 
 | When | What happens |
 |---|---|
-| A sheet written with `css!` does not parse. | A compile error at the site: an unterminated string, an unbalanced block, a declaration with no value. |
-| A sheet parses, but a declaration is not understood. | The rest of the sheet applies. The dropped declaration is warned through `tracing` under the target `zgui::css`. |
-| A caller asks for a sheet to be fatal. | `Error::Stylesheet`. |
+| A `css!` sheet does not parse | Compile error at the call site. |
+| A sheet parses but a declaration is not understood | The rest of the sheet applies; the declaration is dropped with a `tracing` warning under `zgui::css`. |
+| A caller asks for a sheet to be fatal | `Error::Stylesheet`. |
 
-<Status kind="partial">Nothing in the shipped start-up path constructs `Error::Stylesheet` today. An
-application sheet with a bad declaration is a warning, not a failure to start.</Status>
+<Status kind="partial">Nothing in the built-in start-up path creates `Error::Stylesheet` today. A
+bad declaration in an application sheet is a warning, not a start-up failure.</Status>
 
-## What panics
+### `zgui::Error` variants
 
-The framework catches no panic anywhere. An `ErrorBoundary` does not catch one, and a panic inside a
-reactive task reaches the frame loop that ran the flush. Every panic a call of yours can cause:
+`zgui::Error` is `zgui_runtime::AppError`. It is `#[non_exhaustive]`, so a `match` needs a `_` arm.
+
+| Variant | Cause | Message |
+|---|---|---|
+| `Platform(PlatformError)` | The desktop refused something the application needs. | `the platform could not satisfy the application: …` |
+| `GpuUnavailable(GpuUnavailable)` | No graphics adapter could be used. | `no usable graphics device: N adapter(s) were tried and rejected` |
+| `ForeignExecutor` | Another async runtime already holds this process's executor slot. | `another async executor is already installed in this process` |
+| `Stylesheet(String)` | A stylesheet a caller asked to treat as fatal was rejected. | `the application stylesheet was rejected: …` |
+| `DocumentsExhausted` | The process has opened every window it can name (document identities are never reused). | `this process has opened every window it can name` |
+
+`PlatformError` is also `#[non_exhaustive]`:
+
+| Variant | Message |
+|---|---|
+| `Unsupported(Unsupported)` | `the platform does not support this request` |
+| `SurfaceCreation(String)` | `the surface could not be created: …` |
+| `NoSuchSurface` | `that surface no longer exists` |
+| `Backend(String)` | the backend's own message |
+
+## Panics
+
+zgui catches no panics. An `ErrorBoundary` does not catch them, and a panic in a UI task reaches
+the frame loop. These are the panics your code can trigger:
 
 | Call | Condition | Builds |
 |---|---|---|
 | `expect_context::<T>()` | No scope above provides a `T`. | all |
-| any read or write of a signal | Its owner was disposed. | all |
-| `Callable::run` | The callback's owner was disposed. | all |
-| any read of a `LocalStorage` signal | The read is on a different thread from the one that created it. | all |
+| reading or writing a signal | Its owner was disposed of. | all |
+| `Callable::run` | The callback's owner was disposed of. | all |
+| reading a `LocalStorage` signal, or dropping a local value | On a different thread from the one that created it. | all |
 | `use_local_context::<T>()` | The value was provided on a different thread. | all |
-| dropping a value held in a local context or a local signal | The drop is on a different thread. | all |
+| awaiting a `background` or `blocking` result | The work panicked, or the executor shut down before it finished. | all |
 | `provide_context`, `provide_local_context`, `on_cleanup_local`, `Selector::is_selected` | No current owner. | debug |
-| `flush`, `spawn`, `spawn_local`, `Mounted::new`, `Scope::mount`, `use_local_context` | Called off the UI thread. | debug |
-| `set_timeout`, `set_interval` | Called outside a window's reactive scope. | debug |
-| `install_stylesheet`, `remove_stylesheet` | Called outside a window's scope. | debug |
+| `flush`, `spawn`, `spawn_local`, `spawn_detached`, `ui`, `Mounted::new`, `Scope::mount`, `provide_local_context`, `use_local_context` | Off the UI thread. | debug |
+| `set_timeout`, `set_interval`, `request_frame` | Outside a window's scope. | debug |
+| `install_stylesheet`, `remove_stylesheet` | Outside a window's scope. | debug |
 
-The messages are worth recognising:
+<Callout type="warn">
+The debug-only checks compile away in release, where the call silently does nothing (or leaks). Run
+your interface in a debug build at least once.
+</Callout>
+
+### Avoid common panics
+
+| Panic | Fix |
+|---|---|
+| Missing context | Use `use_context` and handle `None`, or provide the value higher up. |
+| Disposed signal or callback | Don't keep a handle past its scope. Where a closure may outlive it, use `try_get`, `try_update` or `try_run`. |
+| Cross-thread local value | Keep view-layer values on the UI thread. Send plain data back and write the signal there. |
+| No current owner | Create state in a component body, not in a static, a global or a plain thread. |
+| Off the UI thread | `zgui::reactive::is_ui_thread()` tells you where you are. |
+| Timer outside a window's scope | From a task or a posted closure, take `Timers::current()` in the component body and carry it in. |
+
+### Panic messages
 
 ```text
 provide_context requires a current owner: with none, the value it creates is
@@ -383,35 +360,10 @@ At src/main.rs:41:18, you tried to access a reactive value which was defined at
 src/main.rs:12:21, but it has already been disposed.
 ```
 
-What to do instead:
+## Troubleshooting
 
-| Panic | Answer |
-|---|---|
-| Missing context. | `use_context` returns `Option`; handle `None`, or provide the value higher up. |
-| Disposed signal or callback. | `try_get`, `try_update`, `try_run`. Do not keep a handle past the scope that owns it. |
-| Cross-thread local storage. | Anything from the view layer stays on the UI thread. Send plain data to the UI thread and write the signal there. |
-| No current owner. | Create state in a component body, not in a static, a lazily initialised global, or a plain thread. |
-| Off the UI thread. | `zgui::reactive::is_ui_thread()` answers whether you are on it. |
-| A timer from a listener. | Take `Timers::current()` in the component body and carry it into the closure. |
-
-The debug-only rows are the important ones: they are checks, and in a release build they compile
-away. The call then does nothing at all, silently. Run the interface in a debug build at least once.
-
-## What fails silently
-
-| Symptom | Cause | How to see it |
-|---|---|---|
-| The interface renders once and never changes. | A signal was read outside a tracking context. | Nothing reports it. Check that every changing value sits behind a closure. |
-| Nothing works, in release only. | A signal, context or stored value was created with no current owner. It is leaked and unreachable. | A debug build panics on the same line. |
-| Everything builds and nothing ever updates. | Reactive effects were compiled out by a feature resolved elsewhere in the dependency graph. | `assert!(zgui::reactive::effects_are_enabled());` at start-up. |
-| A part of the interface is blank. | A `Result` failed with no boundary above it. The error was dropped. | Add a boundary. |
-| One declaration in a sheet does nothing. | The engine did not understand it; the rest of the sheet applied. | A `tracing` warning under the target `zgui::css`. |
-| An effect never runs again. | Its `RenderEffect` handle was dropped, which cancels it. | `#[must_use]` warns at compile time. Store the handle. |
-| One frame in every few is late, and a task never settles. | Two reactive tasks write each other's sources. The iteration budget cuts the cycle. | One `tracing::error!` per flush, naming the spawn site. |
-| A timer never fires, in release only. | `set_timeout` ran outside a window's scope and returned a handle that cancels nothing. | A debug build panics. |
-
-Most of these are visible only through `tracing`, so install a subscriber before the application
-runs:
+Many failures are only visible through `tracing`. Install a subscriber before the application runs,
+and check that reactive effects are enabled:
 
 ```rust
 fn main() -> Result<(), zgui::Error> {
@@ -422,72 +374,40 @@ fn main() -> Result<(), zgui::Error> {
 }
 ```
 
-The targets the framework logs under are `zgui::app`, `zgui::css`, `zgui::style`, `zgui::input`,
-`zgui::observe`, `zgui::paint` and `zgui::platform`.
+zgui logs under the targets `zgui::app`, `zgui::css`, `zgui::style`, `zgui::layout`, `zgui::input`,
+`zgui::observe`, `zgui::paint`, `zgui::images` and `zgui::platform`.
 
-## "My interface does not update"
+### Silent failures
 
-<Steps>
+| Symptom | Cause | How to see it |
+|---|---|---|
+| The interface renders once and never changes. | A signal was read outside a closure. | Nothing reports it. Put changing values behind a closure. |
+| Nothing works, in release only. | State was created with no current owner and leaked. | A debug build panics on that line. |
+| Everything builds, nothing updates. | Reactive effects were compiled out by a feature elsewhere in the dependency graph. | `assert!(zgui::reactive::effects_are_enabled());` at start-up. |
+| Part of the interface is blank. | A `Result` failed with no boundary above it. | Add a boundary. |
+| One CSS declaration does nothing. | The engine did not understand it. | A `tracing` warning under `zgui::css`. |
+| An effect stops running. | Its `RenderEffect` handle was dropped. | `#[must_use]` warns. Store the handle. |
+| Occasional late frames; a task never settles. | Two reactive tasks write each other's sources; the iteration budget cuts the cycle. | One `tracing` error per flush, naming the spawn site. |
+| A timer never fires, in release only. | `set_timeout` ran outside a window's scope. | A debug build panics. |
 
-<Step>
+### Fix an interface that does not update
 
-**Is the value behind a closure?** `{count.get().to_string()}` is read once, at build time.
-`{move || count.get().to_string()}` is read again whenever `count` changes. This is the cause more
-often than everything below put together.
+Check, in order:
 
-</Step>
-
-<Step>
-
-**Does the closure read the signal, or a copy?** A `let` outside the closure takes a snapshot, and
-moving the snapshot in changes nothing.
-
-</Step>
-
-<Step>
-
-**Are effects enabled?** `assert!(zgui::reactive::effects_are_enabled());`. False means every view
-builds, renders once, and ignores every write for the rest of the process.
-
-</Step>
-
-<Step>
-
-**Was the state created in a component body?** A signal made with no current owner never works, and
-only a debug build says so.
-
-</Step>
-
-<Step>
-
-**Is a boundary showing its fallback?** A boundary latches, so a failure early in the run leaves the
-fallback up for good. Look for the fallback's own markup.
-
-</Step>
-
-<Step>
-
-**Is `tracing` on?** The cycle report, the dropped declaration and the window that would not open
-are all logged and nowhere else.
-
-</Step>
-
-<Step>
-
-**Does a worker need to update the interface?** Take a `Ui` handle on the UI thread and call
-`Ui::post` from the worker. The posted closure runs on the UI thread. Direct access to a
-local-storage signal from the worker panics. See [Background work](/docs/learn/background-work).
-
-</Step>
-
-<Step>
-
-**Are two rows sharing a key?** A key that repeats makes "which row is this" unanswerable, and rows
-collapse into one another instead of moving.
-
-</Step>
-
-</Steps>
+1. **Is the value behind a closure?** `{count.get().to_string()}` is read once.
+   `{move || count.get().to_string()}` re-runs when `count` changes. This is the usual cause.
+2. **Does the closure read the signal, or a copy?** A `let` outside the closure is a snapshot.
+3. **Are effects enabled?** If `zgui::reactive::effects_are_enabled()` is false, every view renders
+   once and ignores all writes.
+4. **Was the state created in a component body?** State created with no owner never works, and
+   only debug builds say so.
+5. **Is a boundary showing its fallback?** Boundaries latch, so an early failure leaves the
+   fallback up.
+6. **Is `tracing` on?** Cycle reports, dropped declarations and windows that failed to open are only
+   logged.
+7. **Is a worker thread writing UI state?** Take a `Ui` handle with `ui()` on the UI thread and call
+   `Ui::post` from the worker. See [Background work](/docs/learn/background-work#post-to-the-ui-thread).
+8. **Do two rows share a key?** Duplicate keys make rows collapse into one another.
 
 ## Next
 

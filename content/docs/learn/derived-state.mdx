@@ -1,15 +1,15 @@
 ---
 title: Derived state
-description: Computing values from signals — plain closures, memos, and the Signal<T> prop type that accepts all of them.
+description: Computing values from signals — plain closures, memos, Signal<T> props, and slices.
 ---
 
-Most of the values in an interface are not stored; they are computed from what is stored. This page
-covers the three ways to write a derived value and when each is right. It assumes
-[Signals](/docs/learn/signals) and [Reactivity in views](/docs/learn/reactivity-in-views).
+Most values in an interface are computed from other state: the number of unfinished items, whether
+Save is enabled, a formatted label. Start with a plain closure, and use the other tools on this page
+when you need caching or a flexible prop type.
 
-## A closure is a derived value
+## Derive a value with a closure
 
-The simplest derived value is a closure. There is no wrapper type and nothing to construct.
+The simplest derived value is a closure. There is nothing to construct.
 
 ```rust
 use zgui::prelude::*;
@@ -19,8 +19,8 @@ let items = RwSignal::new(Vec::<Todo>::new());
 let remaining = move || items.get().iter().filter(|item| !item.done.get()).count();
 ```
 
-`remaining` is `impl Fn() -> usize`. Wherever it is read inside a tracking context, the reads it
-performs subscribe on behalf of that context.
+When `remaining()` is called inside a tracking context, the signals it reads are subscribed by that
+context:
 
 ```rust
 view! {
@@ -28,65 +28,58 @@ view! {
 }
 ```
 
-Nothing caches the count and nothing has to invalidate it. If two holes call `remaining()`, the
-work happens twice.
+Nothing is cached. If two holes call `remaining()`, the work runs twice. That is usually fine: a
+closure is the cheapest option, has no lifetime to manage, and composes like any Rust function.
 
-<Callout type="info">
-Prefer a plain closure. It is the cheapest thing that works, it has no lifetime to manage, and it
-composes like any other Rust function.
-</Callout>
+## Cache a value with `Memo`
 
-## `Memo` caches the answer
-
-A memo runs its computation once per change and caches the result. It also compares the result: if
-the new value equals the old one, its own subscribers are not woken.
+A memo runs its computation once per change and caches the result. It also compares the new result
+with the old one, and only notifies its readers when the result actually changed.
 
 ```rust
-use zgui::reactive::Memo;
-
 let over_limit = Memo::new(move |_| count.get() > 10);
 ```
 
-`Memo::new` takes `impl Fn(Option<&T>) -> T`, where the argument is the previous value. `T` must be
-`PartialEq`, because equality is what stops the propagation.
+`Memo::new` takes `impl Fn(Option<&T>) -> T`; the argument is the previous value. `T` must be
+`PartialEq`.
 
-That second property is the reason to reach for a memo. `over_limit` re-runs on every write to
-`count` — it has to, to find out — but while the answer stays `false`, it wakes nothing at all.
+The comparison is the main reason to use a memo. `over_limit` re-runs on every write to `count`,
+but while the result stays `false`, nothing downstream runs:
 
 ```rust
-count.set(3);   // memo re-runs, answer still false, nothing downstream runs
-count.set(11);  // memo re-runs, answer flips, downstream runs
+count.set(3);   // memo runs, result still false, nothing else runs
+count.set(11);  // memo runs, result flips, readers run
 ```
 
-Reach for a memo when:
+Use a memo when:
 
-- the computation is expensive and several places read it;
-- the computation reads a lot but produces something that changes rarely.
+- the computation is expensive and read in several places, or
+- it reads values that change often but produces a result that changes rarely.
 
-Do not reach for one when the closure is `a.get() + b.get()`. The memo's own bookkeeping costs more
-than the addition.
+Don't use one for something like `a.get() + b.get()`; the memo's bookkeeping costs more than the
+addition.
 
 <Callout type="warn">
-`Memo<T>` requires `T: PartialEq + Send + Sync`. There is no `Memo::new_local`. For a derived value
-whose type is not `Send`, use `Signal::derive_local` instead.
+`Memo<T>` requires `T: PartialEq + Send + Sync`, and there is no local form. For a derived value that
+is not `Send`, use `Signal::derive_local`.
 </Callout>
 
-Two more constructors exist for unusual cases:
+Two more constructors cover unusual cases:
 
 | Constructor | For |
 |---|---|
-| `Memo::new_with_compare(f, changed)` | a `T` with no `PartialEq`, or a comparison of your own |
-| `Memo::new_owning(f)` | a computation that takes the old value by value and says whether it changed |
+| `Memo::new_with_compare(f, changed)` | a `T` without `PartialEq`, or a custom comparison |
+| `Memo::new_owning(f)` | a computation that takes the old value by value and reports whether it changed |
 
-## `Signal<T>` is the prop type
+## Accept any readable value with `Signal<T>`
 
-A component should not care whether its caller has a constant, a signal, a memo or a closure.
-`Signal<T>` is the type that accepts all four.
+A component shouldn't care whether its caller passes a constant, a signal, a memo or a closure.
+A prop of type `Signal<T>` accepts all of them:
 
 ```rust
 #[component]
 fn Badge(
-    /// The number shown, from wherever it comes.
+    /// The number shown.
     count: Signal<i32>,
 ) -> impl IntoView {
     view! {
@@ -111,17 +104,18 @@ view! {
 | `Signal::stored(v)` | a constant `T` |
 | `Signal::stored_local(v)` | a constant `T` that is not `Send` |
 
-Reading is the same trait method as on any signal: `count.get()`, `count.with(...)`.
+Read it like any signal: `count.get()`, `count.with(...)`.
 
-### `MaybeProp<T>` for an optional one
+### Optional props: `MaybeProp<T>`
 
-`MaybeProp<T>` is the same idea for a prop that may be absent, present as a constant, or present as
-a signal.
+`MaybeProp<T>` is the same idea for a prop that may be absent, a constant, or a signal.
 
 ```rust
+use zgui::reactive::MaybeProp;
+
 #[component]
 fn Field(
-    /// Shown under the input when there is one.
+    /// Shown under the input when present.
     #[prop(optional)]
     error: MaybeProp<String>,
 ) -> impl IntoView {
@@ -133,13 +127,15 @@ fn Field(
 }
 ```
 
-It converts from `T`, from `Option<T>`, and — for `MaybeProp<String>` — from `&str`.
+It converts from `T`, from `Option<T>`, and, for `MaybeProp<String>`, from `&str`.
 
-### `SignalSetter<T>` for a write
+### Props that write: `SignalSetter<T>`
 
-The mirror image: a prop that accepts a signal, a write half or a closure, and can be written to.
+The write-side counterpart: a prop that accepts a write signal or a closure.
 
 ```rust
+use zgui::reactive::SignalSetter;
+
 #[component]
 fn Slider(
     /// Called with the new value whenever the handle moves.
@@ -147,17 +143,17 @@ fn Slider(
 ) -> impl IntoView { /* … */ }
 ```
 
-Construct one from a closure with `SignalSetter::map(|v| ...)`.
+Create one from a closure with `SignalSetter::map(|v| ...)`.
 
 <Callout type="info">
-A callback prop is written `on_change = …`, with an underscore, because it is an ordinary prop. Only
-a real listener uses the `on:` namespace — see [Events](/docs/learn/events).
+Callback props are written with an underscore, `on_change = …`, because they are ordinary props.
+Only real event listeners use `on:`. See [Events](/docs/learn/events).
 </Callout>
 
-## Slicing one field out of a struct
+## Derive one field of a struct
 
-When state is one struct in one signal but readers care about individual fields, `create_slice`
-gives a reader and a writer for one field:
+When state is one struct in one signal but readers care about single fields, `create_slice` gives a
+reader and writer for one field:
 
 ```rust
 use zgui::reactive::create_slice;
@@ -171,42 +167,23 @@ let (theme, set_theme) = create_slice(
 );
 ```
 
-`theme` is a `Signal<Theme>` that changes only when the theme field changes, because the getter's
-output is compared. `set_theme` is a `SignalSetter<Theme>` that writes back into the struct.
+`theme` is a `Signal<Theme>` that only notifies when the theme field changes. `set_theme` is a
+`SignalSetter<Theme>` that writes back into the struct.
 
-For state with many fields and many readers, a [store](/docs/learn/stores-and-selectors) is the
-better tool: it subscribes per field with no slicing by hand.
+For state with many fields and many readers, a [store](/docs/learn/stores-and-selectors) tracks each
+field without writing slices by hand.
 
-## Choosing
+## Which to use
 
 | Situation | Use |
 |---|---|
-| A cheap computation, read in one or two places. | a plain closure |
-| Expensive, or read in many places. | `Memo` |
-| Changes rarely, but recomputes often. | `Memo` — equality stops the propagation |
-| A component prop that should accept anything. | `Signal<T>` |
-| The same, but optional. | `MaybeProp<T>` |
-| A prop the component writes to. | `SignalSetter<T>` |
-| One field of a struct held in one signal. | `create_slice`, or a store |
-
-## There is no `batch`
-
-Other reactive libraries have a `batch` function that groups writes so subscribers run once.
-zgui has none, and needs none: **a write never runs anything synchronously**. Every write between
-two flushes coalesces into at most one re-run per subscriber.
-
-```rust
-// One update pass, not four.
-on:click = move |_| {
-    first.set(1);
-    second.set(2);
-    third.set(3);
-    fourth.set(4);
-}
-```
-
-There is no `untrack` function either. Use the `_untracked` method on the read itself, which states
-the intent at the read rather than around a region.
+| Cheap, read in one or two places | a plain closure |
+| Expensive, or read in many places | `Memo` |
+| Recomputed often, but the result rarely changes | `Memo` |
+| A prop that should accept anything readable | `Signal<T>` |
+| The same, but optional | `MaybeProp<T>` |
+| A prop the component writes to | `SignalSetter<T>` |
+| One field of a struct in a signal | `create_slice`, or a store |
 
 ## Next
 
@@ -214,7 +191,7 @@ the intent at the read rather than around a region.
   <Card
     title="Components"
     href="/docs/learn/components"
-    description="Props, defaults, conversions, and what a component costs."
+    description="Props, defaults, conversions, and when a component's body runs."
   />
   <Card
     title="Stores and selectors"

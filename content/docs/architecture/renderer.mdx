@@ -1,18 +1,17 @@
 ---
 title: The renderer
-description: The Renderer contract, the vector seam, the wgpu backend's pipelines and batching, partial redraw, the atlases, and how every visual feature is drawn.
+description: The Renderer and VectorRaster contracts, the wgpu backend, frame planning, partial redraw, presentation, atlases, and how each visual feature is drawn.
 ---
 
-The last stage of the pipeline takes a finished display list and a set of damage rectangles and
-puts pixels on a screen. This page is the contract that stage is written against, and the one
-backend the project ships.
+The renderer takes a finished display list and a damage set and puts pixels on a screen.
+`zgui-render` defines the contract, and `zgui-render-wgpu` is the backend zgui ships. The renderer
+makes no drawing decisions of its own: batches, draw order, vector passes and mark bins are all
+planned in the display list (see [Paint and the scene](/docs/architecture/paint-and-scene)), and the
+renderer executes that plan.
 
-It assumes [paint and the scene](/docs/architecture/paint-and-scene): the display list is a value,
-its primitives are sorted into draw order, and its vector content is already planned into passes.
+## The Renderer trait
 
-## The contract
-
-`crates/zgui-render/src/renderer.rs`. Fourteen methods, six of them defaulted:
+`crates/zgui-render/src/renderer.rs` defines eight required methods and ten with defaults:
 
 ```rust
 pub trait Renderer {
@@ -20,67 +19,66 @@ pub trait Renderer {
     fn configure(&mut self, target: RenderTarget);
     fn target(&self) -> Option<RenderTarget>;
     fn draw(&mut self, scene: &Scene, damage: &DamageSet) -> FrameOutcome;
-    fn shifts_composed_pixels(&self) -> bool { false }
-    fn shift_composed(&mut self, shift: ScrollShift) { }
     fn register_external(&mut self, texture: ExternalTexture) -> TextureHandle;
     fn release_external(&mut self, handle: TextureHandle);
     fn memory(&self) -> MemoryReport;
+    fn texture_sink(&mut self) -> &mut dyn TextureSink;
+
+    fn shifts_composed_pixels(&self) -> bool { false }
+    fn composed_survives_configure(&self) -> bool { false }
+    fn shift_composed(&mut self, shift: ScrollShift) { }
+    fn vector_status(&self) -> VectorStatus { VectorStatus::default() }
     fn target_pool(&self) -> TargetPoolReport { TargetPoolReport::EMPTY }
     fn release_cached_targets(&mut self) -> u64 { 0 }
     fn release_idle_resources(&mut self) -> u64 { self.release_cached_targets() }
     fn acquire_block(&self) -> Duration { Duration::ZERO }
-    fn texture_sink(&mut self) -> &mut dyn TextureSink;
+    fn as_any_mut(&mut self) -> Option<&mut dyn Any> { None }
+    fn as_any(&self) -> Option<&dyn Any> { None }
 }
 ```
 
-`zgui-render` names no graphics API and implements neither of its two traits. Its crate
-documentation says so outright: "Two contracts live here and nothing implements either of them."
+`zgui-render` names no graphics API and implements none of its traits. Every default is the correct
+answer for a renderer that does not support the feature, so a minimal implementation stays correct.
 
-### What a renderer must do
-
-| Rule | Why |
+| Rule | Reason |
 |---|---|
-| Compose into a target it keeps between frames. | `draw` is entitled to assume that everything outside the damage rectangles still holds the previous frame's pixels. An implementation that composes into a transient surface has to treat every frame as full. |
-| Perform every accepted `ScrollShift` before the following draw. | The runtime narrows damage only after `shifts_composed_pixels()` returns true. |
-| Execute the display list's plan. | The arrays are already in draw order and the vector passes are already planned. A renderer that derives its own plan is a second owner of one decision. |
-| Read `capabilities()` before the frame is built. | These features change what the display list should *contain*, not only how it is drawn. |
-| Retire damage on submission. | `FrameOutcome::retires_damage()` is the authority, and it is not the naive rule. |
-| Hand out `texture_sink()` per call. | The textures do not survive `configure` on a lost device, so a borrow kept across frames outlives what it names. |
-| Report a pool if it keeps one. | A window's budget asserts that every cache it registers is empty after being told to forget. |
-| Report surface-acquisition delay. | The runtime uses `acquire_block()` to start later frames closer to the time the display can show them. |
+| Compose into a target that persists between frames. | `draw` may assume everything outside the damage still holds the previous frame's pixels. A renderer that draws into a fresh surface each frame must treat every frame as full damage. |
+| Execute the display list's plan; do not derive another. | Batches, draw order, vector passes, mark bins and the damage cull are decided in the scene, so tests can assert them without a device. A renderer or `VectorRaster` that culls against damage again becomes a second owner of the same decision. |
+| Report capabilities before the frame is built. | They change what the display list contains, not only how it is drawn. |
+| Retire damage when work is submitted. | `FrameOutcome::retires_damage()` decides, and the answer is not "when presented". |
+| Hand out `texture_sink()` per call. | Atlas textures do not survive a device loss, so a borrow kept across frames outlives what it names. |
+| Report a pool if you keep one. | A window's budget asserts that every registered cache is empty after it is told to release its contents. |
+| Forward `as_any`/`as_any_mut` from a wrapper. | Backend companion crates, such as the embedding host, reach the concrete renderer through them. |
 
-### What a renderer must not do
+Two optional capabilities change what the runtime sends:
 
-- It must not cull against damage a second time. The display list already did.
-- It must not re-derive where vector passes fall, how many there are, or what each one clips
-  through.
-- A `VectorRaster` under it must not cull against damage either.
+- **`shifts_composed_pixels`**: when this is true, the runtime narrows a scroll frame's damage to the
+  exposed band and calls `shift_composed` before the next `draw`. See
+  [Shifting a composed scrollport](#shifting-a-composed-scrollport).
+- **`composed_survives_configure`**: asked after every `configure`. When it is true and the scale and
+  opacity did not change, the runtime damages only the bands a larger surface exposes. Otherwise the
+  next frame is full damage. See [The persistent target](#the-persistent-target).
 
 ### What a frame reports
 
-`draw` returns a `FrameOutcome`, not a `Result`. Most of the ways a frame fails to reach the screen
-are ordinary events in a window's life.
+`draw` returns a `FrameOutcome`, not a `Result`, because most reasons a frame does not reach the
+screen are normal events in a window's life.
 
 ```rust
-pub enum FrameOutcome {
-    Presented(FrameStats),
-    Skipped(SkipReason),
-    Recovered,
-}
+pub enum FrameOutcome { Presented(FrameStats), Skipped(SkipReason), Recovered }
 
 #[non_exhaustive]
 pub enum SkipReason {
-    Unconfigured, Timeout, Occluded, Outdated, Validation, DeviceUnavailable, Undamaged,
+    Unconfigured, Timeout, Unacquired, Occluded, Outdated, Validation, DeviceUnavailable, Undamaged,
 }
 ```
-
-Two predicates read that enum, and their disagreement is the point.
 
 | Outcome | `retires_damage()` | `wants_another_frame()` |
 |---|---|---|
 | `Presented` | yes | no |
 | `Recovered` | yes | yes |
 | `Skipped(Unconfigured)` | **no** | yes |
+| `Skipped(Unacquired)` | **no** | yes |
 | `Skipped(Timeout)` | yes | yes |
 | `Skipped(Outdated)` | yes | yes |
 | `Skipped(Validation)` | yes | yes |
@@ -88,16 +86,20 @@ Two predicates read that enum, and their disagreement is the point.
 | `Skipped(DeviceUnavailable)` | **no** | **no** |
 | `Skipped(Undamaged)` | yes | **no** |
 
-`Unconfigured` and `DeviceUnavailable` keep their damage because neither records work.
-A frame that composed everything and then failed to acquire a surface has still updated the target
-it drew into; redrawing it would repeat work that has already happened.
+Three outcomes keep their damage because nothing was recorded: the surface was not configured, the
+device could not be rebuilt, or (`Unacquired`) a renderer that draws straight into a buffer the
+display scans out had no buffer to draw into. `Timeout` is the same refusal after the frame was
+composed, so the persistent target already holds the new pixels and the damage is retired.
 
-`Occluded`, `DeviceUnavailable` and `Undamaged` say *do not ask for another frame*. Honouring a
-redraw request on an invisible window is exactly how a window nobody can see runs at full rate. A
-new frame cannot restore a device that could not be rebuilt. These rules are held in place by tests
-in `crates/zgui-render/src/outcome.rs`.
+Three outcomes must not request another frame:
 
-### The surface being drawn for
+- `Occluded`: redrawing a hidden window would make it run at full rate.
+- `Undamaged`: another frame would produce the same pixels.
+- `DeviceUnavailable`: a device that could not be rebuilt will not be rebuilt by asking again.
+
+Tests in `crates/zgui-render/src/outcome.rs` hold these rules.
+
+### Render targets and capabilities
 
 ```rust
 pub struct RenderTarget {
@@ -110,111 +112,126 @@ pub struct RenderCapabilities {
     pub subpixel_text: bool,
     pub vector_compute: bool,
     pub mutable_texture_formats: bool,
+    pub custom_shaders: bool,
     pub max_texture_size: i32,
 }
 ```
 
-`opaque` decides more than it looks. Text antialiased per colour channel writes three coverage
-values and no alpha, which is meaningless against a destination that is not opaque, so a
-translucent surface uses ordinary single-channel coverage throughout.
+`RenderTarget::translucent()` clears `opaque`. A window opened with `App::with_transparent(true)` is
+composed into a translucent target: each pixel is a premultiplied colour, a pixel nothing paints has
+zero alpha, and text uses greyscale (single-channel) antialiasing. Per-channel text writes three
+coverage values and no alpha, which is meaningless over a destination that is not opaque.
 
-`RenderCapabilities::MINIMAL` is the least capable device worth supporting: no per-channel text, no
-compute, no format views, and `max_texture_size: 4096`.
+`RenderCapabilities::MINIMAL` is the least capable device zgui supports: no per-channel text, no
+compute, no format views, no application shaders, and `max_texture_size: 4096`.
 
-## The vector seam
+## Vector rasterisers
 
-Most of what a document draws is rectangles, sprites and lines, which a fixed-function pipeline
-evaluates directly. Arbitrary Bézier outlines — an icon, an SVG document, a path handed to `canvas`
-— are not. They go through a second seam.
-
-Paint handles eligible small solid paths before this seam. It stores their monochrome coverage in
-the shared atlas and emits ordinary sprite instances. Only paths that need the general path
-rasterizer reach `VectorRaster`. The wgpu backend creates that rasterizer lazily on the first
-non-empty vector plan, so an application that draws only atlas-eligible icons does not pay its fixed
-device cost.
+Rectangles, sprites and lines are drawn by fixed pipelines. Paint lowers most vector content to
+quads, marks, atlas masks or CPU-rasterised sprites (see
+[Vector routes](/docs/architecture/paint-and-scene#vector-routes)). Only what is left becomes
+`VectorItem`s, planned into [vector passes](/docs/architecture/paint-and-scene#vector-passes), and a
+`VectorRaster` draws those passes.
 
 ```rust
 pub trait VectorRaster: 'static {
+    fn backend(&self) -> VectorBackend { VectorBackend::Other }
     fn plan(&mut self, passes: &ScenePassPlan) -> VectorPlan;
-    fn clear_targets(&mut self, plan: &VectorPlan);
+    fn clear_targets(&mut self, plan: &VectorPlan, round: usize);
     fn prepare(&mut self, frame: &mut VectorFrame<'_>) -> Result<(), VectorError>;
     fn memory(&self) -> MemoryReport;
+    fn release_idle_resources(&mut self) -> u64 { 0 }
 }
 ```
 
-An implementation rasterises outlines into a **scratch texture** — an offscreen image the rasteriser
-writes and the renderer then samples — and the renderer composites that scratch into the frame at
-the exact point in draw order the batch stream reached it. Submission order is z-order here: there
-is no depth buffer, no stencil and no order-independent scheme anywhere in this renderer, so an
-ordinary draw inserted at that index is exactly right.
-
-`VectorPass::region` is the pass's surface-space bounds. `VectorPass::raster_region` is a compact
-rectangle in scratch. Disjoint pass regions can share a layer and are shelf-packed, so scratch does
-not include the unused distance between far-apart paths.
+A rasteriser writes each pass into a **scratch texture**, and the renderer composites the scratch
+back with one ordinary draw at the pass's position in the batch stream. The renderer has no depth
+buffer, stencil or order-independent scheme. Submission order is z-order, so inserting the composite
+at the right index is enough.
 
 The rules, from `crates/zgui-render/src/vector/raster.rs`:
 
-- The scratch holds **straight** colour, not premultiplied. The compositing draw premultiplies as
-  it reads. (Premultiplied means each colour channel is already scaled by the alpha; it is what
-  every other target in this renderer holds.)
-- `plan()` is **index-aligned** with what it was given: one `VectorPass` per `PlannedPass`, in the
-  same order, or an empty plan. The display list names each composite by the plan's index, so an
-  implementation that dropped one pass would draw every later composite from the wrong pass.
-- `clear_targets` is mandatory. A rasterisation that fails while reporting success would otherwise
-  leave a reused scratch holding the previous frame's content, which composites as wrong pixels
-  rather than missing ones.
-- `prepare` runs before the frame's own command recording begins, because an implementation may
-  submit work of its own.
-- **Residual clips** are part of the contract. One composite applies one clip, so an item whose clip
-  chain runs deeper than its pass's has the extra links applied inside the scratch.
-- An empty plan means the caller does nothing at all. An empty pass over a full-size surface is not
-  free.
+- The scratch holds **straight** (un-premultiplied) colour. The composite premultiplies as it reads.
+- `plan()` is **index-aligned** with its input: one `VectorPass` per `PlannedPass`, in order, or an
+  empty plan. Composites name passes by index, so dropping one would draw every later composite from
+  the wrong pass. `VectorPlan::resourcing` starts a plan that keeps the alignment.
+- `plan()` runs once per frame and holds the per-frame bookkeeping. `clear_targets` and `prepare` run
+  once per **round**, and again for each damage rectangle, so they must not age caches or reset
+  statistics.
+- `clear_targets` is mandatory. Without it, a rasterisation that fails silently leaves the previous
+  frame's paths in a reused scratch, which composite as wrong pixels.
+- `prepare` runs before the commands that composite its round are recorded, because an
+  implementation may submit work of its own.
+- **Residual clips** are part of the contract. A composite applies one clip, so the part of an
+  item's clip chain below its pass's clip is applied inside the scratch.
+- A pass whose `clamped` flag is set (cut to the damage, or with ink past the surface edge) must be
+  clipped to its region, because the next pass's bin starts where the region ends.
+- An empty plan means do nothing. An empty pass over a full-size surface is not free.
 
-The wgpu side asks one further question, through an extension trait rather than a downcast
-(`crates/zgui-render-wgpu/src/frame/vector.rs`):
+### Packing passes into scratch and rounds
 
-```rust
-pub trait VectorSource: VectorRaster {
-    fn view(&self, target: VectorTarget) -> Option<&wgpu::TextureView>;
-}
-```
+Both rasterisers use the `zgui_render::Layering` helper (`crates/zgui-render/src/vector/pack/mod.rs`):
 
-### The two implementations
+- **Bins.** Each pass gets a bin of its own size on a shelf of a scratch layer. Two passes never
+  share a texel, whatever they cover on the surface, so a stack of passes over one point costs the
+  same as the same passes side by side. `VectorPass::region` is where the pass composites on the
+  surface; `VectorPass::raster_region` is its bin.
+- **Capacity.** `Capacity::DEFAULT` is eight layers of 2048 × 2048 per round (at most 128 MiB of
+  RGBA8). A pass larger than a layer widens the layer, so every pass fits.
+- **Rounds.** A frame that needs more is cut into rounds: contiguous runs of the plan, in order. The
+  renderer submits what it has recorded, rasterises the next round into the same layers, and
+  continues. Paint order does not change, and no pass is dropped.
+- **Sizing.** The scratch grows at once to what a frame needs, rounded up to 256-pixel size classes.
+  It shrinks only after `Decay::GRACE` (two seconds) of needing less, so a fling does not reallocate
+  on every quiet frame.
 
-| Crate | Type | For | Downgrades |
-|---|---|---|---|
-| `zgui-render-vector-vello` | `VelloRaster` | Every device that runs compute shaders over writable storage textures. This is what everything is measured against. | None. |
-| `zgui-render-vector-coverage` | `CoverageRaster` | A device that runs no compute shaders over writable storage textures. | Stated, not hidden — see below. |
+`VectorFramesDropped` counts frames where a round still failed to rasterise. It should stay at zero.
 
-`zgui_render_vector_vello::select::chosen(gpu)` reads `gpu.capabilities().vector_compute` — what the
-*device* turned out to support, not what the adapter promised. The probe and the fallback are one
-function, `for_device`, so the alternative branch cannot be the one written later. If
-`VelloRaster::new` fails even on a compute device, one warning is logged and the coverage raster is
-used.
+### Vello and coverage rasterisers
 
-The coverage raster's downgrade, from its own crate documentation:
+| Crate | Type | For |
+|---|---|---|
+| `zgui-render-vector-vello` | `VelloRaster` | Devices that run compute shaders over writable storage textures. The reference implementation. |
+| `zgui-render-vector-coverage` | `CoverageRaster` | Devices that cannot. A visible downgrade. |
 
-- **No blend or compose set.** Everything composites source-over.
-- **Multisampled coverage rather than analytic.** Sixteen samples per pixel (`GRID: i32 = 4` in
-  `crates/zgui-render-vector-coverage/src/shader/coverage.wgsl`), so an edge lands on one of
-  seventeen levels. Interiors are exact.
-- **Cost grows with area times outline complexity.** Reasonable for icons, unreasonable for a map.
-- **Ramps are filled flat.** A gradient fill is drawn in the ramp's mean colour. A paint that samples
-  an image has no stand-in and is not drawn.
+`zgui_render_vector_vello::for_device` reads `gpu.capabilities().vector_compute` (what the device
+supports, not what the adapter advertised) and returns one or the other. If `VelloRaster::new` fails
+on a compute device, it logs one warning and uses the coverage raster. One Vello renderer is shared
+per device; scratch textures and caches are per window.
+
+`VelloRaster` keeps an **encoding cache** (`raster/cached.rs`). An item's encoding is keyed by
+content: the identity of its shared path allocation, its paints, its fill rule and stroke style, and
+its brush transform. Placement, pass, clip and item identity are not part of the key, so a scrolled,
+moved, refitted or duplicated drawing reuses its encoding. The cache holds the `Arc`, so a freed
+path address cannot be reused by another path, and drops the least recently drawn entries past
+64 MiB. `VectorEncodeHits` and `VectorEncodeMisses` count lookups.
+
+The coverage raster's limitations, from its crate documentation:
+
+- **No blend or compose modes.** Everything composites source-over.
+- **Multisampled coverage.** Sixteen samples per pixel (`GRID: i32 = 4` in `coverage.wgsl`), so an
+  edge has seventeen levels. Interiors are exact.
+- **Cost scales with area times outline complexity.** Fine for icons, slow for a map.
+- **Gradients are filled flat** in the ramp's mean colour. Image paints are not drawn.
+
+The general rasteriser is built **lazily**, on the first frame whose plan is not empty. Building it
+takes hundreds of milliseconds and a large fixed allocation, so a document whose shapes all take
+another route never builds it. `Renderer::vector_status()` reports the configured backend and whether
+it has been built; `VectorBackendBuilt` counts builds.
 
 <Callout type="warn">
-A renderer with no rasterizer factory attached plans general vector passes and then has no scratch
-content to composite. The result is an empty rectangle where that drawing should be. Atlas-backed
-small paths do not need this rasterizer. `zgui::app()` calls
-`zgui_render_vector_vello::attach` for you (`crates/zgui/src/app/graphics.rs`).
+A renderer with no rasteriser factory attached still plans vector passes, but nothing writes the
+scratch, so each general vector item draws as an empty rectangle. `zgui::app()` calls
+`zgui_render_vector_vello::attach` for you (`crates/zgui/src/app/graphics.rs`). Call it yourself
+when you build a `WgpuRenderer` directly.
 </Callout>
 
 ## The wgpu backend
 
 `zgui-render-wgpu` is the shipped implementation. `Builder` opens a device and returns a
-`WgpuRenderer`; it is a builder rather than a constructor because a surface has to be created from
-the same instance the device came from, and whether an adapter is *usable* is only known once a
-device has been created from it and a surface configured under a validation error scope.
+`WgpuRenderer`. It is a builder because the surface must be created from the same instance as the
+device, and an adapter is only known to be usable once a device was created from it and a surface
+configured under a validation error scope.
 
 ```rust
 use zgui_geom::{Scale, Size};
@@ -224,226 +241,188 @@ use zgui_render_wgpu::{Builder, WgpuRenderer};
 fn offscreen() -> Result<WgpuRenderer, GpuUnavailable> {
     let target = RenderTarget::new(Size::new(256, 256), Scale::new(1.0));
     let mut renderer = Builder::new().offscreen(target, wgpu::TextureFormat::Bgra8Unorm, false)?;
-    // Install the lazy rasterizer factory for general vector paths.
+    // Install the lazy factory for the general vector rasteriser.
     zgui_render_vector_vello::attach(&mut renderer, target.size);
     Ok(renderer)
 }
 ```
 
-`GpuUnavailable` is a typed error and not a fallback. A machine with no usable device exists, and
-opening an offscreen surface quietly for a window the user asked for is worse than failing: the
-window appears and never paints. Every adapter that was tried is named in the error.
+`GpuUnavailable` is a typed error, not a fallback, and names every adapter that was tried. A window
+that opens and never paints is worse than a clear failure.
 
-### Shared graphics across windows
+### Sharing a device across windows
 
 The standard renderer factory owns one `SharedGraphics`. The first window selects and opens a
-device. Later windows receive renderers on that device when its adapter can present to their
-surfaces. A surface that the primary adapter cannot present to gets a fallback device; compatible
-windows on that adapter share the fallback.
+device. Later windows get renderers on that device when its adapter can present to their surfaces.
+A surface the primary adapter cannot present to gets a fallback device, shared by compatible windows.
 
-The device, queue, adapter, compiled pipelines, and pipeline cache are shared per device. The
-surface, swap chain, composed target, persistent primitive arenas, remap and side-table buffers,
-group pool, scroll scratch, and atlas remain per window. Atlas keys belong to one window's content cache, so sharing an atlas would let one
-window's eviction invalidate another's tiles.
+| Shared per device | Per window |
+|---|---|
+| Device, queue, adapter, compiled pipelines, on-disk pipeline cache, the Vello renderer | Surface and swap chain, composed target, primitive arenas, remap and side-table buffers, group pool, scroll scratch, mark pages, atlas textures |
 
-The renderer factory remains lazy. Constructing the application does not enumerate adapters. The
-first surface performs device selection, and closing the last window on a fallback device lets that
-device go.
+The atlas stays per window because atlas keys are created by a window's content cache; sharing it
+would let one window's eviction blank another's glyphs. The factory is lazy: constructing the
+application enumerates no adapters, and closing the last window on a fallback device releases it.
 
-### The persistent target
+### Adopting a host-opened device
 
-A frame is never composed straight into the window's surface. It is composed into a texture the
-renderer keeps, and the whole of that texture is then copied onto the surface
-(`crates/zgui-render-wgpu/src/target/scene_texture.rs`).
-
-Both halves are forced. Every acquisition of a surface texture yields a brand-new resource marked
-wholly uninitialised, so loading from one costs a full clear before any of this frame's commands
-run. Composing into a target that outlives the frame is what makes partial redraw possible at all;
-copying **all** of it is what stops the rest coming out black.
-
-The target is allocated at a **size class** rather than at the exact size:
+An application embedded in a host that already owns the graphics device, such as a game engine, can
+draw on that device instead of opening its own:
 
 ```rust
-pub const SIZE_CLASS: i32 = 256;
-pub fn size_class(length: i32) -> i32;   // ceiling to a multiple of 256, minimum 1
+use zgui_render_wgpu::{Gpu, SharedGraphics};
+
+let gpu = Gpu::from_existing(instance, adapter, device, queue);   // the host's wgpu objects
+let graphics = SharedGraphics::with_gpu(gpu);
+// Then, per window: graphics.renderer_for_surface(target, surface, pacing, None)
 ```
 
-An interactive resize delivers one new size per frame. Growth during a drag costs a handful of
-allocations; shrinking costs none. `SceneTexture::used` is the sub-rectangle the surface occupies
-and the slack around it is never read.
+`zgui::app()` opens its own device. To draw on a host's device, install a
+[renderer factory](#custom-renderers) with `App::with_renderer` that hands out renderers from these
+graphics, and call `zgui_render_vector_vello::attach` on each.
 
-### Shifting a composed scrollport
+- **Capabilities** are read from the host's device and adapter the same way `Gpu::open` reads them,
+  so a device without dual-source blending draws text with ordinary coverage, and so on.
+- **Graphics made with `with_gpu` never open a device.** Wherever one would be opened (the first
+  surface on a lost device, a surface the adapter cannot present to, the replacement after a loss),
+  they return `GpuUnavailable` instead. `Gpu::is_adopted()` and `SharedGraphics::is_adopted()` report
+  this.
+- **Device loss is reported by the host.** wgpu keeps one device-lost callback per device and the
+  host already owns it, so zgui installs none. The host calls `gpu.loss().report(reason, message)`,
+  or calls the closure from `DeviceLoss::observer()` inside its own callback. Until then, renderers
+  on the device do not see the loss.
+- **Recovery.** After recovering, the host hands over the new device with `graphics.adopt(new_gpu)`.
+  Each renderer moves to it the next time it recovers. Adopting the device that is already primary
+  changes nothing.
 
-A persistent target also permits a scroll to reuse pixels already composed. The runtime calls
-`Renderer::shift_composed` with a `ScrollShift` only after it verifies the document-level safety
-conditions. The renderer copies the surviving part of the scrollport by a whole number of device
-pixels before it draws this frame's damage.
+### Presenting into supplied textures
 
-`ScrollShift::source()` and `destination()` define the copy regions. These regions usually overlap.
-The wgpu backend copies through a scratch texture because one texture cannot safely be both the
-overlapping source and destination. The scratch texture is allocated on first use and can be
-released by the render-target cache budget.
+`SharedGraphics::renderer_supplied(target, textures)` builds a renderer that presents into textures
+the caller created on the shared device (via `SharedGraphics::open_gpu`) instead of into a swap
+chain. The experimental console backend uses it to draw into scanout buffers; Vulkan extensions the
+textures need are declared once with `SharedGraphics::with_extensions`. When no supplied buffer is
+free, the renderer reports `Skipped(Unacquired)` and keeps its damage. Such a renderer cannot recover
+from a device loss, because its textures belong to the old device; its owner builds a new one.
 
-The movement can expose one horizontal band and one vertical band. These bands are added to damage,
-and the ordinary partial-redraw path fills them. Damage from other changes is also preserved. A
-renderer that returns `false` from `shifts_composed_pixels` always receives the complete fallback
-damage and does not implement this operation.
+## Colour encoding
 
-### One colour rule
-
-Compositing, blending and filtering all happen on premultiplied, gamma-encoded values, in every
-target. The composed target's format is the surface's with any `*Srgb` suffix removed, and a debug
-build asserts it. An `*Srgb` attachment would insert a fixed-function decode before every blend and
-an encode after it — `rgba(128, 128, 128, 0.5)` over white reads back 191 from a plain attachment,
-which is what CSS specifies, and 225 from an encoded one.
+Compositing, blending and filtering all happen on premultiplied, gamma-encoded values in every
+target. The composed target's format is the surface format with any `*Srgb` suffix removed, and a
+debug build asserts it. An `*Srgb` attachment would decode before each blend and encode after it:
+`rgba(128, 128, 128, 0.5)` over white would then read back 225 instead of the 191 CSS specifies.
 
 ```rust
 pub enum SrgbTier { Native, ViewFormatTwin, UndoInBlit }
 ```
 
-Where the surface offers only an encoded format and the device cannot view a texture under a second
-format, the encode is cancelled in the final copy instead. `BlitUndoSrgb` is the one shader in the
-renderer that converts between encodings, and it is legal precisely because that copy is a pure
-copy.
+When the surface offers only an encoded format and the device cannot view a texture under a second
+format, the final copy (`BlitUndoSrgb`) cancels the encoding instead. It is the only shader that
+converts between encodings, which is safe because that copy is a pure copy.
 
-### The pipelines
+## Pipelines
 
-A pipeline is a compiled shader plus its fixed state. There are fourteen kinds
-(`crates/zgui-render-wgpu/src/pipeline/kind.rs`), each keyed by kind **and** by the format of the
-attachment it draws into, because a pipeline's colour target has to match the attachment.
+A pipeline is keyed by kind **and** by the format of the attachment it draws into. There are 23
+built-in kinds (`crates/zgui-render-wgpu/src/pipeline/kind.rs`):
 
 | Kind | Draws | Blend |
 |---|---|---|
 | `Quad` | Rounded, bordered rectangles. | premultiplied over |
 | `Shadow` | Box shadows, outer and inset. | premultiplied over |
-| `Decoration` | Underline, overline and strikethrough lines. | premultiplied over |
-| `MonoSprite` | Single-channel coverage tiles: ordinary glyphs. | premultiplied over |
-| `SubpixelSprite` | Per-channel coverage tiles: glyphs on an opaque destination. | dual source, writes no alpha |
-| `ColorSprite` | Full-colour tiles: images, colour emoji. | premultiplied over |
+| `Decoration` | Underline, overline and strikethrough. | premultiplied over |
+| `MonoSprite` | Single-channel coverage tiles: glyphs, atlas masks, path glyph cells. | premultiplied over |
+| `SubpixelSprite` | Per-channel coverage tiles, on an opaque destination. | dual source, no alpha write |
+| `ColorSprite` | Full-colour tiles: images, colour emoji, CPU vector layers. | premultiplied over |
+| `MarksDisc`, `MarksBox`, `MarksPolyline`, `MarksGlyph` | One payload kind of a mark, painted directly. | premultiplied over |
+| `MarksDiscCoverage` … `MarksGlyphCoverage` | The same kinds, writing coverage into a union bin. | add; polylines take the max |
+| `MarksComposite` | A union mark, painted through its bin. | premultiplied over |
+| `VectorComposite` | A rasterised vector pass. | premultiplied over |
+| `Composite` | An isolated group target into the target beneath. | premultiplied over |
+| `External` | A texture the renderer did not draw. | premultiplied over |
 | `DamageClear` | One damage rectangle, cleared by drawing over it. | replace |
-| `BlurDownsample` | The 2:1 downsample that begins a blur. | replace |
-| `BlurAxis` | One axis of a separable Gaussian. | replace |
-| `Composite` | An isolated target back into the one beneath it. | premultiplied over |
-| `VectorComposite` | A rasterised vector pass back into the target. | premultiplied over |
-| `External` | A rectangle showing a texture the renderer did not draw. | premultiplied over |
-| `Blit` | The copy from the composed target to the surface. | replace |
-| `BlitUndoSrgb` | The same copy, with the attachment's encode cancelled in advance. | replace |
+| `BlurDownsample`, `BlurAxis` | The steps of a blur. | replace |
+| `Blit`, `BlitUndoSrgb` | The copy from the composed target to the surface. | replace |
 
-A copy, a clear and a filtering pass all **replace** rather than blend, so the result never depends
-on what the attachment happened to hold.
+Copies, clears and filter passes **replace** rather than blend, so their result never depends on
+what the attachment held.
 
-`SubpixelSprite` is the only kind that needs a device feature — dual-source blending, where the
-fragment shader emits a second colour used as the blend factor — and the only kind refused for an
-isolated target's format. Where the feature is missing, text is emitted as single-channel coverage
-instead.
+`SubpixelSprite` is the only kind that needs a device feature (dual-source blending) and the only
+one refused for an isolated target's format. Without the feature, text is emitted as single-channel
+coverage.
 
-Every pipeline is built at renderer construction, over `PipelineKind::ALL`, so a driver's first
-shader compilation stays out of a frame the user is waiting for.
+The WGSL sources live once in `zgui-wgsl` and are concatenated per module, so a clip evaluated by a
+quad, a glyph and an application effect runs the same code. They are parsed when `zgui-render-wgpu`
+is built, and a launch loads the parsed form. Every built-in pipeline is created at renderer
+construction over `PipelineKind::ALL`, so the driver's first compilation does not land in a frame.
+Application [shader effects](/docs/advanced/custom-shaders) are registered per device and built
+lazily for the formats that use them. `draw` syncs newly declared effects before planning, and a
+device rebuild registers them again.
+
+## GPU tables and buffers
 
 ### Side tables
 
 Clips, paints and coordinate systems are addressed by index from every instance, so they travel in
-storage buffers rather than in the instances (`crates/zgui-render-wgpu/src/bind/tables.rs`):
+storage buffers (`crates/zgui-render-wgpu/src/bind/tables.rs`): `GpuClip`, `GpuPaint` (with gradient
+stops in a separate table) and `GpuSpatial` (one 4×4 matrix per slot). Globals are **per target**,
+read through a dynamic offset; one buffer rewritten per frame would give every pass the last mapping
+written.
+
+The renderer keeps CPU copies of the tables. The scene's clip and paint tables publish a bounded
+change journal, and a `TableVersion` asks what changed since the frame it last prepared, so an
+unchanged scene flattens **zero** slots and uploads zero side-table bytes. Changed slots are copied
+as contiguous ranges. The renderer falls back to a full copy when it missed the journal, when
+gradient stops moved, when at least half the table changed, or when more than sixteen ranges would
+be needed. `SideTableSlotsPrepared` counts the CPU work.
+
+Application shader parameters use a separate fixed-stride uniform buffer. Equal parameter blocks
+share one slot, and a draw selects its block with a dynamic offset.
+
+### Instance arenas
+
+The seven instanced kinds (quads, shaded rectangles, shadows, decorations and the three sprite
+kinds) and mark payloads live in persistent GPU **arenas**, keyed by the paint chunk's revision. A
+new encoding uploads once. A replay at the same position uploads nothing, and a **moved** replay
+uploads nothing either: the scene records the chunk's offset (`Scene::chunk_offsets`) and the shader
+adds it at draw time. Content that cannot be resident (unresolved sprites, captures) goes into a
+transient range.
+
+Arenas reuse freed ranges before growing their tail, grow to at least twice their size, and keep each
+lane's bytes when they grow. A freed range is reused only after the GPU has completed the submission
+that last read it.
+
+### Upload belts
+
+Uploads go through a reusable `UploadBelt` (`buffer/upload.rs`) rather than `Queue::write_buffer`,
+which can allocate and map a staging buffer per call:
+
+- chunks are at least 256 KiB and grow to the next power of two for larger requests;
+- `finish` unmaps before submission, and `recall` starts asynchronous re-mapping after it;
+- a frame reuses only chunks whose mapping completed, and never waits for one;
+- one free chunk stays warm; others unused for 120 frames are released.
+
+Atlas uploads use a second belt with the same policy and one submission per batch.
+`UploadChunksAllocated` is non-zero when the belt grew; a recurring count means GPU backlog or
+repeated bursts.
+
+## Planning a frame
+
+The scene's [batches](/docs/architecture/paint-and-scene#batching) say which draw calls a frame
+makes and in what order. The renderer adds render passes around them. A render pass ends at:
+
+| Render pass boundary | Reason |
+|---|---|
+| A new damage rectangle. | The batch stream is replayed once per rectangle, under its own scissor. |
+| A group start or end. | Content is redirected into a pooled target, then composited back. |
+| A `backdrop-filter`. | `EncoderOp::Capture` copies what is beneath, because a shader cannot read its own attachment. |
+| Each blur or filter step. | Each step reads one target and writes another. |
+| A new vector round. | Recorded work is submitted before the rasteriser writes the shared layers again. |
+
+All of these split points need the command encoder, which a live render pass holds borrowed. So the
+frame is **planned before any pass opens** (`crates/zgui-render-wgpu/src/frame/`), as a value that
+tests can read:
 
 ```rust
-#[repr(C)] pub struct GpuClip {
-    pub aabb: [f32; 4], pub first: GpuRounded, pub second: GpuRounded,
-    pub count: u32, pub has_mask: u32, pub mask: SpriteTile,
-}
-#[repr(C)] pub struct GpuPaint {
-    pub kind: u32, pub gradient: u32, pub space: u32, pub flags: u32,
-    pub geometry: [f32; 4], pub color: [f32; 4],
-    pub stop_start: u32, pub stop_count: u32, pub pad0: u32, pub pad1: u32,
-}
-#[repr(C)] pub struct GpuSpatial { pub matrix: [[f32; 4]; 4] }
-```
-
-Globals are **per target**, not per frame, and are read through a dynamic offset. A single buffer
-rewritten once a frame would give every pass of that frame the last mapping written.
-
-The renderer keeps a CPU copy of all four tables in `PreparedTables`. The scene's clip and paint
-tables publish a bounded change journal. A `TableVersion` lets the renderer ask what changed since
-the frame it last prepared. Coordinate systems report slots whose occupant or resolved matrix
-changed, including slots that became vacant.
-
-An unchanged scene therefore flattens **zero** side-table slots and uploads zero side-table bytes.
-Changed slots are sorted, deduplicated and copied as contiguous ranges. The renderer uses a full
-copy when it missed the journal, when a paint edit moved gradient stops, when at least half the
-table changed, or when the update would require more than sixteen copy ranges. The
-`SideTableSlotsPrepared` counter separates this CPU work from the bytes copied to the device.
-
-### Updating GPU buffers
-
-The six instanced primitive kinds use persistent GPU arenas: quads, shadows, decorations, and the
-three sprite kinds. A paint chunk's unique revision identifies its residence. A new encoding is
-uploaded once; a zero-offset replay then uploads no primitive bytes.
-
-Each arena allocates reclaimed ranges before its high-water tail. If it must grow, it grows to a
-power of two and uploads its resident chunks to the replacement buffer. A retired range is not
-reused until the GPU completion callback for the submission that last used it has arrived.
-
-For each frame, the renderer resolves the scene's sorted remap positions to arena slots. Content
-that cannot be resident — moved copies, outlines, and unresolved sprites — is gathered into a
-transient range. The remap buffer is uploaded only when its contents changed. On a steady retained
-frame, primitive arenas and remaps need no upload; only changed globals or side tables move.
-
-The upload source is a reusable `UploadBelt` (`crates/zgui-render-wgpu/src/buffer/upload.rs`). A
-native `Queue::write_buffer` can allocate and map a temporary staging buffer for each call. A frame
-with many instance and table buffers can therefore hit allocator or mapping latency even when it
-copies few bytes. The belt instead suballocates every copy from mapped chunks:
-
-- a chunk is at least 256 KiB and grows to the next power of two for a larger request;
-- `finish` unmaps the chunks before submission;
-- `recall` starts asynchronous write mapping after submission;
-- the next frame polls without waiting and reuses only chunks whose callbacks completed;
-- one free chunk stays warm, while other chunks unused for 120 frames are released.
-
-The atlas backend uses a second belt with the same policy. It pads texture rows in staging memory,
-records all pending atlas writes in one encoder, and submits one non-empty upload batch. No frame
-waits for a staging chunk to become writable; GPU backlog can allocate another chunk instead.
-
-The frame probe labels this work `r.buffers` (**Update GPU buffers**). A non-zero
-`UploadChunksAllocated` count normally means that the belt grew to a new working set. A recurring
-count indicates GPU backlog or repeated bursts above that working set. The `r.record` mark carries
-the allocation count on those frames.
-
-## From display list to draw calls
-
-A batch is one draw call's worth of primitives: a contiguous range in one kind's sorted remap list.
-The shader uses the remap binding to find each primitive in that kind's persistent arena or
-transient range. Primitive arrays stay in insertion order. The display list yields the batches
-(`crates/zgui-scene/src/batch/mod.rs`); the renderer issues them.
-
-`Scene::batches()` merges the eleven primitive kinds by `(DrawOrder, PrimitiveKind)` and yields the
-longest run it can take from one of them before another kind's next primitive would have to come
-first.
-
-**What ends a batch:**
-
-| Cause | Effect |
-|---|---|
-| Another array's next primitive sorts lower. | The run stops there. |
-| A sprite batch reaches a different texture. | A draw call binds one texture. |
-| A group marker. | Never merged with anything: the renderer changes target at exactly that point. |
-| A vector composite, an external quad or a backdrop. | One at a time, each with its own bindings. |
-
-**What ends a render pass** — a pass is a run of draws into one attachment under one scissor
-rectangle, and a live one holds the command encoder mutably borrowed:
-
-| Cause | Where |
-|---|---|
-| A new damage rectangle. | The whole batch stream is replayed once per rectangle, under a different scissor. |
-| A group start. | The pool lends a target; the content draws into it. |
-| A group end. | The composite lands in whatever is beneath. |
-| A `backdrop-filter`. | `EncoderOp::Capture` copies what is beneath into a target of its own, because a fragment shader cannot read the attachment it is writing. |
-| Each blur or filter step. | Each reads one target and writes another. |
-
-This is why the frame is **planned before any pass is opened**
-(`crates/zgui-render-wgpu/src/frame/plan.rs`). The split points are exactly the operations that need
-the encoder. Planning first turns them into a value that can be read and asserted:
-
-```rust
-pub enum Segment { Encoder(EncoderOp), Pass(PlannedPass) }
+pub enum Segment { Encoder(EncoderOp), Pass(PlannedPass), Round(usize) }
 
 pub struct PlannedPass {
     pub target: TargetRef,
@@ -455,137 +434,125 @@ pub struct PlannedPass {
 ```
 
 <Callout type="info">
-One damage rectangle is one full replay of the batch stream. It is **not** a re-culled stream:
-which primitives survive a damage set was decided where the display list was built, from the
-fragments' own ink. So `FrameStats::draw_calls` rises with the number of damage rectangles, which is
-one of the reasons `MAX_DAMAGE` is 4.
+Each damage rectangle replays the whole batch stream; it is not culled again. Which primitives
+survive was decided when the display list was built. `FrameStats::draw_calls` therefore grows with
+the number of rectangles, which is why `MAX_DAMAGE` is six and not larger.
 </Callout>
+
+### Vector work inside a frame
+
+1. **`r.vectors`.** If the renderer widened this frame to full damage but the scene's passes were cut
+   to the damage, it asks the scene for `plan_uncut_passes` first. It then calls `plan()`, clears and
+   prepares round 0, before the frame's encoder exists.
+2. **`r.plan`.** The mark bins come from `Scene::mark_plan()`, or are planned again with
+   `Scene::plan_marks` when the frame was widened. `MarksScratch` is sized to the plan's pages.
+3. **`r.record`.** For each later round, the renderer submits what it has recorded, prepares that
+   round, and continues recording into a fresh encoder.
+
+### Drawing marks
+
+A [mark](/docs/architecture/paint-and-scene#marks) whose shapes are apart is painted directly, with
+one draw per payload kind it holds. A union mark is drawn through its planned bin on a
+single-channel coverage page:
+
+1. The coverage pipelines write into the bin: polylines first (keeping the largest coverage of their
+   segments), then discs, boxes and glyphs adding to it.
+2. `MarksComposite` paints the item's paint through the summed coverage.
+
+Pages are the size of the surface, so a bin is never split. Items on the shared spare page each write
+their coverage just before their own composite.
 
 ## Partial redraw
 
-Damage becomes scissor rectangles in exactly one place
-(`crates/zgui-render-wgpu/src/frame/damage.rs`):
+Damage becomes scissor rectangles in one place, `crates/zgui-render-wgpu/src/frame/damage.rs`. A
+full set becomes the whole used area; otherwise each rectangle is intersected with it and empty ones
+are dropped. The rectangles are pairwise disjoint, so no pixel is redrawn twice. When damage touches
+a `backdrop-filter`, the scissor grows to the backdrop's whole source region, so the filter reads
+this frame's pixels and not its own output from the last frame.
 
-```rust
-pub fn rects(damage: &DamageSet, used: Rect<i32, Device>) -> Vec<Rect<i32, Device>>;
-pub fn rects_covering_backdrops(
-    damage: &DamageSet,
-    used: Rect<i32, Device>,
-    backdrops: &[Rect<i32, Device>],
-) -> Vec<Rect<i32, Device>>;
-```
+A render pass clears its whole attachment or none of it, so a damage rectangle is cleared by
+**drawing over it**: `DamageClear` writes transparent with no blending under the rectangle's scissor.
 
-A full set becomes the whole of `used`. Otherwise every rectangle is intersected with `used` and the
-empties are dropped. The rectangles are pairwise disjoint on the way in and stay so, which is why no
-pixel is redrawn twice.
+Pixels outside the damage stay valid because:
 
-A backdrop reads the composed target beneath it. When damage touches a backdrop, the planner grows
-the scissor to cover that backdrop's full source region, so the filter reads pixels written by this
-frame instead of its own result from the previous frame. A backdrop that does not intersect the
-scissor is skipped before capture and costs nothing on that rectangle.
+1. the composed target outlives the frame, and every pass on it uses `PassLoad::Keep`;
+2. the scissor stops every draw of the frame, including the clear, from writing outside the
+   rectangle;
+3. the copy to the surface covers the whole target, so untouched pixels reach the screen again.
 
-**The rectangles only ever scissor the composed target.** The copy to the surface is unconditional
-and covers all of it.
+A pooled group target is different. It uses `PassLoad::Discard` on the first write of each lease
+and discards the **whole** target, so a blur fades to transparent at the edge of what the group
+painted and never reads what a previous lease left behind. A group that received no draw is not
+composited.
 
-Inside a scissored pass, the rectangle is cleared by *drawing over it*:
+The renderer widens damage to the whole surface once, at the top of `draw`, when
+`full_damage_next` is set: by a reallocated target, a change of scale or opacity, a device rebuild,
+or an acquisition result that says the compositor changed the surface. A frame with empty damage, no
+pending shift and nothing owed to the surface returns `Skipped(Undamaged)` **before acquiring
+anything**.
 
-```rust
-pub enum PlannedDraw { Clear, Batch(Batch), /* … */ }
-```
+### The persistent target
 
-A render pass clears its whole attachment or none of it — there is no scissored clear operation. So
-`DamageClear` draws one full-target triangle strip with the scissor set to the rectangle, writing
-transparent with no blend. That single draw is what makes "redraw only what changed" a mechanism
-rather than a description.
+Each frame is composed into a texture the renderer keeps, and then the whole texture is copied onto
+the surface (`crates/zgui-render-wgpu/src/target/scene_texture.rs`). Both halves are required. An
+acquired surface texture starts uninitialised, so partial redraw needs a target that outlives the
+frame, and copying **all** of it keeps the undamaged pixels from coming out black.
 
-Pixels outside the damage stay valid for three reasons, in order:
+The target is allocated in 256-pixel **size classes** (`SIZE_CLASS`). During an interactive resize,
+growing costs a few allocations and shrinking costs none; `SceneTexture::used` is the part the
+surface occupies.
 
-<Steps>
+A size change alone keeps the composed picture when the target still fits. In that case
+`composed_survives_configure()` is true, and the runtime damages only the right and bottom bands the
+new extent exposes, plus whatever layout moved. A change of scale or opacity, or a reallocated
+target, makes the next frame full.
 
-<Step>
+### Shifting a composed scrollport
 
-The composed target outlives the frame, and every pass on it uses `PassLoad::Keep`. Nothing clears
-it wholesale.
+The runtime calls `shift_composed` with a `ScrollShift` only after it has checked that the shift is
+safe: the port moved rigidly by whole device pixels, nothing else draws over it, and it is opaque.
+The port is measured where it stands on the device (the scroll container's padding box minus its
+scrollbar gutter), not in the container's own coordinates. See
+[Scrolling](/docs/building/scrolling) for the conditions the runtime checks.
 
-</Step>
-
-<Step>
-
-The scissor admits only the damage rectangle, so no draw of this frame can write outside it — not
-the clear, and not any batch.
-
-</Step>
-
-<Step>
-
-The copy to the surface covers the whole target, so the untouched pixels reach the screen again
-unchanged.
-
-</Step>
-
-</Steps>
-
-A target lent from the pool for an isolated group is different: it uses `PassLoad::Discard` on the
-first write of each lease, and discards the **whole** target rather than the region. That is what
-makes a blur bleed towards transparent at the edge of what the group painted, and what stops a
-filter reading whatever the previous lease left outside its region.
-
-The renderer tracks whether the lease received a draw. It does not composite an empty group. This
-check prevents an unwritten pooled target from contributing pixels left by its previous lease.
-
-The renderer widens damage to everything exactly once, at the top of `draw`, when
-`full_damage_next` is set — by a reallocated target, by a `configure` that changed anything
-including the scale factor, or by a surface answer that says the compositor changed something
-nothing observed.
+The copy is recorded, not performed immediately, and runs in the frame's own encoder before any
+damage is redrawn. Source and destination usually overlap, so it goes through a scratch texture that
+is allocated on first use and released by the idle trim. The bands the move exposes are added to the
+damage and redrawn by the ordinary partial-redraw path.
 
 ## Present
 
-The swap chain is the queue of images the compositor takes finished frames from. Its maximum frame
-latency is fixed, but its presentation mode follows the platform's pacing contract
-(`crates/zgui-render-wgpu/src/gpu/surface.rs`):
+The present mode follows the surface's pacing (`crates/zgui-render-wgpu/src/gpu/surface.rs`; see
+[the platform layer](/docs/architecture/platform-layer) for `PresentPacing`):
 
-```rust
-pub const FRAME_LATENCY: u32 = 2;
+| `PresentPacing` | Mode | Who paces |
+|---|---|---|
+| `Display` | `Fifo` | Surface acquisition blocks until the display frees an image. |
+| `Platform` | `Mailbox`, else `Immediate`, else `Fifo` | Compositor frame callbacks (for example native Wayland). `Mailbox` and `Immediate` keep acquisition non-blocking; `Fifo` works but can add a second wait. |
 
-pub fn present_mode(
-    pacing: PresentPacing,
-    capabilities: &wgpu::SurfaceCapabilities,
-) -> wgpu::PresentMode;
-```
+`FRAME_LATENCY` is 2: one image being composited and one being drawn (wgpu-hal turns this into three
+swap-chain images). `acquire_block()` reports how long the last acquisition waited. On a
+display-paced surface, the runtime uses it to start later frames closer to the next refresh, keeping
+a margin of one sixth of the refresh interval, clamped to 500 µs–2 ms. On a platform-paced surface,
+acquisition does not wait, so the hold converges to zero. Every field of
+`wgpu::SurfaceConfiguration` is set explicitly.
 
-`PresentPacing::Display` selects `Fifo`: surface acquisition waits for the display, and that wait
-paces the frame loop. `PresentPacing::Platform` selects `Mailbox` when available, then `Immediate`.
-Those modes do not add a display wait to a backend that already schedules frames from compositor
-callbacks. If neither is available, it falls back to `Fifo`; this remains correct, but can add
-latency because both layers pace the frame.
+The order inside `draw` (`crates/zgui-render-wgpu/src/renderer/draw.rs`):
 
-Two is one image being composited and one being drawn; wgpu-hal turns
-`desired_maximum_frame_latency: 2` into three swap-chain images (`docs/perf/present.md`).
+1. Configure the surface if needed, recover a lost device, widen damage, and return `Undamaged` if
+   there is nothing to do.
+2. Prepare side tables and stage effect parameters (`r.tables`), rasterise round 0 of the vector plan
+   (`r.vectors`), and plan the frame (`r.plan`).
+3. Create the encoder (`r.encoder`), apply a pending scroll shift (`r.shift`), upload buffers
+   (`r.buffers`), and record every pass (`r.record`), submitting between vector rounds.
+4. Rebuild the swap chain if owed. The rebuild waits for the device to go idle, and the frame's CPU
+   work has just given it time to.
+5. Acquire a surface texture (`acq.in`), blit the composed target onto it (a four-vertex strip, one
+   `textureLoad` per fragment), submit once (`sub.out`), and present (`pres.out`).
 
-`acquire_block()` reports how long the last frame waited for a swap-chain image. On a display-paced
-surface, the runtime uses that observation to hold a later requested frame until closer to the next
-presentation. On a platform-paced surface, acquisition normally returns without waiting, so this
-servo converges to no additional hold. The backend's frame callback remains the cadence source.
+### Surface acquisition
 
-The pacing margin is one sixth of the refresh interval, clamped to 500 µs through 2 ms. This keeps
-the margin proportional on fast displays without removing the measured safety margin on slower
-ones.
-
-Every field of `wgpu::SurfaceConfiguration` is written explicitly, because wgpu's defaults for the
-format and the alpha mode are "whatever the driver listed first" and "work it out later".
-
-The order inside `draw` matters (`crates/zgui-render-wgpu/src/renderer/draw.rs`):
-
-1. Every pass is recorded into one command encoder labelled `zgui.frame`.
-2. `presentation.apply_pending()` rebuilds the swap chain **here** if one is owed. The rebuild waits
-   for the device to go completely idle, and the frame's CPU work has just given it that time.
-3. `present::acquire` asks for a surface texture.
-4. If one came back, `blit` copies the composed target onto it — a four-vertex triangle strip, one
-   `textureLoad` per fragment, no sampler and no blend.
-5. `queue.submit` once, then `texture.present()`.
-
-Acquisition has seven answers, each with a fixed response
-(`crates/zgui-render-wgpu/src/target/acquire.rs`):
+Acquisition has seven answers (`crates/zgui-render-wgpu/src/target/acquire.rs`):
 
 | Answer | Presents | Reconfigure | Recreate surface | Full damage next |
 |---|---|---|---|---|
@@ -597,187 +564,131 @@ Acquisition has seven answers, each with a fixed response
 | `Lost` | | yes | **yes** | **yes** |
 | `Validation` | | | | |
 
-A suboptimal texture is presented and the surface reconfigured afterwards: dropping it drops a frame
-the user would have seen, and the condition corrects itself at the next configuration. An outdated
-one is not retried inside the same frame, because the recorded work is sized for the surface that
-went away. A run of `Validation` answers escalates to a device loss, and the next frame rebuilds
-adapter, device, presentation, pipelines, composed target, buffers and atlas textures in that order.
-Nothing on the old device survives. Paint records remain on the CPU and are re-announced to the new
-chunk store, so their six instanced lanes become resident again when they are next drawn. The vector
-rasteriser is dropped rather than carried over.
+- **Suboptimal.** The texture is presented and the surface reconfigured afterwards, so the user does
+  not lose a frame.
+- **Outdated.** Not retried in the same frame, because the recorded work was sized for the old
+  surface.
+- **Validation.** A run of these answers escalates to a device loss. The next frame rebuilds the
+  adapter, device, presentation, pipelines, composed target, buffers and atlas textures. Paint
+  records stay on the CPU and are re-noted, so the next drawn frame makes them resident again in one
+  pass. The vector rasteriser is dropped and rebuilt lazily.
+- **Timeout.** The window is marked **starved**. Animation, caret and frame-callback deadlines stop,
+  so a blocking acquisition cannot stall the input thread repeatedly. zgui probes after 1 second,
+  doubling up to 16 seconds. Input, focus gain, resize, a scale change or becoming visible clears the
+  state. Timers keep running.
 
-A timeout latches the window as **starved**. Animation, caret, and frame-callback deadlines stop,
-so repeated blocking acquisitions cannot stall the input thread. zgui probes after 1 second and
-doubles the delay up to 16 seconds while timeouts continue. Input, focus gain, resize, scale change,
-or an unoccluded event clears the latch immediately. Timers still run while starved; they can update
-state without forcing repeated presentation attempts.
-
-`ZGUI_SURFACE_FAULT=<answer>[,n]` injects any of the seven, because six of them do not happen on
-demand.
+`ZGUI_SURFACE_FAULT=<answer>[,n]` injects any of the seven answers for testing.
 
 ## Atlases
 
-An atlas is one large texture holding many small rasterised images side by side, so that a page of
-text costs one texture binding rather than one per letter. `zgui-atlas` is the whole policy — where
-a tile goes, how long it stays, when its space comes back — and there is no GPU in that crate.
+An atlas is a large texture holding many small rasters, so a page of text binds one texture instead
+of one per glyph. `zgui-atlas` holds the whole policy (placement, lifetime, eviction) and has no GPU
+dependency.
 
-One `ContentCache` per window holds **one** atlas for glyphs and images together
-(`crates/zgui-paint/src/content/cache.rs`). They compete for the same texture memory, and a budget
-split in advance is a budget wrong in one direction or the other.
+One `ContentCache` per window holds **one** atlas for glyphs, vector masks, path glyph cells,
+images and CPU vector layers, so they share one memory budget. It has four pools:
 
-Inside it are four pools, one per `TextureKind`:
+| `TextureKind` | Format | Holds | Sampled |
+|---|---|---|---|
+| `Mono` | `R8Unorm` | Glyph coverage, atlas vector masks, path glyph cells. | nearest |
+| `Subpixel` | `Rgba8Unorm` | Per-channel glyph coverage. | nearest |
+| `Color` | `Rgba8Unorm` | Colour glyphs and emoji, premultiplied. | nearest |
+| `Image` | `Rgba8Unorm` | Decoded images and CPU vector layers, premultiplied. | linear, mipmapped |
 
-| Kind | Format | Holds |
-|---|---|---|
-| `Mono` | `R8Unorm` | Single-channel glyph coverage. |
-| `Subpixel` | `Rgba8Unorm` | Per-channel glyph coverage. |
-| `Color` | `Rgba8Unorm` | Colour glyphs, premultiplied and sampled without image filtering. |
-| `Image` | `Rgba8Unorm` | Decoded images, premultiplied and sampled with linear filtering. |
+Formats are fixed rather than following the surface: no channel swizzle on upload, and one byte per
+coverage texel keeps text uploads small. Glyph pools use nearest sampling because a glyph is
+rasterised at its drawn size; the image pool filters because images are stretched.
 
-`Subpixel`, `Color`, and `Image` share a format. `Subpixel` uses a different pipeline. `Color` and
-`Image` use different samplers: exact-size glyph rasters must stay sharp, while images need filtered
-scaling. The formats are fixed rather than following the surface: a surface-following colour format
-would need a channel swizzle on every upload, and pinning coverage to one byte per texel keeps a
-text-heavy frame's upload volume down by a factor of four.
+`AtlasKey::new(handle, kind)` is opaque. A glyph's handle hashes face, glyph id, size and subpixel
+phase; other caches create handles in their own namespace.
 
-The key is opaque:
+### Allocation and eviction
 
-```rust
-pub struct AtlasKey { /* kind: TextureKind, handle: u64 */ }
-impl AtlasKey { pub const fn new(handle: u64, kind: TextureKind) -> Self; }
-```
-
-A closed `Glyph | Svg | Image` enum would make the atlas's taxonomy the whole world's. A glyph's
-handle is a hash of face, glyph id, size and subpixel phase; an image's is a hash of source identity
-and decode size.
-
-### Allocation
-
-Each pool packs tiles with `etagere::BucketedAtlasAllocator` — shelf-and-bucket packing, one
-allocator per texture (`crates/zgui-atlas/src/atlas/pool.rs`).
-
-- Existing textures are tried **newest first**: the most likely to have contiguous room left.
-- A tile larger than `max_texture_size` on either axis is `AtlasError::TooLarge`, which evicting
-  cannot fix. No room in any texture is `AtlasError::OutOfSpace`, which it can.
-- A new texture is created at `limits.texture_extent_for(size)` and refused past
-  `max_textures_per_pool`.
-- Texture **slots are reused**, so indices stay dense and a bind group can be keyed by index.
-- `deallocate` decrements a live count, and the whole texture is destroyed when it reaches zero.
-- The allocator's rectangle is trimmed back to the requested extent, because shelf packing rounds
-  up and the slack must not be handed out as if it held content.
+Each pool packs tiles with `etagere::BucketedAtlasAllocator`, one allocator per texture, trying the
+newest texture first. A tile larger than `max_texture_size` is `AtlasError::TooLarge`. No room is
+`AtlasError::OutOfSpace`, which eviction can fix.
 
 ```rust
 pub struct AtlasLimits {
     pub texture_size: i32,          // default 1024
-    pub max_texture_size: i32,      // default 4096
+    pub max_texture_size: i32,      // default 4096; a window uses the device's limit
     pub max_textures_per_pool: u32, // default 16
-    pub soft_bytes: Option<u64>,    // default None
+    pub soft_bytes: Option<u64>,    // default None; a window sets ATLAS_SOFT_BYTES = 64 MiB
 }
 ```
 
-4096 is the conservative default. A window replaces `max_texture_size` with the current device's
-reported limit. Image decoding uses that effective limit, less the atlas padding.
+An image variant with a long edge above 512 pixels, or a CPU vector layer above 1024, gets a
+standalone texture with a full mip chain in the same pool.
 
-Small image variants use ordinary tiles in the `Image` pool. A variant with a long edge above 512
-pixels gets a standalone texture and a complete mip chain. It still uses the same pool and image
-sampler; standalone storage lets the GPU select a suitable level when the picture is minified.
-
-### The soft limit and eviction
-
-`soft_bytes` is a level the atlas returns *below* between frames, not a ceiling an allocation is
-refused at. A frame is allowed to exceed it — everything one frame draws is hot — and the excess
-comes back out of the cold generations afterwards. A window installs it at
-`crates/zgui-runtime/src/window/mod.rs`:
-
-```rust
-pub const ATLAS_SOFT_BYTES: u64 = 64 * 1024 * 1024;
-```
-
-Eviction is by **generation**. `Atlas::begin_frame` increments a generation counter and starts a new
-epoch of the use bitset, which empties it in one increment. Every lookup during the frame stamps its
-entry with the current generation.
-
-| Method | Frees |
-|---|---|
-| `evict_least_recently_used` | Exactly the entries sharing the *oldest* generation that are unreferenced and untouched this frame. |
-| `evict_all_unused` | Every unreferenced entry. |
-| `evict_to_soft_limit` | Steps of the first until resident bytes fall below `soft_bytes`. Does nothing when it is `None`. |
-
-`evict_to_soft_limit` stops the moment a step frees nothing: everything left is either held or in
-this frame's working set, so a frame whose working set exceeds the limit stays over it rather than
-evicting what it is about to draw. Resident bytes only fall when a whole texture empties, so one
-step may free many tiles and zero bytes.
-
-Reference counts hold a tile against eviction and saturate rather than wrap. What takes them is the
-paint stage's replay record: a replayed chunk re-emits instances that already
-carry their texture rectangle, so nothing on that path asks the atlas for anything.
+`soft_bytes` is a level the atlas returns *below* between frames, not a ceiling: everything one frame
+draws is in use and may exceed it. Eviction is by **generation**. `Atlas::begin_frame` starts a new
+generation, every lookup stamps its entry, and `evict_to_soft_limit` frees the oldest unreferenced
+generations until resident bytes drop below the level. It stops when a step frees nothing, so a
+frame whose working set exceeds the limit keeps it. A paint record's replay holds reference counts
+on its tiles, so a replayed chunk keeps its texels without looking them up again.
 
 ### The upload path
 
-Uploads are **deferred**. `get_or_insert` allocates, calls `build()` only on a miss, verifies the
-byte count against the format, and queues a pending upload. Nothing reaches a device until
-`flush_uploads`.
+Uploads are deferred. `get_or_insert` allocates, calls `build()` only on a miss, checks the byte
+count, and queues the write. Nothing reaches the device until `flush_uploads`.
 
 ```rust
 pub trait TextureSink {
     fn create_texture(&mut self, texture: TextureId, size: Size<i32, Device>,
                       format: TextureFormat) -> Result<(), SinkError>;
+    fn create_texture_with_mips(/* … */) -> Result<(), SinkError>;   // defaulted
     fn begin_uploads(&mut self) -> Result<(), SinkError> { Ok(()) }
     fn write_texture(&mut self, texture: TextureId, bounds: Rect<i32, Device>,
                      format: TextureFormat, bytes: &[u8]) -> Result<(), SinkError>;
+    fn write_texture_mip(/* … */) -> Result<(), SinkError>;          // defaulted
     fn finish_uploads(&mut self) {}
     fn destroy_texture(&mut self, texture: TextureId);
 }
 ```
 
-An implementation may rely on the call order: a texture is created before anything is written to it,
-every write lies inside the created size, `create_texture` is called at most once per `TextureId`,
-and nothing is written to a destroyed texture. `MemorySink` implements the trait over a `Vec<u8>`,
-so the whole policy is exercised in a unit test with no adapter and no window.
-
-The device side is `AtlasTextures` (`crates/zgui-render-wgpu/src/atlas_backend/sink.rs`), reached
-through `Renderer::texture_sink()`. It builds one texture and one bind group per `TextureId`, all
-read through one sampler with `Nearest` filtering and `ClampToEdge` addressing — a tile is
-rasterised at the size it is drawn at, so filtering would blur a glyph and, at a tile's edge, sample
-its neighbour. Its upload boundaries combine pending writes into reusable staging storage and one
-queue submission. A non-device sink can keep the default empty boundary methods.
+A sink may rely on the call order: create before write, writes inside the created size,
+`create_texture` once per id, nothing written after destroy. `MemorySink` implements the trait over
+a `Vec<u8>` for unit tests. The device side is `AtlasTextures`
+(`crates/zgui-render-wgpu/src/atlas_backend/sink.rs`), reached through `Renderer::texture_sink()`.
 
 <Callout type="warn">
-The order in the frame is load-bearing. Tiles are allocated **while the emit walk runs** and
-uploaded in one batch afterwards; the frame loop calls `ContentCache::flush(renderer.texture_sink())`
-between emitting and drawing (`crates/zgui-runtime/src/window/frame.rs`). Drawing before the flush
-samples texels that were never written, which on most devices is not a blank glyph but whatever the
-texture held before.
+Tiles are allocated while the emit walk runs and uploaded in one batch afterwards: the frame calls
+`ContentCache::flush(renderer.texture_sink())` between emitting and drawing
+(`crates/zgui-runtime/src/window/frame.rs`). Drawing before the flush samples texels that were never
+written, which on most devices shows stale texture contents rather than a blank glyph.
 </Callout>
 
 ## How each feature is drawn
 
 | Feature | Mechanism |
 |---|---|
-| Solid fill | One `Quad` instance. `PaintRef` is eight bytes carrying the paint family beside the index, so a solid fill never reads the stop storage at all (`shader/paint.wgsl`). |
-| Rounded corners | A signed distance function — one expression giving the distance from a pixel to the shape's boundary, negative inside — with the corner radii picked by the quadrant the pixel lies in. Each corner carries **two** elliptical semi-axes rather than a scalar radius, so `border-radius: 80px / 20px` is expressible; the circular case is kept as an exact fast path. Coverage is `saturate(0.5 - distance)`, so an edge is antialiased over one pixel. |
-| Gradient | Evaluated per fragment. `gradient_position` gives the ramp coordinate for linear, radial and conic; `sample_ramp` walks the stops. Stops are converted into the ramp's own interpolation space on the CPU and premultiplied; `decode_stop` converts back, which is what stops a ramp to transparent turning black through its middle. Oklab stays Oklab. |
-| Border | The same instance as its fill. An inner signed distance is taken against the box shrunk by each side's own width, and the border colour is composited over the background inside the shell. |
-| Dashed and dotted border | Dashes are laid out clockwise around the whole perimeter, in dash space where one period has length one. Dash size is proportional to border width. Each corner's arc length is a Ramanujan quarter-ellipse perimeter, and position along it is the eccentric anomaly, so a dash does not stretch at a corner. |
-| Outer shadow | One `Shadow` instance, drawn analytically: a closed-form horizontal integral of a Gaussian using an `erf` approximation, accumulated over four vertical samples. `Shadow::BLUR_EXTENT = 3.0` — the Gaussian is below one thousandth at three standard deviations, under half a level at eight bits per channel. |
-| Inset shadow | The same shader and the complement of the same integral. `bounds` is the casting box itself rather than a dilated one, and `inset` is 1. |
-| Text and custom glyph runs | A `MonoSprite` or `SubpixelSprite` per glyph run, reading a coverage tile from the atlas. Coverage is contrast-enhanced and gamma-corrected before it multiplies the colour, with the correction stronger for light text on a dark background. The instance's colour is premultiplied and gamma-encoded. |
-| Underline, overline, strikethrough | One `Decoration` primitive with a style: `Solid`, `Wavy`, `Dashed`, `Dotted` or `Double`. Only the rectangle differs between the three positions. |
-| Image | A `ColorSprite` reading a premultiplied tile, with elliptical corner radii for the clip and a grayscale flag. |
-| Opacity group | The paint stage decides. When no two primitives in the subtree overlap, the alpha is **folded** into each primitive's own paint for identical pixels and no target at all. Otherwise the group marker leases a pool target, the content draws into it, and `Composite` multiplies the whole result by the group's alpha. |
-| Filter chain | `Chain::of` folds consecutive per-pixel functions into one colour matrix — exact, because each is an affine map on colour. A blur does not commute with an affine map, so the steps stay in written order. `split()` hands the trailing matrix to the composite, which costs nothing extra. |
-| Blur | A 2:1 downsample, then two separable Gaussian axis passes. Half resolution is four times less work. Beyond `BlurParams::MAX_TAPS = 16.0` the taps spread out rather than the kernel being cut short. Every extent and scale is explicit rather than derived from the viewport, so a blur anchored to moving content does not shift its sampling lattice by a pixel per frame. |
-| Drop-shadow filter | A blurred copy of the group, composited with `COMPOSITE_TINT`: the sampled colour is replaced by a flat colour scaled by its alpha, displaced by the offset the params carry. |
-| `backdrop-filter` | `EncoderOp::Capture` copies the region beneath the element into a lent target, the chain runs over that, and the result composites back. |
-| Clipping | Every pipeline drawing into the composed target calls one `clip_coverage` function, so one clip means one thing whatever draws through it. The chain's intersection rectangle is a hard edge — antialiasing it would bleed content one pixel outside a scrollport — and at most two rounded tests are evaluated inline. A chain that needs more, or more than one mask, is reported by `ClipTable::needs_group_target` and gets a target instead. |
-| Transform | Every instance carries a `SpatialId`; `to_clip_position` multiplies the point by that slot's 4×4 matrix. Shapes are evaluated in the primitive's own space and clips in device space, at the real pixel. |
-| Isolated targets | `GroupPool`, `Rgba16Float`, budget 256 MiB. Every target covers the whole composed region at one of two resolutions, so isolated content lands at the device coordinates it would have had without isolation. There is **no depth limit**; at the memory limit the pool degrades to half resolution rather than to no isolation. |
+| Solid fill | One `Quad`. `PaintRef` carries the paint family beside the index, so a solid fill never reads gradient stops. |
+| Edges and antialiasing | Each quad measures one device pixel in its own space with derivatives and spreads its edge over that length. Edges stay one device pixel wide at every zoom, including the inner half of rounded edges and inner border corners. |
+| Rounded and superellipse corners | A signed distance function over two semi-axes per corner (so `border-radius: 80px / 20px` works) and the `--zgui-corner-shape` exponent. Exponent `2` takes the exact ellipse path. The same exponent reaches quads, shadows, clips and outlines. |
+| Border | Same instance as the fill. An inner distance against the box shrunk by each side's width selects the border colour. |
+| Dashed and dotted border | Laid out clockwise around the whole perimeter, sized by border width. Corner arc lengths use Ramanujan's quarter-ellipse perimeter and the eccentric anomaly, so dashes do not stretch at corners. |
+| Gradient | Evaluated per fragment (`gradient_position`, `sample_ramp`). Stops are converted to the ramp's interpolation space and premultiplied on the CPU; `decode_stop` converts back, so a ramp to transparent does not darken midway. |
+| Outer shadow | One `Shadow`, analytic: a closed-form `erf` integral horizontally, four samples vertically. `Shadow::BLUR_EXTENT = 3.0` standard deviations. |
+| Inset shadow | The complement of the same integral, clipped to the **padding box**. The hole is the padding box offset by the shadow's offset and shrunk by its spread, with concentric corners; a large spread closes it. |
+| Application paint or coverage shader | One `ShadedQuad`, batched by shader and parameter block. The framework supplies transform, clip and blend. Without `custom_shaders`, the built-in fallback is emitted instead. |
+| Application filter | A custom step in a group's filter chain. Its declared reach grows damage and bounds the source region. |
+| Text | One sprite per glyph, ordered as one run. `SubpixelSprite` or `MonoSprite`, as [paint chooses](/docs/architecture/paint-and-scene#primitives). Coverage is contrast-enhanced and gamma-corrected, more strongly for light text on dark. |
+| Decorations | One `Decoration` with style `Solid`, `Wavy`, `Dashed`, `Dotted` or `Double`. |
+| Image | A `ColorSprite` with elliptical corner radii and a grayscale flag. |
+| Recognised vector shapes | Analytic `Quad`s, or `Marks` drawn from a payload ([drawing marks](#drawing-marks)). |
+| CPU vector layer | A `ColorSprite` from the image pool, or one per 512-pixel tile of a large layer. |
+| Path glyphs | A mark whose glyph words read `Mono` atlas cells, sixteen sub-pixel phases per outline. |
+| General vector item | Rasterised into a scratch bin, then drawn with `VectorComposite`. |
+| Opacity group | Folded into each primitive's paint when no two primitives of the subtree overlap; otherwise a pooled target composited with the group's alpha. |
+| Filter chain | `Chain::of` folds consecutive per-pixel functions into one colour matrix. Blur breaks the fold; `split()` hands the trailing matrix to the composite. |
+| Blur | A 2:1 downsample, then two separable Gaussian passes. Past `BlurParams::MAX_TAPS = 16.0`, taps spread out rather than truncating. Extents are explicit, so a moving blur does not shift its sampling lattice. |
+| Drop-shadow filter | A blurred copy composited with `COMPOSITE_TINT` (flat colour times alpha) at the offset. |
+| `backdrop-filter` | `EncoderOp::Capture` copies the region beneath into a pooled target; the chain runs; the result composites back. |
+| Clipping | Every pipeline calls one `clip_coverage`. The chain's intersection rectangle is a hard edge (no bleed outside a scrollport); at most two rounded tests run inline. More, or more than one mask, gets a group target (`ClipTable::needs_group_target`). |
+| Transform | Each instance carries a `SpatialId`; `to_clip_position` applies that slot's matrix. Shapes are evaluated in the primitive's space, clips in device space. |
+| Isolated targets | `GroupPool`, `Rgba16Float`, 256 MiB budget, no depth limit. At the limit, the pool drops to half resolution rather than skipping isolation. A step the pool cannot serve is skipped and counted. |
 
-Where the pool cannot lend a target, the step is skipped and counted rather than faked: content one
-filter less blurred is a visible degradation, and content composited in the wrong place is not a
-degradation at all.
-
-## Writing a renderer of your own
+## Custom renderers
 
 An application replaces the renderer with a factory:
 
@@ -786,9 +697,8 @@ pub type RendererFactory =
     Box<dyn FnMut(&Arc<dyn Surface>, RenderTarget) -> Result<Box<dyn Renderer>, AppError>>;
 ```
 
-The runtime calls the factory once for each opened surface, and again for recreated surfaces after a
-platform resume. A GPU factory should keep device-level state outside the returned renderer, as
-`SharedGraphics` does. The returned renderer owns the state sized to that one window.
+The runtime calls it once per opened surface, and again for recreated surfaces after a platform
+resume. Keep device-level state outside the returned renderer, as `SharedGraphics` does.
 
 ```rust
 use zgui::prelude::*;
@@ -797,7 +707,7 @@ use zgui::render::{RenderTarget, Renderer};
 fn main() -> Result<(), zgui::Error> {
     zgui::app()
         .with_renderer(Box::new(|_surface, target: RenderTarget| {
-            // The coercion is written out, because the factory's return type is what forces it.
+            // The factory's return type forces the coercion, so write it out.
             let renderer: Box<dyn Renderer> = Box::new(MyRenderer::new(target));
             Ok(renderer)
         }))
@@ -805,129 +715,79 @@ fn main() -> Result<(), zgui::Error> {
 }
 ```
 
-The two callers that need this are the one running on a device this framework has no backend for,
-and the one running with no device at all — a test that drives the same application and asserts on
-what it drew. `crates/zgui-testkit-scene` ships `CaptureRenderer`, which records the display list as
-stable text and draws nothing; `crates/zgui-bench/src/draw.rs` has a `NullRenderer` that accepts
-every frame so a benchmark measures only the CPU.
+Two existing implementations are useful references. `CaptureRenderer` in `zgui-testkit-scene`
+records the display list as stable text and draws nothing. `NullRenderer` in
+`crates/zgui-bench/src/draw.rs` accepts every frame, so a benchmark measures only the CPU. A
+`texture_sink` that accepts every write and stores nothing is enough for a renderer that draws
+nowhere.
 
-What has to be implemented, at minimum: all eight non-defaulted methods. A `texture_sink` that
-accepts every write and holds nothing is enough for a renderer that draws nowhere.
-
-Whatever the implementation holds is reported field by field, because a rasteriser whose fixed cost
-is large and whose per-frame cost is small has a completely different budget from one the other way
-round:
+`memory()` reports by component, because fixed cost and per-frame cost are budgeted differently:
 
 ```rust
-pub struct MemoryReport {
-    pub fixed: u64,
-    pub targets: u64,
-    pub scratch: u64,
-    pub atlases: u64,
-    pub buffers: u64,
-}
+pub struct MemoryReport { pub fixed: u64, pub targets: u64, pub scratch: u64, pub atlases: u64, pub buffers: u64 }
 ```
 
-`WgpuRenderer::memory()` reports the composed target plus the group pool as `targets`, the atlas
-textures as `atlases`, and every retained instance buffer, side-table buffer, and upload-belt
-allocation as `buffers`. These figures use allocated buffer capacities, not the bytes used by the
-last frame. The vector rasterizer adds its report component by component instead of as one total.
+`WgpuRenderer` reports the composed target and group pool as `targets`, the mark pages as
+`scratch`, the atlas textures as `atlases`, and arenas, side tables and upload belts (by allocated
+capacity) as `buffers`. The vector rasteriser adds its own report component by component.
 
-The traps, in the order they are hit:
+`release_idle_resources` is called by the runtime's idle maintenance, two seconds after the last
+normal frame (see [the frame](/docs/architecture/the-frame)). `WgpuRenderer` releases unused group
+targets, the scroll scratch, completed upload chunks, persistent arenas, retained remap and table
+buffers, and the vector rasteriser's reproducible scratch. The composed target and fixed state stay.
 
-<Accordions>
-<Accordion title="Returning Skipped(Unconfigured) for the wrong reason">
-That arm keeps its damage. `DeviceUnavailable` also keeps damage because device recovery failed
-before work was recorded. Other skip reasons retire damage after submission.
-</Accordion>
-<Accordion title="Culling against damage">
-The display list already did. A primitive that reaches your `draw` reaches the damage. Culling again
-makes the pass count something only a real device can produce.
-</Accordion>
-<Accordion title="Calling batches() on an unfinished scene">
-`Scene::batches()` panics with "batches() needs a finished scene; call finish() first". The runtime
-always finishes it; a test that builds one by hand may not.
-</Accordion>
-<Accordion title="Ignoring group markers">
-`push_group` never culls and returns `DrawOrder` rather than `Option<DrawOrder>`, so the markers are
-always a matched pair. Half a pair leaves a target open or composites one that was never begun.
-</Accordion>
-<Accordion title="Composing into the surface">
-A renderer that has no target of its own must treat every frame as full. It is a legal
-implementation and it forfeits partial redraw.
-</Accordion>
-<Accordion title="Pooling targets and defaulting target_pool()">
-`TargetPoolReport::EMPTY` is the true answer only for an implementation that pools nothing. A
-window's budget asserts that every registered cache is empty after being told to forget.
-</Accordion>
-<Accordion title="Drawing an external quad against another texture">
-`ExternalQuad` is not instanced and not `Pod`. A quad naming a texture nothing registered is counted
-as undrawn, never drawn against whatever was bound.
-</Accordion>
-</Accordions>
+### Common mistakes
 
-## What it costs, measured
+| Mistake | Consequence |
+|---|---|
+| Returning a damage-keeping skip for the wrong reason | `Unconfigured`, `Unacquired` and `DeviceUnavailable` keep damage; every other skip retires it. |
+| Culling against damage | The display list already did. A primitive that reaches `draw` reaches the damage. |
+| Calling `batches()` on an unfinished scene | It panics with "batches() needs a finished scene; call finish() first". The runtime always finishes the scene; a hand-built test scene may not. |
+| Ignoring group markers | `push_group` never culls, so markers are always a matched pair. Half a pair leaves a target open or composites one that never began. |
+| Composing straight into the surface | Legal, but every frame must then be full damage. |
+| Pooling targets and leaving `target_pool()` defaulted | The budget check catches it. |
+| Drawing an external quad against another texture | A quad naming an unregistered texture is counted as undrawn, never drawn with whatever is bound. |
 
-The present path itself is not where a slow frame goes. Measured across 2 705 frames in ten runs on
-the maintainer's machine — RTX 3080 Ti, Vulkan, Hyprland/Wayland, 1080×720 surface
-(`docs/perf/present.md`, Measurement A):
+## Measured costs
+
+The present path itself is cheap. Across 2 705 frames on the maintainer's machine (RTX 3080 Ti,
+Vulkan, Hyprland, 1080×720; `docs/perf/present.md`, Measurement A):
 
 | Stage | p50 | p90 | p99 | max |
 |---|---:|---:|---:|---:|
 | `get_current_texture` | 0.028 ms | 0.101 | 12.802 | 30.808 |
 | blit and `queue.submit` | 0.175 ms | 0.323 | 0.558 | 1.811 |
 | `present` | 0.103 ms | 0.181 | 0.271 | 1.003 |
-| **the whole present path** | **0.327 ms** | 0.629 | 13.003 | 31.337 |
+| **whole present path** | **0.327 ms** | 0.629 | 13.003 | 31.337 |
 
-Every acquisition longer than 2 ms — 64 of 2 705 — came from the one run with
-`desired_maximum_frame_latency = 1`. In the nine other runs the slowest acquisition anywhere was
-0.302 ms, and `success` was the only answer recorded. Nothing waits on a fence inside a frame:
-`device.poll` appears once in the workspace, in `Gpu::wait`, called only by pixel readback.
+All 64 acquisitions over 2 ms came from the one run with `desired_maximum_frame_latency = 1`. Nothing
+waits on a fence inside a frame; `device.poll` is called only by pixel readback.
 
-The costs that scale, and what each is proportional to:
+`wgpu::Surface::configure` is a full GPU idle wait (2.4 ms on `counter`, 8.0 ms on `styled`). It
+scales with in-flight work, not window size, which is why the rebuild is deferred to just before
+acquisition and skipped when the extent did not change.
 
-| Cost | Proportional to |
+| Cost | Grows with |
 |---|---|
-| Draw calls | Batches, times the number of damage rectangles. |
-| `damage_px` | The area of the damage rectangles clipped to the surface. |
-| `bytes_uploaded` | Tiles that missed the atlas, new or transient primitive bytes, changed remaps, and changed side-table ranges. Resident zero-offset replays add no primitive bytes. |
-| `side_table_slots_prepared` | Clip, paint, stop and coordinate-system slots flattened again on the CPU. |
-| `upload_chunks_allocated` | Staging chunks allocated because no completed reusable chunk could fit the frame. |
-| Pool memory | What the document nests, not what it draws. Unused targets are released after two seconds without a normal frame. |
-| Vector passes | The non-atlas vector plan the display list made, never re-derived here. |
-
-Two seconds after the last normal frame, a maintenance-only deadline releases unused group targets,
-scroll-shift scratch, completed upload chunks, persistent primitive arenas, retained remap and table
-buffers, and reproducible vector scratch. It does not lay out, paint, draw, or present. The composed
-target and fixed renderer state stay live. Retained CPU paint chunks restore GPU residence when
-drawing resumes.
-
-A frame with an empty damage set returns `Skipped(SkipReason::Undamaged)` **before acquiring
-anything**, and `wants_another_frame()` is false. `docs/performance.md` records `idle.frames` at
-0.00 against a ceiling of 0.00: a still document draws nothing at all.
-
-`wgpu::Surface::configure` is a full GPU idle wait, measured at 2.4 ms on `counter` and 8.0 ms on
-`styled` at the same 1080×720 surface (`docs/perf/present.md`). It scales with in-flight GPU work
-rather than with window size, which is why the rebuild is deferred to just before acquisition and
-why `ConfiguredSurface::resize` skips an extent it is already at.
-
-<Callout type="idea">
-`ZGUI_FULL_DAMAGE=1` is the first thing to try when a visual artefact is reported. If the artefact
-disappears, the bug is a rectangle somebody under-reported, not a shader.
-</Callout>
+| Draw calls | Batches × damage rectangles. |
+| `damage_px` | Area of the damage rectangles clipped to the surface. |
+| `bytes_uploaded` | Atlas misses, new or transient primitive bytes, mark payloads, changed remaps and side-table ranges. Replays upload nothing, moved or not. |
+| Vector passes | The general vector plan; rounds only when the passes exceed one scratch capacity. |
+| Mark bins | Union marks that reach the damage (`MarksUnionBins`). |
+| Pool memory | What the document nests, not what it draws. |
 
 ## Next
 
 <Cards>
   <Card
-    title="The platform layer"
-    href="/docs/architecture/platform-layer"
-    description="Surface, AppHandler, Clock, Waker and Clipboard; the native Wayland, portable and headless backends."
+    title="Paint and the scene"
+    href="/docs/architecture/paint-and-scene"
+    description="How fragments become a display list, how vector content is routed, and how passes are planned."
   />
   <Card
-    title="The crate map"
-    href="/docs/architecture/crate-map"
-    description="Every crate, its layer, and the rule that keeps the arrows pointing one way."
+    title="The platform layer"
+    href="/docs/architecture/platform-layer"
+    description="The platform contract and the native Wayland, winit, headless and console backends."
   />
   <Card
     title="Caches"
@@ -935,8 +795,8 @@ disappears, the bug is a rectangle somebody under-reported, not a shader.
     description="Every cache in the pipeline, what invalidates it, and what a miss costs."
   />
   <Card
-    title="Cost model"
-    href="/docs/performance/cost-model"
-    description="What each kind of change costs across the whole pipeline, measured."
+    title="Vector and canvas"
+    href="/docs/building/vector-and-canvas"
+    description="Drawing icons, documents and canvas scenes from an application."
   />
 </Cards>

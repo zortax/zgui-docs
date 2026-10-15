@@ -1,13 +1,16 @@
 ---
 title: Your first application
-description: A counter, taken apart line by line — the component, the signal, the view, the style sheet and the entry point.
+description: Build a counter step by step — the component, the signal, the view, the style sheet, and the entry point.
 ---
 
-This page builds one small application and explains every line of it. It introduces terms the rest
-of the guide uses. Nothing here needs the [previous page](/docs/getting-started/what-zgui-is), but
-it helps.
+In this tutorial you build a small counter with two buttons, then walk through it piece by piece.
+Along the way you meet the ideas the rest of the guide builds on: components, signals, views, and
+reactive holes.
 
-## The finished thing
+## The complete program
+
+Replace `src/main.rs` in the project from [Installation](/docs/getting-started/installation) with
+this:
 
 ```rust title="src/main.rs"
 use zgui::prelude::*;
@@ -99,62 +102,56 @@ fn main() -> Result<(), zgui::Error> {
 }
 ```
 
-`cargo run` opens a window with a number and two buttons. Now take it apart.
+Run it with `cargo run`. A window opens with a number and two buttons that change it. The sections
+below explain the program from top to bottom.
 
-## The import
+## Import the prelude
 
 ```rust
 use zgui::prelude::*;
 ```
 
-One import brings in everything an interface is written with: the reactive primitives, the
-authoring macros, the element attribute types, the event vocabulary, the control flow and the
-application entry point.
+The prelude brings in everything you need to write an interface: reactive primitives, the
+`view!`, `component`, and `css!` macros, attribute and event types, control flow, and the `app()`
+entry point.
 
-Reading and writing a signal are **trait** methods, not inherent ones, so those traits have to be
-in scope. That is the main reason the prelude exists. Every name in it is also reachable at its own
-path if you prefer to import what you use.
+Reading and writing a signal are trait methods, so those traits must be in scope. That is the main
+reason to import the prelude. Every name in it is also available at its own path.
 
-## The component
+## Define a component
 
 ```rust
 #[component]
 fn Counter() -> impl IntoView {
 ```
 
-`#[component]` turns a function into a component. A component is a plain Rust function that builds
-a piece of the interface and returns it. The name must start with a capital letter.
+`#[component]` turns a function into a component: a plain function that builds part of the
+interface and returns it. Component names start with a capital letter.
 
-`impl IntoView` is what every view already satisfies — a string, a number, a tuple, an `Option`, a
-closure, an element, or the result of a `view!` block.
+`impl IntoView` covers anything that can be shown: a string, a number, a tuple, an `Option`, a
+closure, an element, or a `view!` block.
 
-**The function runs once.** This is the single most important rule in the framework. `Counter()` is
-called one time, when the interface is built. It is never called again, no matter how many times
-the count changes. Everything that has to change later changes through a signal.
+**A component runs once.** `Counter()` is called when the interface is built and never again,
+however often the count changes. Anything that changes later changes through a signal.
 
-## The state
+## Create state with a signal
 
 ```rust
 let (count, set_count) = signal(0);
 ```
 
-`signal(0)` creates a piece of state and hands back two halves: a reader and a writer.
+`signal(0)` creates state and returns two handles: a reader and a writer.
 
-A **signal** is a value that remembers what read it. When you read `count` inside a closure that
-the framework is watching, the framework records that this closure depends on `count`. When you
-write a new value through `set_count`, every closure that read `count` runs again. Nothing else in
-the window is touched.
-
-This is why a component can run once. The component builds the structure; the signals update the
-parts that vary.
+When a closure that zgui is tracking reads `count`, zgui records the dependency. When you write
+through `set_count`, every closure that read `count` runs again. Nothing else in the window is
+touched.
 
 <Callout type="info">
-`RwSignal::new(0)` is the same thing with the reader and the writer in one handle. Use whichever
-reads better. A split pair is useful when you hand the writer to one place and the reader to
-another.
+`RwSignal::new(0)` is the same signal with both halves in one handle. A split pair is useful when
+you pass the writer and the reader to different places.
 </Callout>
 
-## The view
+## Describe the interface
 
 ```rust
 view! {
@@ -165,16 +162,14 @@ view! {
 }
 ```
 
-`view!` describes part of the document. The grammar is a **call and a block**:
+`view!` describes part of the document. Each node is a **call with a block**:
 
-- a name — `column`, `text`, `control` — which is an element or a component;
-- an attribute list in parentheses, comma-separated, each attribute written `name = value`;
-- a block of children in braces.
+- a name, such as `column` or `control`, which is an element or a component;
+- attributes in parentheses, comma-separated, written `name = value`;
+- children in braces.
 
-Either the parentheses or the block may be left out, but not both.
-
-Children are written one after another with no separator. A child is a string literal, a braced
-expression, or another call.
+You can leave out the parentheses or the block, but not both. Children follow each other with no
+separator. A child is a string literal, a braced expression, or another call.
 
 ```rust
 column(class = "a") {          // attributes and children
@@ -183,93 +178,80 @@ column(class = "a") {          // attributes and children
 }
 ```
 
-### The elements
+### Built-in elements
 
-`column`, `row`, `text`, `label` and `control` are four of the sixteen element names zgui defines.
-They mean what they say, and each has its layout before you write a single CSS rule:
+zgui has sixteen built-in elements. This program uses five, and each has a default layout:
 
-| Name | What it is | Laid out as |
+| Name | What it is | Default layout |
 |---|---|---|
-| `column` | children stacked top to bottom | a vertical flex container |
-| `row` | children in a line, left to right | a horizontal flex container |
+| `column` | children stacked top to bottom | vertical flex container |
+| `row` | children in a line | horizontal flex container |
 | `text` | a run of text | inline |
 | `label` | text that names something else | inline |
-| `control` | something the user operates | a block |
+| `control` | something the user operates; focusable | block |
 
-There is no `div`. A container that means nothing in particular is called `box`. The full list is
-in [The element vocabulary](/docs/learn/elements).
+There is no `div`. A generic container is `box`. The full list is in
+[Elements](/docs/learn/elements).
 
-### The reactive part
+### Show a changing value
 
 ```rust
 text(class = "counter__value") {{move || count.get().to_string()}}
 ```
 
-The doubled braces are not a typo. The outer pair is the children block. The inner pair is a braced
-expression child. The expression is a closure.
+The double braces are intentional. The outer pair is the children block. The inner pair is an
+expression child, and the expression is a closure.
 
-**A closure child is a reactive hole.** The framework runs it once to get the first text, and runs
-it again whenever anything it read has changed — writing only the text node, not the element and
-not its siblings.
-
-Compare:
+**A closure child is a reactive hole.** zgui runs it once for the initial text, and again whenever
+something it read changes. Only the text node is updated, not the element or its siblings.
 
 ```rust
-text {{move || count.get().to_string()}}   // updates for ever
-text {{count.get().to_string()}}           // written once, never again
+text {{move || count.get().to_string()}}   // updates whenever count changes
+text {{count.get().to_string()}}           // written once, never updated
 ```
 
-Both compile. The difference is the type of the expression: a closure is reactive, a `String` is
-not. There is no keyword and no attribute that marks one as dynamic — it is decided by what you
-pass.
+Both compile. A closure is reactive; a plain `String` is not.
 
 <Callout type="warn">
-Forgetting `move ||` is the most common mistake in the framework. The interface renders correctly
-once and then never changes, with nothing to see in a debugger.
+Forgetting `move ||` is the most common mistake. The interface renders correctly once and then
+never changes.
 </Callout>
 
-### The listener
+### Handle a click
 
 ```rust
 control(on:click = move |_| set_count.update(|n| *n += 1)) { "+" }
 ```
 
-`on:click` attaches a listener. The `on:` prefix is a namespace: everything after it is an event
-name. The closure's argument type is inferred from that name, so a click handler receives a click
-payload with no downcast anywhere.
+`on:click` attaches a listener. The text after `on:` is the event name, and the closure's argument
+type is inferred from it.
 
-`set_count.update(|n| *n += 1)` mutates the value in place. `set_count.set(5)` replaces it.
+`set_count.update(|n| *n += 1)` changes the value in place. `set_count.set(5)` replaces it.
 
-The write does not take effect immediately. Writing a signal **marks** the closures that read it;
-the framework runs them once, later in the same frame. This means a listener can write five signals
-and cost one update pass rather than five.
+A write does not run dependent closures immediately. It marks them, and zgui runs each one once
+later in the same frame. A listener that writes five signals still causes one update pass.
 
-## The style sheet
+## Style it with CSS
 
 ```rust
 const SHEET: &str = css!(":root { ... } .counter { ... }");
 ```
 
-`css!` is a macro that takes CSS and checks its structure at compile time: an unclosed block, an
-unclosed string, a rule with no selector, a declaration with no colon. Each is a compile error that
-points at the line and column inside the sheet. It does not check property names. The macro returns
-the sheet as a `&'static str`, so it works in a `const`.
+`css!` checks the sheet's structure at compile time and reports errors at the line and column
+inside the sheet. It does not check property names. It returns a `&'static str`, so it works in a
+`const`.
 
-The CSS is ordinary CSS: selectors, the cascade, inheritance, class selectors, `:hover`, flexbox,
-grid, gradients, borders, radii and shadows.
+The CSS is ordinary CSS. Three points matter now:
 
-Three details matter now:
+- `:root` is the document root. Put the window background, base text colour, and font family
+  there; they inherit.
+- Element names are selectors. `control { ... }` styles every `control`. Your rules override
+  zgui's default sheet, so `column { flex-direction: row }` works.
+- `:hover`, `:focus`, and other states work because zgui tracks the pointer and focus itself.
 
-- `:root` selects the document root. It is where you put the window background, the base text
-  colour and the font family, all of which inherit down.
-- Element names are selectors. `control { ... }` styles every `control`. The framework's own sheet
-  already gave each element name its layout, and your rules sit above it — so
-  `column { flex-direction: row }` works and means what it says.
-- `.button:hover` works because the framework tracks the pointer and applies the state itself.
+[Styling](/docs/learn/styling) covers the full model.
 
-[Styling](/docs/learn/styling) covers the whole model.
-
-## The entry point
+## Open the window
 
 ```rust
 fn main() -> Result<(), zgui::Error> {
@@ -281,92 +263,89 @@ fn main() -> Result<(), zgui::Error> {
 }
 ```
 
-`app()` starts a builder. Each `with_*` call decides one thing about the window or the application.
-`run` opens the primary window and drives the event loop until the selected exit policy stops the
-application. On Linux and BSD it selects the native Wayland backend when a Wayland compositor is
-available, and otherwise uses winit. `ZGUI_PLATFORM=winit` or `ZGUI_PLATFORM=wayland` overrides
-that selection.
+`app()` starts a builder. `run` opens the primary window, runs the event loop, and returns when the
+application exits. The closure builds the window's root view.
 
-The closure passed to `run` builds the primary window's root view. It runs once during an ordinary
-desktop session. A platform suspension removes the window scope, and resume runs the closure again.
-
-| Call | What it sets |
-|---|---|
-| `with_title` | the window title |
-| `with_size` | the starting size, in CSS pixels |
-| `with_min_size`, `with_max_size`, `with_resizable` | the primary window's size constraints |
-| `with_decorations`, `with_transparent` | which desktop frame is used, and whether the surface has transparent pixels |
-| `with_position`, `with_maximized`, `with_fullscreen` | the primary window's requested starting state |
-| `with_level`, `with_icon`, `with_theme` | primary-window desktop integration |
-| `with_stylesheet` | the application's own sheet, at the author origin |
-| `with_application_id` | the identifier the desktop matches window rules and icons against |
-| `with_context` | state provided above every window |
-| `with_exit_policy` | when a multi-window application stops |
-| `with_fonts` | the faces to draw with, instead of the system's |
-| `with_renderer` | a drawing device of your own |
-| `run_on` | a platform other than this machine's desktop |
-
-Open more windows with `use_windows()`. See
-[Multiple windows](/docs/building/windows).
+The builder has methods for the window's size limits, position, frame, icon, and theme, and for
+application-wide settings such as fonts and shared state. They are listed in
+[Application builder methods](#application-builder-methods) below.
 
 ## What happens when you click
 
-Worth following once, because it explains the rules you have just met.
+Between your click and the new number on screen, zgui does the following:
 
 <Steps>
 
 <Step>
 
-**The platform reports a click.** The window backend hands the runtime a pointer event at a pixel.
+**The platform reports a pointer event** at a pixel position.
 
 </Step>
 
 <Step>
 
-**The framework finds what is under it.** It uses the geometry the last frame produced, and builds
-the path of elements from the root down to the target and back out.
+**zgui finds the element under it** using the geometry from the last frame, and dispatches the
+event along the path from the root to that element.
 
 </Step>
 
 <Step>
 
-**Your listener runs.** `set_count.update(...)` writes the signal. Writing marks the closures that
-read `count`. It does not run them yet.
+**Your listener runs.** `set_count.update(...)` writes the signal and marks the closures that read
+`count`.
 
 </Step>
 
 <Step>
 
-**The frame settles the reactive graph.** The marked closure runs once and writes the new string
-into the text node.
+**The marked closure runs once** and writes the new string into the text node.
 
 </Step>
 
 <Step>
 
-**The stages below service what changed.** The text node's content changed, so its paragraph is
-re-shaped and its box is re-measured. Nothing else in the document owes anything.
+**Only affected work is redone.** The changed paragraph is reshaped and its box re-measured.
+Nothing else in the document needs work.
 
 </Step>
 
 <Step>
 
-**The renderer redraws the damage.** The rectangle covering the number is redrawn. Every other
-pixel in the window is still correct from the last frame and is not touched.
+**The renderer redraws the damaged area**, the rectangle around the number. Every other pixel is
+kept from the previous frame.
 
 </Step>
 
 </Steps>
 
-## Next
+## Application builder methods
 
-Start the guide. It covers the same ground properly, beginning with the view.
+| Method | Sets |
+|---|---|
+| `with_title` | the window title |
+| `with_size` | the starting size, in CSS pixels |
+| `with_min_size`, `with_max_size`, `with_resizable` | size constraints |
+| `with_position`, `with_maximized`, `with_fullscreen` | the starting window state |
+| `with_decorations`, `with_transparent`, `with_title_buttons` | the window frame, transparency, and macOS title-bar button placement |
+| `with_level`, `with_icon`, `with_theme` | stacking level, window icon, light or dark preference |
+| `with_stylesheet` | the application's style sheet |
+| `with_application_id` | the identifier the desktop uses for icons and window rules |
+| `with_context` | state shared by every window |
+| `with_menu` | the application menu (macOS) |
+| `with_exit_policy` | when a multi-window application exits |
+| `with_fonts` | the fonts to use instead of the system's |
+| `with_style_threads`, `with_layout_threads` | worker counts for styling and layout |
+
+To open more windows, use `use_windows()`. See [Windows](/docs/building/windows).
+[Shipping](/docs/building/shipping) covers the application identifier and the menu.
+
+## Next
 
 <Cards>
   <Card
     title="Views"
     href="/docs/learn/views"
-    description="The view! grammar in full: elements, children, attributes, and what a view is as a value."
+    description="The view! grammar in full: elements, children, attributes, and views as values."
   />
   <Card
     title="Signals"

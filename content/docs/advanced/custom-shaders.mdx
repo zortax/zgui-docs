@@ -1,0 +1,302 @@
+---
+title: Custom shaders and corner shapes
+description: Write WGSL effects with shader!, bind them from CSS or a custom element, and cut squircle and other corner shapes with --zgui-corner-shape.
+---
+
+A custom shader fills, shapes, or filters a box with WGSL you write. Use one when CSS backgrounds,
+filters, and shapes cannot produce the result you want. zgui supplies the vertex stage, transform,
+clip, and blending, so you write a single function.
+
+For squircle, bevel, scoop, or notch corners you do not need a shader: see
+[Corner shapes](#corner-shapes).
+
+## A complete example
+
+This application shows a card with a highlight that follows the pointer:
+
+```rust title="src/main.rs"
+use zgui::prelude::*;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, ShaderParams)]
+struct SpotlightParams {
+    radius: f32,
+}
+
+static SPOTLIGHT: ShaderEffect<SpotlightParams> = shader! {
+    name: "spotlight",
+    mode: Paint,
+    params: SpotlightParams,
+    reads: [Pointer],
+    source: r#"
+        struct Params {
+            radius: f32,
+        }
+
+        fn shade(in: ShaderInput, params: Params) -> vec4<f32> {
+            let base = vec3<f32>(0.10, 0.12, 0.17);
+            let light = vec3<f32>(0.25, 0.45, 0.95);
+            let reach = max(params.radius * in.scale, 1.0);
+            let glow = exp(-distance(in.local, in.pointer) / reach) * in.hovered;
+            return premultiplied(mix(base, light, glow), 1.0);
+        }
+    "#,
+};
+
+#[component]
+fn Card() -> impl IntoView {
+    // Register before any style uses the name. Registering again is harmless.
+    SPOTLIGHT.register();
+
+    view! {
+        box(class = "card") {
+            label {"Move the pointer over me"}
+        }
+    }
+}
+
+const SHEET: &str = css!(
+    ":root {
+        background-color: #12141a;
+        color: #e8ecf4;
+        font-family: sans-serif;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+    .card {
+        display: flex;
+        width: 280px;
+        height: 160px;
+        align-items: center;
+        justify-content: center;
+        border-radius: 16px;
+        --zgui-shader: spotlight;
+        --spotlight-radius: 60;
+    }"
+);
+
+fn main() -> Result<(), zgui::Error> {
+    app()
+        .with_title("Spotlight")
+        .with_size(400.0, 280.0)
+        .with_stylesheet(SHEET)
+        .run(|| view! { Card() })
+}
+```
+
+- `shader!` compiles the WGSL when the application builds. WGSL syntax, type, and validation errors
+  are compile errors.
+- `mode: Paint` means the shader replaces the box's background. It runs inside the box's rounded
+  corners and clip like a normal background.
+- `reads: [Pointer]` makes zgui fill `in.pointer` and `in.hovered`, and repaint the box when the
+  pointer moves.
+- `--zgui-shader: spotlight` binds the effect to the card, and `--spotlight-radius` sets the
+  `radius` parameter.
+
+`examples/shader.rs` in the zgui repository has more: a coverage effect, a backdrop filter, CSS
+parameters, pointer input, and animation.
+
+## Declare an effect
+
+| Field | Meaning |
+|---|---|
+| `name` | The name CSS uses (required) |
+| `mode` | `Paint`, `Coverage`, or `Filter` (required); see [Modes](#modes) |
+| `params` | The Rust parameter struct; omit it for none (`ShaderEffect<NoParams>`) |
+| `reads` | `[Time]`, `[Pointer]`, or both; see [Animate or follow the pointer](#animate-or-follow-the-pointer) |
+| `reach` | For filters: how far outside the box the effect samples, in CSS pixels |
+| `source` / `path` | Inline WGSL, or a file path relative to the crate's `Cargo.toml` |
+
+**The parameter struct must match the WGSL `Params` struct.** The Rust struct must be `#[repr(C)]`,
+`Copy`, and derive `ShaderParams`. The WGSL struct must have the same field names, order, and
+widths. Fields can be `f32`, `u32`, `i32`, or short arrays of them, up to 64 bytes in total. A
+mismatch makes the effect draw nothing; call `SPOTLIGHT.validate()` in a test to catch it early.
+
+`register()` returns a `ShaderHandle`. You only need to keep it when you draw the effect from a
+custom element or set its parameters from Rust.
+
+## Modes
+
+| Mode | Function you write | Result |
+|---|---|---|
+| `Paint` | `shade(in, params) -> vec4<f32>` | Replaces the box background with a premultiplied colour |
+| `Coverage` | `coverage(in, params) -> f32` | Decides which pixels the normal background and border fill |
+| `Filter` | `apply(in, params, beneath, beneath_sampler, region) -> vec4<f32>` | Replaces the box's content or its backdrop |
+
+Paint and coverage effects cannot draw outside their box.
+
+`ShaderInput` has these fields:
+
+| Field | Meaning |
+|---|---|
+| `uv` | Position in the box, 0 to 1 on each axis |
+| `local` | Position in the box, in device pixels |
+| `size` | The box size, in device pixels |
+| `scale` | Device pixels per CSS pixel |
+| `time` | Seconds since the document started |
+| `delta` | Seconds the previous frame took |
+| `pointer` | The pointer position, in the same coordinates as `local` |
+| `hovered` | 1 while the pointer is over the box, 0 otherwise |
+
+The WGSL prelude also provides `premultiplied`, `coverage_of`, `superellipse_sdf`, `hsl`, and, for
+filters, `source_at`.
+
+## Bind an effect from CSS
+
+Register the effect before a style uses its name, then name it with one of these properties:
+
+| Property | Mode | Effect |
+|---|---|---|
+| `--zgui-shader` | `Paint` | Fills the box |
+| `--zgui-shape` | `Coverage` | Shapes the normal background and border |
+| `--zgui-filter` | `Filter` | Filters the box and its children |
+| `--zgui-backdrop-filter` | `Filter` | Filters what is drawn behind the box |
+
+Parameters are custom properties named `--<effect>-<field>`, and take a number or a length. Like
+any custom property, they can change per class or state:
+
+```css
+.card { --zgui-shader: spotlight; --spotlight-radius: 60; }
+.card--large { --spotlight-radius: 120; }
+```
+
+- CSS writes only 4-byte `f32` fields. Set integer and array fields from Rust with
+  `ShaderHandle::set_params`.
+- Unknown fields are ignored, and missing fields are zero.
+- These properties inherit. Set one to `none` on a descendant that must not use the effect.
+- When a box sets both `--zgui-shape` and `--zgui-shader`, the coverage effect wins.
+
+## Animate or follow the pointer
+
+Declare what the shader reads besides its parameters:
+
+```rust
+reads: [Time, Pointer],
+```
+
+- `Pointer`: for an effect bound from CSS, zgui fills `in.pointer` and `in.hovered` and repaints
+  the box when the pointer moves. From a custom element, set them with
+  `ShaderHandle::set_pointer(position, hovered)`.
+- `Time`: the effect uses `in.time` or `in.delta`. zgui does not schedule frames for it, so keep
+  the element repainting while it animates, for example with a `request_frame` loop that calls
+  `CustomHandle::repaint()`, as `examples/shader.rs` does.
+
+An effect that reads neither repaints only when its element or parameters change, and costs about
+as much as a background.
+
+## Write a filter
+
+A filter receives the content beneath it as a texture. Sample it with `source_at`, which clamps
+reads to the allowed region. A filter that samples outside its own box must declare how far with
+`reach`:
+
+```rust
+use zgui::shader::NoParams;
+
+static SHIFT: ShaderEffect<NoParams> = shader! {
+    name: "shift",
+    mode: Filter,
+    reach: 12.0,
+    source: r#"
+        fn apply(
+            in: ShaderInput,
+            params: Params,
+            beneath: texture_2d<f32>,
+            beneath_sampler: sampler,
+            region: FilterSource,
+        ) -> vec4<f32> {
+            let offset = vec2<f32>(12.0 * in.scale, 0.0);
+            return source_at(beneath, beneath_sampler, region, in.local - offset);
+        }
+    "#,
+};
+```
+
+zgui grows the redrawn area by the reach. If the reach is too small, a partial redraw can read
+stale pixels. A filter renders the box through an offscreen target, so it costs more than a paint
+or coverage effect.
+
+## Draw from a custom element
+
+A [custom element](/docs/advanced/custom-elements) draws a paint effect with `ScenePainter::effect`
+(from `ShaderPainterExt`, in the prelude) and a handle from `register()`:
+
+```rust
+use zgui::geom::{DevicePx, Point, Rect};
+use zgui::prelude::*;
+
+struct Glow {
+    effect: ShaderHandle<GlowParams>,
+    strength: f32,
+}
+
+impl CustomElement for Glow {
+    fn layout(&mut self, cx: &mut CustomLayoutCx<'_>) -> CustomMeasured {
+        CustomMeasured {
+            width: cx.known_width.unwrap_or(200.0 * cx.scale),
+            height: cx.known_height.unwrap_or(120.0 * cx.scale),
+            ..CustomMeasured::default()
+        }
+    }
+
+    fn paint(&mut self, painter: &mut ScenePainter<'_>) {
+        let rect = Rect::new(Point::new(DevicePx(0.0), DevicePx(0.0)), painter.size());
+        self.effect.set_params(GlowParams { strength: self.strength });
+        painter.effect(rect, 12.0 * painter.scale(), &self.effect);
+    }
+}
+
+let (glow, handle) = zgui::custom::custom(Glow {
+    effect: GLOW.register(),
+    strength: 0.7,
+});
+```
+
+Here `GLOW` is a `Paint` effect declared with `shader!` and a `GlowParams` struct with one
+`strength: f32` field.
+
+The painter reads the parameters when `paint` runs, and the element replays them until it repaints.
+After changing `strength` with `handle.update(..)`, call `handle.repaint()`.
+
+## Corner shapes
+
+`--zgui-corner-shape` changes the shape of rounded corners without a shader. Set a radius, then a
+shape:
+
+```css
+.card {
+    border-radius: 24px;
+    --zgui-corner-shape: squircle;
+}
+```
+
+The shape applies to the background, border, shadow, outline, and clip alike, and costs less than a
+coverage effect.
+
+| Value | Superellipse exponent |
+|---|---|
+| `round` or `none` | 2 (the normal elliptical corner, the default) |
+| `squircle` | 4 |
+| `bevel` | 1 |
+| `scoop` | 0.5 |
+| `notch` or `square` | 64 |
+| `superellipse(<number>)` or a bare number | That number |
+
+This is a custom property, so it inherits. Set `--zgui-corner-shape: none` on a descendant that
+should keep round corners.
+
+## Next
+
+<Cards>
+  <Card
+    title="Custom elements"
+    href="/docs/advanced/custom-elements"
+    description="Retained widgets that lay out their own children and paint with zgui's own primitives."
+  />
+  <Card
+    title="Styling"
+    href="/docs/learn/styling"
+    description="Selectors, the cascade, custom properties, and how zgui applies CSS."
+  />
+</Cards>

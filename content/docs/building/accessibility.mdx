@@ -1,48 +1,16 @@
 ---
 title: Accessibility
-description: The accessibility tree, every a11y attribute, the Role vocabulary, what the framework derives on its own, and how to test it.
+description: Give controls roles, names and keyboard access, report state, announce changes, test what screen readers see, and look up every a11y attribute and role.
 ---
 
-Some people cannot see the screen, cannot use a pointer, or cannot read small text. They operate the
-same application through a program that reads it out, magnifies it, or drives it from a keyboard.
-This page explains what that program is told, what zgui works out on its own, and what you have to
-declare. It assumes [Elements](/docs/learn/elements), [Events](/docs/learn/events) and
-[Attributes](/docs/learn/attributes).
+Screen readers, braille displays, magnifiers and automation tools cannot read pixels. They read an
+**accessibility tree** that zgui builds from your document. zgui fills in what it can observe, such
+as text, bounds, focus and click handlers. You declare what it cannot know: what each element is,
+and its state.
 
-## What an accessibility tree is
+## Make a control accessible
 
-An **assistive technology** is a program outside your application that presents the interface in
-another form. A screen reader speaks it. A braille display prints it. A magnifier follows the caret.
-An automation script clicks through it.
-
-None of them can read your pixels. A rectangle of colour does not say "this is a switch, it is
-called Wi-Fi, it is on, and pressing Space turns it off". So the operating system defines a second
-description of every window: a tree of nodes, each carrying
-
-| Part | Example |
-|---|---|
-| a **role** — what kind of thing it is | button, switch, list item, heading |
-| a **name** — what it is called | "Delete", "Wi-Fi" |
-| **state** — what it is doing right now | on, expanded, disabled, invalid |
-| **bounds** — where it is on the screen | a rectangle in CSS pixels |
-| **actions** — what it can be asked to do | click it, focus it, increment it |
-| **relations** — which other nodes it points at | "the text that names me is over there" |
-
-That tree is the **accessibility tree**. It is not your document. It is a projection of it: layout
-boxes disappear, text nodes become names, and a control that is off the screen is marked absent.
-
-zgui builds this tree from the document after every frame that changed anything, and hands it to
-[AccessKit](https://accesskit.dev). AccessKit is the library that speaks each operating system's own
-protocol — UI Automation on Windows, NSAccessibility on macOS, AT-SPI on Linux — so the framework
-produces one description and AccessKit answers three platforms with it.
-
-<Callout type="info">
-AccessKit is not hidden behind a wrapper. `Role`, `Toggled`, `Live`, `NodeId` and the rest are
-AccessKit's own types, re-exported at `zgui::vocab`. A parallel copy would have to be kept in step
-by hand and would convert on every property of every node.
-</Callout>
-
-## The smallest accessible control
+Every interactive element needs three things: a **role**, a **name**, and **keyboard access**.
 
 ```rust
 use zgui::prelude::*;
@@ -59,98 +27,437 @@ view! {
 }
 ```
 
-Three things are true of it already.
+- **Role:** declared with `a11y:role`. Without it, the element is `Role::GenericContainer`, which
+  assistive technology skips.
+- **Name:** derived from the element's own text child, "Add one".
+- **Keyboard:** `control` is focusable by default, so Tab reaches it and Enter or Space dispatch
+  `click`.
 
-- **The role is declared.** Without `a11y:role` the element is `Role::GenericContainer`, which
-  consumers drop from the tree they present.
-- **The name is derived.** The element's own text child, `"Add one"`, becomes its accessible name.
-- **The action is derived.** The element has a `click` listener, so the node advertises
-  `Action::Click`. A screen reader activating it produces a real `click` on the same path a pointer
-  takes, reaching the same listener.
+The `click` listener also makes zgui advertise a click action. A screen reader that activates the
+button dispatches a real `click` along the same path as a pointer, so pointer, keyboard and screen
+reader all end up in one `on:click`.
 
-`control` is also focusable by nature, so the keyboard reaches it by tabbing and Enter or Space on it
-produces the same `click`. Pointer, keyboard and assistive technology all arrive at one `on:click`.
+## Give elements a role
 
-## What is derived and what you declare
+The role decides how an element is announced, which keyboard conventions apply, and which other
+properties mean anything. These are the roles most applications need:
 
-The framework works out everything it can see for itself. It never guesses at meaning.
+| Role | For |
+|---|---|
+| `Button` | an action |
+| `Switch` | on/off that takes effect immediately |
+| `CheckBox` | a choice applied later; may be `Mixed` |
+| `RadioButton` inside `RadioGroup` | one choice of several |
+| `Link` | navigation |
+| `Heading` with `a11y:level` | a section title |
+| `TextInput`, `MultilineTextInput`, `SearchInput`, `PasswordInput` | text entry |
+| `Slider`, `SpinButton`, `ProgressIndicator`, `Meter` | a number |
+| `Tab`, `TabList`, `TabPanel` | tabs |
+| `Menu`, `MenuBar`, `MenuItem`, `MenuItemCheckBox`, `MenuItemRadio` | menus |
+| `ListBox`, `ListBoxOption`, `ComboBox` | choosers |
+| `List`, `ListItem`, `Tree`, `TreeItem` | collections |
+| `Table`, `Row`, `Cell`, `RowHeader`, `ColumnHeader`, `Grid`, `GridCell` | tabular data |
+| `Dialog`, `AlertDialog` with `a11y:modal` | dialogs |
+| `Alert`, `Status`, `Log` | content that should be read out when it appears |
+| `Group`, `Region`, `Section`, `Toolbar`, `Navigation`, `Main` | structure |
 
-### Derived, with no declaration
+Leave layout-only elements without a role. `Role::GenericContainer` is skipped, so deep visual
+nesting does not become deep spoken nesting. Each window's root node has `Role::Window`.
+
+`a11y:role` may appear only once per element; a second one is a compile error. `Role` is in the
+prelude. [All roles](#all-roles) are listed at the end of this page.
+
+## Name elements
+
+An element's name comes from, in order of precedence:
+
+1. a declared `a11y:label`;
+2. an `a11y:labelled_by` relation (the assistive technology reads the target's name);
+3. the element's **own** text children, joined with single spaces.
+
+Only direct text children count:
+
+```rust
+// Named "Delete".
+control(a11y:role = Role::Button) {"Delete"}
+
+// No name: "Delete" belongs to the inner element.
+control(a11y:role = Role::Button) { text {"Delete"} }
+```
+
+When the words are nested, declare `a11y:label` or point `a11y:labelled_by` at them. An icon-only
+button always needs `a11y:label`.
+
+`Label`, `TextInput`, `MultilineTextInput` and `SearchInput` put their own text in the **value**
+instead of the name. For an editable element the text is the value, so do not declare
+`a11y:value` on a field.
+
+Use `a11y:description` for hint text under a field, not for a second name.
+
+## Make elements reachable by keyboard
+
+Tab order and assistive-technology focus requests use the same focusability rule:
+
+| Rule | Detail |
+|---|---|
+| focusable by default | `control`, `field`, `editor` |
+| focusable by declaration | `tabindex = Focus::Sequential` (in the Tab order) or `Focus::Programmatic` (focusable, not in the Tab order) |
+| never focusable | an element with `state:disabled`, or one without a visible box |
+| Tab order | document order |
+
+```rust
+// A row that is not a control but must be reachable.
+row(class = "item", tabindex = Focus::Sequential, on:click = pick) { … }
+```
+
+Enter and Space on the focused element dispatch `click`, as does an assistive technology's
+activation request. There is no separate accessibility activation path. See
+[Keyboard and focus](/docs/building/keyboard-and-focus) for traversal, `:focus-visible`, focus traps
+and programmatic focus.
+
+## Report state
+
+`state:` and `a11y:` are separate. `state:checked` sets the UI state that CSS matches with
+`:checked`. `a11y:toggled_on` sets what a screen reader announces. **Neither implies the other, so
+a toggle usually needs both:**
+
+```rust
+control(
+    a11y:role = Role::Switch,
+    a11y:label = "Wi-Fi",
+    state:checked = move || on.get(),     // for CSS
+    a11y:toggled_on = move || on.get(),   // for assistive technology
+    on:click = move |_| on.update(|value| *value = !*value)
+)
+```
+
+The same applies to disabled elements: `state:disabled` makes the element unfocusable and matches
+`:disabled`, and `a11y:disabled` announces it.
+
+`a11y:expanded`, `a11y:selected` and `a11y:toggled_on` have three states. Omitting the attribute
+means "not expandable", "not selectable" or "not a toggle". `false` means "collapsed", "not
+selected" or "off". Use `a11y:toggled = Toggled::Mixed` for a checkbox that summarises a partly
+selected group.
+
+Other state attributes include `a11y:invalid`, `a11y:required`, `a11y:busy` and
+`a11y:read_only`. See [All `a11y:` attributes](#all-a11y-attributes).
+
+## Connect related elements
+
+A relation points one element at another. Relation attributes take a
+[`NodeRef`](/docs/learn/attributes):
+
+```rust
+let caption = NodeRef::new();
+let hint = NodeRef::new();
+
+view! {
+    column {
+        label(node_ref = caption) {"Full name"}
+        field(
+            a11y:role = Role::TextInput,
+            a11y:labelled_by = caption,
+            a11y:described_by = hint,
+            a11y:required = true
+        )
+        text(node_ref = hint) {"As it appears on your passport"}
+    }
+}
+```
+
+A relation to an element that has not mounted yet is empty until the target appears, and becomes
+empty again when the target is removed. To switch targets, use a closure returning
+`Option<NodeRef>`; `None` points at nothing:
+
+```rust
+field(a11y:described_by = move || Some(if wrong.get() { error } else { hint }))
+```
+
+There are eight relations. Seven have attributes ([Relations](#relations) lists them);
+`radio_group` goes through [`A11yBinding::step`](#set-properties-that-have-no-attribute).
+
+Two common patterns follow. A trigger that opened a dialog rendered in an overlay layer:
+
+```text
+Button label="Delete" expanded=true has_popup=Dialog owns=[dialog]
+Dialog modal labelled_by=[title] described_by=[body] popup_for=button
+```
+
+`owns` makes the dialog a child of the trigger in the accessibility tree, even though it lives in
+the overlay layer in the document.
+
+A combobox that keeps focus in its input while arrow keys move through the list:
+
+```text
+ComboBox label="Fruit" expanded=true has_popup=Listbox controls=[list]
+         owns=[list] active_descendant=option
+```
+
+## Announce changes
+
+There is no `announce()` function. Instead, mark an element as a **live region**, and its changes
+are read out automatically:
+
+```rust
+use zgui::vocab::Live;
+
+view! {
+    text(class = "status", a11y:live = Live::Polite) {
+        {move || format!("{} results", results.get().len())}
+    }
+}
+```
+
+| Value | Behaviour |
+|---|---|
+| `Live::Off` | not a live region |
+| `Live::Polite` | read at the next pause |
+| `Live::Assertive` | interrupts current speech |
+
+Use `Assertive` only for something the user must act on now.
+
+- To announce the whole region rather than only the changed part, set
+  `.step(|a| a.flag(SemanticFlags::LIVE_ATOMIC, true))` on an [`A11yBinding`](#set-properties-that-have-no-attribute).
+- `Role::Alert` and `Role::Status` are live by default. Use `Role::Alert` for a toast and
+  `Live::Polite` on a plain element for a quiet counter.
+
+## Example: an accessible toggle
+
+A switch with a caption, usable by pointer, keyboard and screen reader, built from plain elements:
+
+```rust
+use zgui::prelude::*;
+
+#[component]
+fn Toggle(
+    /// Whether it is on.
+    on: RwSignal<bool>,
+    /// Its caption.
+    #[prop(into)]
+    caption: String,
+    /// Whether it can be used.
+    #[prop(into, default = Signal::stored(false))]
+    disabled: Signal<bool>,
+) -> impl IntoView {
+    let name = NodeRef::new();
+
+    view! {
+        row(class = "toggle") {
+            label(class = "toggle__caption", node_ref = name) {{caption}}
+            control(
+                class = "toggle__switch",
+                // For CSS.
+                state:checked = move || on.get(),
+                state:disabled = move || disabled.get(),
+                // For assistive technology.
+                a11y:role = Role::Switch,
+                a11y:labelled_by = name,
+                a11y:toggled_on = move || on.get(),
+                a11y:disabled = move || disabled.get(),
+                a11y:state_description = move || {
+                    zgui::vocab::SharedString::from(if on.get() { "on" } else { "off" })
+                },
+                on:click = move |_| {
+                    if !disabled.get_untracked() {
+                        on.update(|value| *value = !*value);
+                    }
+                }
+            ) {
+                box(class = "toggle__thumb")
+            }
+        }
+    }
+}
+
+const SHEET: &str = css!(
+    ".toggle__switch { display: flex; width: 44px; height: 24px; padding: 2px; border-radius: 999px; }
+    .toggle__thumb { width: 20px; height: 20px; border-radius: 999px; background-color: white; }
+    .toggle__switch:checked { justify-content: flex-end; background-color: #3b6cf6; }
+    .toggle__switch:focus-visible { outline: 2px solid #7aa2ff; outline-offset: 2px; }
+    .toggle__switch:disabled { opacity: 0.4; }"
+);
+```
+
+| Written | Effect |
+|---|---|
+| `control` | focusable; Tab reaches it, Enter and Space activate it |
+| `a11y:role = Role::Switch` | announced as a switch |
+| `a11y:labelled_by = name` | named by the caption next to it |
+| `a11y:toggled_on` | the state, announced on change |
+| `state:checked` | the state, for `:checked` in CSS |
+| `a11y:disabled` + `state:disabled` | announced as disabled, ignores pointer input, leaves the Tab order |
+| `a11y:state_description` | says "on"/"off" instead of the default wording |
+| `on:click` | handles pointer, keyboard and assistive technology |
+
+Bounds, children, actions and focus are all derived.
+
+## Test accessibility
+
+### Test a component
+
+With `zgui-testkit-view` (see [Testing](/docs/building/testing)), mount the component, run a frame,
+and read `semantics(node)` from the in-memory tree:
+
+```rust
+use zgui::vocab::Toggled;
+
+let window = zgui_testkit_view::Window::open();
+let on = window.scope.with(|| RwSignal::new(false));
+let mut built = window.scope.with(|| {
+    view! {
+        control(
+            a11y:role = Role::Switch,
+            a11y:label = "Dark mode",
+            a11y:toggled_on = move || on.get()
+        )
+    }
+    .into_view()
+    .build(&mut window.cx.cx())
+});
+built.mount(&window.dom_handle, window.root, None);
+window.frame();
+
+let node = window.dom.tree().children(window.root)[0];
+let semantics = window.dom.tree().semantics(node).expect("has semantics");
+assert_eq!(semantics.role, Role::Switch);
+assert_eq!(semantics.label.as_deref(), Some("Dark mode"));
+assert_eq!(semantics.toggled, Some(Toggled::False));
+
+on.set(true);
+window.frame(); // without this, the tree still shows the previous state
+assert_eq!(window.dom.tree().semantics(node).unwrap().toggled, Some(Toggled::True));
+```
+
+Every `Semantics` field can be asserted: `role`, `label`, `description`, `value`, `flags`,
+`toggled`, `invalid`, `live`, `numeric`, `position`, `table` and `relations`. The transcript also
+records `semantics #1 Switch` and `semantics #1 cleared` lines, so a golden file catches a
+description that stopped being written.
+
+### Test a whole window
+
+`zgui-platform-headless` runs the real frame loop and records each update on the offscreen surface
+(`last_a11y_update()`, `a11y_log()`, `take_a11y_log()`, `a11y_updates()`). Each update is a
+difference against the ones before it, so a claim about the whole tree must consider the whole
+sequence.
+
+`zgui_a11y::dump(&update)` prints one update as sorted, stable text with small ordinals for node
+IDs, suitable for a golden file. It shows mistakes a screenshot cannot, such as a combobox that no
+longer points at its active option.
+
+```text
+tree root=#1
+focus #1
+#1 Window children=[#2]
+#2 GenericContainer children=[#3 #4 #5]
+#3 GenericContainer label="Full name"
+#4 TextInput required labelled_by=[#3] described_by=[#5]
+#5 GenericContainer label="As it appears on your passport"
+```
+
+`zgui_a11y::dangling(&update, retained)` lists every node ID an update mentions that resolves
+neither inside the update nor among the `retained` IDs the consumer already holds. The runtime
+checks this in debug builds.
+
+## What to check yourself
+
+- **Contrast and target size.** zgui checks neither. The framework sheet gives `:focus-visible` an
+  outline; if your sheet removes it, keyboard users cannot see where focus is.
+- **Reading order.** The tree follows document order. If CSS reorders things visually, the two
+  disagree.
+- **Screen coordinates on Wayland.** Wayland does not tell applications where their windows are, so
+  features that need absolute screen position, such as a magnifier following the caret, are
+  limited there. <Status kind="partial">A platform limitation.</Status>
+
+## How the tree is built
+
+Each node in the accessibility tree has:
+
+| Part | Example |
+|---|---|
+| a **role** | button, switch, list item, heading |
+| a **name** | "Delete", "Wi-Fi" |
+| **state** | on, expanded, disabled, invalid |
+| **bounds** | a rectangle in CSS pixels |
+| **actions** | click, focus, increment |
+| **relations** | "the text that names me is that node" |
+
+zgui builds the tree from the document and hands it to [AccessKit](https://accesskit.dev), which
+speaks UI Automation on Windows, NSAccessibility on macOS and AT-SPI on Linux. Layout-only boxes are
+dropped from what is presented, text nodes become names, and elements without a box are marked
+hidden.
+
+### What zgui derives
+
+zgui derives what it can observe. It never guesses meaning.
 
 | Derived | From |
 |---|---|
-| the accessible **name** | the element's **own** text children, joined with single spaces |
-| **bounds** | the union of the element's fragments, resolved through the drawn frame's transforms, in CSS pixels |
-| **hidden** | the element and everything below it generated no box |
+| **name** | the element's **own** text children, joined with single spaces |
+| **bounds** | the union of the element's fragments, in CSS pixels, relative to the parent node; the root carries the window scale factor |
+| **hidden** | the element generated no box |
 | **clips children** | a fragment of the element clips its content |
-| **children** | document child order, minus markers and minus text nodes |
-| `Action::Click` | the element has a `click` listener |
-| `Action::Focus`, `Action::Blur` | the element is focusable; `Blur` only while it holds focus |
-| `Action::Increment`, `Action::Decrement` | the element declared any numeric value, range or step |
-| `Action::SetValue` | the element declared a `value`, or has a `change` listener |
-| **focus** | the window's focused node, reported on every update |
-| the root **transform** | the window's scale factor |
+| **children** | element children in document order |
+| `Action::Click` | a `click` listener |
+| `Action::Focus`, `Action::Blur` | the element is focusable; `Blur` only while it has focus |
+| `Action::Increment`, `Action::Decrement` | a declared numeric value, range or step |
+| `Action::SetValue` | a declared `value`, or a `change` listener |
+| **focus** | the window's focused element |
 
-### Declared, or absent
+Everything else is declared or absent: the role, descriptions, every state flag, `expanded`,
+`selected`, `toggled`, `invalid`, `live`, the numeric range and step, set and table positions, and
+every relation.
 
-Everything else. The role, `description`, `placeholder`, `role_description`, `state_description`,
-`keyboard_shortcut`, `tooltip`, every flag, `expanded`, `selected`, `toggled`, `invalid`, `live`,
-`orientation`, `has_popup`, `auto_complete`, `sort_direction`, `current`, the numeric range and
-step, the set position, the table position, and **every relation**.
+### Publishing
 
-<Callout type="warn">
-`state:` and `a11y:` are separate namespaces with separate destinations. `state:checked` writes the
-UI state that CSS matches with `:checked`; `a11y:toggled_on` writes the accessibility property a
-screen reader announces. Neither implies the other. A toggle that changes colour and says nothing
-is a toggle that declared one of the two.
-</Callout>
+zgui publishes the tree at the end of each frame that changed something, after rendering, so
+reported bounds match what was drawn. Only changed nodes are sent, and only while an assistive
+technology is listening; with nothing listening, the cost is a single check. A frame that only
+moved focus publishes a small update. A whole tree is sent when an assistive technology connects.
 
-## Every `a11y:` attribute
+Text is not a node of its own, so a changing number such as `label { {count} }` is one node whose
+name changes. Relations to nodes that are not in the published tree are dropped before publishing.
+[The platform layer](/docs/architecture/platform-layer#accessibility) describes the update format.
 
-One namespace, 38 properties plus the role. Every one may be reactive: a constant, a signal, or a
-closure.
+## All `a11y:` attributes
 
-### The role
+There are 38 properties plus the role. Each accepts a constant, a signal or a closure. `Role`,
+`Toggled`, `Live`, `NodeId` and the other vocabulary types are AccessKit's own, re-exported at
+`zgui::vocab`.
 
-| Attribute | Type | Says |
+### Role
+
+| Attribute | Type |
+|---|---|
+| `a11y:role` | `Role` |
+
+### Text
+
+| Attribute | Type | Meaning |
 |---|---|---|
-| `a11y:role` | `Role` | what kind of thing the element is |
+| `a11y:label` | `SharedString` | the name |
+| `a11y:description` | `SharedString` | a longer description, read after the name |
+| `a11y:value` | `SharedString` | the value as text |
+| `a11y:placeholder` | `SharedString` | text shown when a field is empty |
+| `a11y:role_description` | `SharedString` | a custom name for the role |
+| `a11y:state_description` | `SharedString` | the current value in words |
+| `a11y:keyboard_shortcut` | `SharedString` | the key that activates the element |
+| `a11y:tooltip` | `SharedString` | the element's tooltip |
 
-`a11y:role` may be written **once** on a node; writing it twice is the compile error
-`` `a11y:role` is written once ``.
+### Flags
 
-### Naming and text
-
-| Attribute | Type | Says |
+| Attribute | Type | Meaning |
 |---|---|---|
-| `a11y:label` | `SharedString` | what this element is called |
-| `a11y:description` | `SharedString` | a longer description of this element |
-| `a11y:value` | `SharedString` | this control's value, as text |
-| `a11y:placeholder` | `SharedString` | the text shown when this field is empty |
-| `a11y:role_description` | `SharedString` | what this element's role is called, in words |
-| `a11y:state_description` | `SharedString` | what this control's value means, in words |
-| `a11y:keyboard_shortcut` | `SharedString` | the keystroke that activates this element |
-| `a11y:tooltip` | `SharedString` | the tooltip shown for this element |
-
-### Conditions
-
-| Attribute | Type | Says |
-|---|---|---|
-| `a11y:disabled` | `bool` | cannot be interacted with |
-| `a11y:read_only` | `bool` | the value cannot be changed |
+| `a11y:disabled` | `bool` | cannot be used |
+| `a11y:read_only` | `bool` | value cannot be changed |
 | `a11y:required` | `bool` | must have a value |
-| `a11y:modal` | `bool` | takes the interaction over |
+| `a11y:modal` | `bool` | blocks the rest of the window |
 | `a11y:busy` | `bool` | still loading |
-| `a11y:hidden` | `bool` | absent from the presented tree, with everything inside it |
-| `a11y:expanded` | `bool` | this element's content is showing |
-| `a11y:selected` | `bool` | this element is selected |
-| `a11y:toggled_on` | `bool` | this toggle is on |
+| `a11y:hidden` | `bool` | removed from the presented tree, with its subtree |
+| `a11y:expanded` | `bool` | its content is showing |
+| `a11y:selected` | `bool` | selected |
+| `a11y:toggled_on` | `bool` | a toggle that is on |
 
-`expanded` and `selected` are three-valued underneath. Saying nothing means "not expandable at all";
-saying `false` means "collapsed, and there is a control for it". The same distinction applies to
-`toggled_on`.
-
-### Closed vocabularies
+### Enumerations
 
 | Attribute | Type | Values |
 |---|---|---|
@@ -163,60 +470,52 @@ saying `false` means "collapsed, and there is a control for it". The same distin
 | `a11y:current` | `AriaCurrent` | `False`, `True`, `Page`, `Step`, `Location`, `Date`, `Time` |
 | `a11y:auto_complete` | `AutoComplete` | `Inline`, `List`, `Both` |
 
-All eight live at `zgui::vocab`. `a11y:toggled` is the three-state form of `a11y:toggled_on`: a
-checkbox summarising a partly selected group is `Toggled::Mixed`, and a consumer announces it
-differently from either of the other two.
+All are in `zgui::vocab`.
 
 ### Numbers
 
-| Attribute | Type | Says |
+| Attribute | Type | Meaning |
 |---|---|---|
-| `a11y:numeric_value` | `f64` | this control's value, as a number |
-| `a11y:level` | `usize` | this heading's level, counting from one |
-| `a11y:row_index` | `usize` | which row of its table, counting from zero |
-| `a11y:column_index` | `usize` | which column of its table, counting from zero |
-| `a11y:row_span` | `usize` | how many rows this cell covers |
-| `a11y:column_span` | `usize` | how many columns this cell covers |
+| `a11y:numeric_value` | `f64` | the value as a number |
+| `a11y:level` | `usize` | heading level, from 1 |
+| `a11y:row_index`, `a11y:column_index` | `usize` | position in a table, from 0 |
+| `a11y:row_span`, `a11y:column_span` | `usize` | cells covered |
 
 ### Relations
 
-| Attribute | Type | Says |
-|---|---|---|
-| `a11y:labelled_by` | `NodeId` | the element whose text names this one |
-| `a11y:described_by` | `NodeId` | the element whose text describes this one |
-| `a11y:controls` | `NodeId` | the element this one controls |
-| `a11y:owns` | `NodeId` | the element this one owns, which is not its child in the tree |
-| `a11y:active_descendant` | `NodeId` | the descendant that behaves as though it had focus |
-| `a11y:popup_for` | `NodeId` | the element this popup belongs to |
-| `a11y:error_message` | `NodeId` | the element holding this control's error message |
+| Attribute | Points at |
+|---|---|
+| `a11y:labelled_by` | the element whose text names this one |
+| `a11y:described_by` | the element whose text describes this one |
+| `a11y:controls` | the element this one controls |
+| `a11y:owns` | an element that belongs to this one but is not its child in the document |
+| `a11y:active_descendant` | the descendant that acts as if it had focus |
+| `a11y:popup_for` | the element this popup belongs to |
+| `a11y:error_message` | the element holding this control's error |
 
-### Rules that apply to all of them
+All relation attributes take a `NodeId`; pass a `NodeRef`.
 
-- **Every property may be reactive.** They are all resolved inside one binding on the element, so a
-  change re-lowers the whole description and re-projects one node.
-- **A reactive text property must produce a `SharedString`.** A literal `&str` converts on its own; a
-  closure has to say `move || SharedString::from(format!("…"))`.
-- **Writing the same name twice is allowed** for everything except `role`. Both steps run and the
-  later one wins. The list relations rely on this to accumulate targets.
-- **With no role, the description says nothing about what the element is.** That is not the same as
-  saying it is a box. On a component call the caller's description merges *over* the component's
-  own, and a role invented for the caller would silently replace the component's.
+### Values and merging
+
+- Text properties take a `SharedString`. A `&str` literal converts. A closure must return one:
+  `move || SharedString::from(format!("…"))`.
+- Repeating an attribute is allowed for everything except `role`; the later value wins. Relation
+  lists accumulate.
+- On a component call, the caller's attributes merge over the component's own. A caller that
+  writes no role keeps the component's role:
 
 ```rust
-// The caller adds a label. The component's Role::Button survives.
+// Adds a label; SaveButton's Role::Button stays.
 view! {
     SaveButton(a11y:label = "Save and close")
 }
 ```
 
-### What is not writable as an attribute
+### Set properties that have no attribute
 
-| Property | Why | Instead |
-|---|---|---|
-| `table_size(rows, columns)` | takes two arguments, and an attribute passes one | `A11yBinding::table_size(rows, columns)` |
-| `radio_group`, `numeric_range`, `numeric_step`, `set_position`, `clips_children`, and the raw `flag` | no method on the reactive builder | `A11yBinding::step` |
-
-Both escape hatches go through an attribute bundle, which a view spreads with `{..}`:
+`table_size(rows, columns)`, `radio_group`, `numeric_range`, `numeric_step`, `set_position`,
+`clips_children` and raw `flag`s have no attribute. Set them through `A11yBinding::step` and spread
+the binding with `{..}`:
 
 ```rust
 let semantics = A11yBinding::new(Role::Slider)
@@ -230,48 +529,35 @@ view! {
 }
 ```
 
-`A11yBinding::step` takes `impl Fn(A11y) -> A11y`. The closure runs inside the binding's effect, so
-anything reactive it reads is tracked like any other property.
+`table_size` also has its own method, `A11yBinding::table_size(rows, columns)`. The `step` closure
+runs inside the binding's effect, so signals it reads are tracked. `Semantics::access_key` and the
+numeric `jump` have no builder method; set them by building a `Semantics` value directly.
 
-`Semantics::access_key` and the coarse numeric `jump` are projected but have no builder method at
-all today. <Status kind="partial">Reachable only by constructing a `Semantics` value directly.</Status>
+## Actions from assistive technology
 
-## The role vocabulary
+Requests are routed to the window that owns the node and run in that window's reactive scope.
 
-The role is the most important thing an element declares. It decides how a consumer announces the
-element, which keyboard conventions apply to it, and which of the other properties mean anything —
-a checked state means something on a checkbox and nothing on a heading.
-
-Two roles have framework-wide meaning:
-
-- **`Role::GenericContainer`** is a box that exists for layout only. It is the default for every
-  element that declares no role, and consumers filter it out of the tree they present, so deep
-  visual nesting does not become deep spoken nesting.
-- **`Role::TextRun`** is a run of text inside an editable field, and is likewise filtered out.
-
-The roles you reach for most:
-
-| Role | For |
+| Request | Result |
 |---|---|
-| `Button` | anything that does something when it is activated |
-| `Switch` | on or off, taking effect at once |
-| `CheckBox` | a fact something else will act on later; may be `Mixed` |
-| `RadioButton` | one of a group, with `RadioGroup` around them |
-| `Link` | navigation |
-| `Heading` with `a11y:level` | a section title |
-| `TextInput`, `MultilineTextInput`, `SearchInput`, `PasswordInput` | typed text |
-| `Slider`, `SpinButton`, `ProgressIndicator`, `Meter` | a number |
-| `Tab`, `TabList`, `TabPanel` | tabs |
-| `Menu`, `MenuBar`, `MenuItem`, `MenuItemCheckBox`, `MenuItemRadio` | menus |
-| `ListBox`, `ListBoxOption`, `ComboBox` | a chooser |
-| `List`, `ListItem`, `Tree`, `TreeItem` | a collection |
-| `Table`, `Row`, `Cell`, `RowHeader`, `ColumnHeader`, `Grid`, `GridCell` | tabular data |
-| `Dialog`, `AlertDialog` with `a11y:modal` | a window inside the window |
-| `Alert`, `Status`, `Log` | something that appeared and should be read out |
-| `Group`, `Region`, `Section`, `Toolbar`, `Navigation`, `Main` | structure |
+| `Click` | a `click` on the node, along the normal capture/target/bubble path |
+| `Focus`, `Blur` | focus moves to the node, or away from it |
+| `Increment`, `Decrement` | a `change` event with the stepped value |
+| `SetValue`, `ReplaceSelectedText` | a `change` event with the new value |
+| `ShowContextMenu` | a `context_menu` event |
+| `ScrollIntoView` | the same as `NodeRef::scroll_to` |
+| `SetScrollOffset` | scrolls the container to an absolute offset in CSS pixels |
+| `ScrollUp`, `ScrollDown`, `ScrollLeft`, `ScrollRight` | one line of scrolling |
+| `Collapse`, `Expand`, `CustomAction`, `ShowTooltip`, `HideTooltip`, `ScrollToPoint`, `SetTextSelection` | ignored |
+
+Ignored requests are not reported as handled.
+
+`Increment` and `Decrement` step by the declared `numeric_step` if it is above zero, otherwise by
+1/100 of the declared range, otherwise by 0.01. The result is clamped to the declared bounds.
+
+## All roles
 
 <Accordions>
-<Accordion title="All 182 roles, in declaration order">
+<Accordion title="All 182 roles (AccessKit 0.24)">
 
 ```text
 Unknown TextRun Cell Label Image Link Row ListItem ListMarker TreeItem
@@ -301,520 +587,8 @@ DocPageFooter DocPageHeader DocPageList DocPart DocPreface DocPrologue
 DocPullquote DocQna DocSubtitle DocTip DocToc ListGrid Terminal
 ```
 
-`Role::Window` is used by the framework for the root node of each window. `Role::Unknown` is the
-enumeration's own default and is never what an undeclared element gets — that is
-`GenericContainer`.
-
 </Accordion>
 </Accordions>
-
-## Names
-
-An element gets its name from one of three places, in this order.
-
-<Steps>
-
-<Step>
-
-**A declared `a11y:label`.** It wins over everything.
-
-</Step>
-
-<Step>
-
-**A `labelled_by` relation.** The consumer reads the target node's name.
-
-</Step>
-
-<Step>
-
-**The element's own text children**, joined with single spaces.
-
-</Step>
-
-</Steps>
-
-The third rule is the one that surprises people, because **only the element's own text children
-count**.
-
-```rust
-// Named "Delete": the string is a text child of the control.
-control(a11y:role = Role::Button) {"Delete"}
-
-// The control has no name. "Delete" landed on the inner element instead.
-control(a11y:role = Role::Button) { text {"Delete"} }
-```
-
-A name assembled from a whole subtree would make one deep element pay for every text node beneath
-it, and the change key the projection is scheduled by hashes exactly these children. When the words
-are nested, declare the label or point a relation at them.
-
-Four roles put their own text in **`value`** rather than in `label`: `Label`, `TextInput`,
-`MultilineTextInput` and `SearchInput`. A consumer reads a `Label` node's text from its value, and
-an editable element's text *is* its value — the document is the only copy of it, so the element
-declares no value and the projection reads the real one.
-
-`a11y:description` is the longer second string a consumer reads after the name. Use it for the hint
-under a field, not for a second name.
-
-## Relations
-
-A relation names another node. The type is `NodeId`, but you never write one: a
-[`NodeRef`](/docs/learn/attributes) converts directly.
-
-```rust
-let caption = NodeRef::new();
-let hint = NodeRef::new();
-
-view! {
-    column {
-        label(node_ref = caption) {"Full name"}
-        field(
-            a11y:role = Role::TextInput,
-            a11y:labelled_by = caption,
-            a11y:described_by = hint,
-            a11y:required = true
-        )
-        text(node_ref = hint) {"As it appears on your passport"}
-    }
-}
-```
-
-The conversion tracks. A relation written before its target mounts resolves to nothing on that
-frame, and is filled in on the frame the target appears. It empties again when the target goes away.
-
-When the target itself changes, write a closure returning `Option<NodeRef>`:
-
-```rust
-let hint = NodeRef::new();
-let error = NodeRef::new();
-
-field(a11y:described_by = move || Some(if wrong.get() { error } else { hint }))
-```
-
-`None` names nothing, and names it the same way an unbound handle does.
-
-<Callout type="error">
-Every target is filtered against the projected tree before it is written. A relation naming a node
-that is not there is dropped rather than published. This is not tidiness: a consumer resolves a
-relation with an unchecked lookup, on a thread this process does not own and cannot catch. A
-debug build asserts that no published update names anything unresolvable.
-</Callout>
-
-The eight relations are `labelled_by`, `described_by`, `controls`, `owns`, `radio_group`,
-`active_descendant`, `popup_for` and `error_message`. Seven are writable as attributes;
-`radio_group` goes through `A11yBinding::step`.
-
-Two shapes are worth knowing. A trigger that opened a dialog the framework moved to an overlay band
-projects to this:
-
-```text
-Button label="Delete" expanded=true has_popup=Dialog owns=[dialog]
-Dialog modal labelled_by=[title] described_by=[body] popup_for=button
-```
-
-`owns` re-parents the portalled surface for a consumer: the dialog is a child of the overlay band in
-the document, and a child of the trigger in the tree that is read out.
-
-A combobox whose keyboard focus never leaves the input projects to this:
-
-```text
-ComboBox label="Fruit" expanded=true has_popup=Listbox controls=[list]
-         owns=[list] active_descendant=option
-```
-
-`active_descendant` is what lets an arrow key walk the list while focus stays in the text field.
-
-## Live regions and announcements
-
-There is no announcement queue and no `announce()` function. A **live region** is an element whose
-changes a consumer reads out without being asked, and it is declared with one attribute.
-
-```rust
-use zgui::vocab::Live;
-
-view! {
-    text(class = "status", a11y:live = Live::Polite) {
-        {move || format!("{} results", results.get().len())}
-    }
-}
-```
-
-| Value | Behaviour |
-|---|---|
-| `Live::Off` | not a live region |
-| `Live::Polite` | read out when the consumer next pauses |
-| `Live::Assertive` | interrupt whatever is being read |
-
-The mechanism is ordinary. The text changes, the node is marked, the node is re-projected, the
-changed node is in the next update, and the consumer sees a live region change. Nothing is queued
-and nothing is timed.
-
-Two additions:
-
-- `SemanticFlags::LIVE_ATOMIC` says "announce the whole region, not the part that changed". It has
-  no attribute; reach it with `.step(|a| a.flag(SemanticFlags::LIVE_ATOMIC, true))`.
-- `Role::Alert` and `Role::Status` are roles a consumer already treats as live. A toast wants
-  `Role::Alert`; a quiet counter wants `Live::Polite` on a plain element.
-
-Use `Assertive` for one thing only: something the user must act on now. Everything else is `Polite`.
-
-## Focus and keyboard reachability
-
-An interface nobody can reach with a keyboard is inaccessible whatever its tree says. Focus is an
-accessibility concern for a second reason as well: **focus is a field of every accessibility update**,
-so a frame that moved focus and changed nothing else still publishes one.
-
-There is exactly one answer to "which node can take focus", shared by the Tab key and by an
-assistive technology's focus request. Two answers would be two tab orders.
-
-| Rule | Detail |
-|---|---|
-| focusable by nature | `control`, `field` and `editor`, with nothing declared |
-| focusable by declaration | any element with `tabindex = Focus::Sequential` or `Focus::Programmatic` |
-| never focusable | anything carrying `state:disabled`, or generating no visible box |
-| sequential order | document order; `Focus::Programmatic` is reachable but not in the sequence |
-
-```rust
-// A row that is not a control, but has to be reachable.
-row(class = "item", tabindex = Focus::Sequential, on:click = pick) { … }
-```
-
-Enter and Space on the focused element produce a real `click`. So does an assistive technology's
-activation request. One `on:click` handles a pointer, a keyboard and a screen reader, and there is
-no separate accessibility activation path to write.
-
-<Callout type="warn">
-A control that is disabled while it holds focus has to leave the sequential order. Make `tabindex`
-reactive when the control can be disabled:
-`tabindex = move || if disabled.get() { Focus::Programmatic } else { Focus::Sequential }`.
-</Callout>
-
-[Keyboard and focus](/docs/building/keyboard-and-focus) covers traversal, `:focus-visible`, focus
-traps and programmatic focus in full.
-
-## How the tree is published
-
-`publish_a11y` is the last phase of a frame that has anything to say, and it runs **after the
-renderer**. What a consumer is told about a node's position has to be what was drawn, not what was
-about to be.
-
-<Steps>
-
-<Step>
-
-**Geometry moves are noted.** A node the frame carried somewhere else is named by the fragment pass.
-A node whose whole coordinate system was rewritten — an element under a running transform — was
-never touched at all, and is named by the space that moved.
-
-</Step>
-
-<Step>
-
-**The document's accessibility marks are drained, on every frame, listener or not.** Invalidation is
-a union: a bit nobody retires keeps every ancestor's subtree marked for the life of the window, and
-every other stage would then descend everywhere. Draining is cheap; what it gathers accumulates.
-
-</Step>
-
-<Step>
-
-**Nothing owed and focus unmoved:** the frame publishes nothing.
-
-</Step>
-
-<Step>
-
-**Only focus moved:** an update carrying no nodes at all, which costs no projection.
-
-</Step>
-
-<Step>
-
-**Otherwise the surface is handed a closure**, not a tree. AccessKit runs it only if something is
-listening. On a machine with no assistive technology running, the whole phase costs one comparison.
-
-</Step>
-
-</Steps>
-
-### What marks a node for re-projection
-
-| Change | Also marks |
-|---|---|
-| writing any `a11y:` property | the node and its ancestors |
-| changing a text node's text | the node's ancestors |
-| setting a `prop:` value | the node and its ancestors |
-| adding or removing a listener | the node and its ancestors |
-| creating or inserting an element | the node and its ancestors |
-| removing a subtree | the node and its ancestors |
-| `checked`, `disabled`, `open` or `indeterminate` changing | the node and its ancestors |
-
-### What an update contains
-
-An update is a **difference**. Each marked node is projected afresh — the projection is a pure
-function of the frame, nothing cached — and is put in the update only if the result differs from the
-last one sent for that node.
-
-Two rules are not optional:
-
-- **A node's parent is re-projected whenever the node is.** A child list belongs to the parent and to
-  nothing else, so an appearance, a disappearance or an identity change is only visible once the
-  parent is sent again.
-- **Departures are retired before anything is projected.** A node that leaves invalidates every node
-  naming it, and those nodes are usually not in this frame's marks at all.
-
-Once more than 4096 nodes are owed, the next build is a whole tree instead, because at that size a
-rebuild is cheaper than a diff. A consumer that connects late is also sent a whole tree, although
-nothing is dirty — nothing has changed; what is missing is its copy.
-
-### What it costs
-
-**Nothing, when nothing is listening.** The tree is built inside a closure the surface calls only
-when a consumer is active.
-
-**When something is listening, one projection per changed node, plus its parent.** In the
-maintainer's gallery workload, one window resize — the worst case, where every one of 2 265 boxes
-moved and had to be re-measured — spent 0.58 ms in the accessibility phase, 2.6 % of an 18.4 ms
-frame (`f.a11y → f.recycle`, `docs/perf/gallery-interactions.md`). An ordinary interaction changes
-one or two nodes.
-
-**A ticking number is one node.** A text node is not a node in this tree; the characters inside an
-element are that element's name. `label { {count} }` is one node whose name changes.
-
-## Actions coming back
-
-An assistive technology does not only read. It acts. Each request arrives as a wake, is matched to
-the window whose document holds the node, and is carried out inside that window's reactive scope.
-
-| Requested | What happens |
-|---|---|
-| `Click` | a synthesised `click` on the node, down the same capture, target and bubble path a pointer takes |
-| `Focus` / `Blur` | focus moves to the node, or away from it |
-| `Increment` / `Decrement` | a `change` event carrying the stepped value |
-| `SetValue` / `ReplaceSelectedText` | a `change` event carrying the new value |
-| `ShowContextMenu` | a `context_menu` event on the node |
-| `ScrollIntoView` | the same call `NodeRef::scroll_to` makes |
-| `SetScrollOffset` | the container scrolls to an absolute offset in CSS pixels |
-| `ScrollUp` / `Down` / `Left` / `Right` | one line of scrolling, as a wheel would have reported it |
-| `Collapse`, `Expand`, `CustomAction`, `ShowTooltip`, `HideTooltip`, `ScrollToPoint`, `SetTextSelection` | ignored |
-
-A request naming a node this build cannot act on is left alone rather than absorbed. An assistive
-technology told an action succeeded when nothing happened tells its user the application responded.
-
-The step size for `Increment` and `Decrement` is the declared `numeric_step` when it is above zero,
-otherwise a hundredth of the declared range, otherwise one hundredth. The result is clamped to
-whichever of the range ends were declared.
-
-## Testing accessibility
-
-### One component
-
-`zgui-testkit-view` mounts a component with no window, no style engine and no layout, and lets you
-read what it wrote. Add it to your `[dev-dependencies]`; it is not re-exported by `zgui`.
-
-```rust
-use zgui::prelude::*;
-use zgui::vocab::{Role, Semantics, Toggled};
-use zgui_testkit_view::Window;
-
-#[test]
-fn a_toggle_says_what_it_is_and_which_position_it_is_in() {
-    let window = Window::open();
-    let on = window.scope.with(|| RwSignal::new(false));
-
-    let mut built = window.scope.with(|| {
-        view! {
-            control(
-                a11y:role = Role::Switch,
-                a11y:label = "Dark mode",
-                a11y:toggled_on = move || on.get()
-            )
-        }
-        .into_view()
-        .build(&mut window.cx.cx())
-    });
-    built.mount(&window.dom_handle, window.root, None);
-    window.frame();
-
-    let node = window.dom.tree().children(window.root)[0];
-    let semantics: Semantics = window
-        .dom
-        .tree()
-        .semantics(node)
-        .expect("the control says what it is");
-
-    assert_eq!(semantics.role, Role::Switch);
-    assert_eq!(semantics.label.as_deref(), Some("Dark mode"));
-    assert_eq!(semantics.toggled, Some(Toggled::False));
-
-    on.set(true);
-    window.frame();
-    assert_eq!(
-        window.dom.tree().semantics(node).expect("still there").toggled,
-        Some(Toggled::True)
-    );
-}
-```
-
-Everything on `Semantics` is assertable this way: `role`, `label`, `description`, `value`, `flags`,
-`toggled`, `invalid`, `live`, `numeric`, `position`, `table` and `relations`.
-
-The same window keeps a transcript of every change made to the tree, one line each. A description
-appears as its role, and a cleared one says so:
-
-```text
-semantics #1 Switch
-semantics #1 cleared
-```
-
-`Transcript::assert_matches(path)` compares the whole recorded sequence against a checked-in file,
-which catches a description that stopped being written as well as one that changed.
-
-<Callout type="warn">
-`window.frame()` is what makes a written signal reach the tree. Asserting straight after an
-interaction asserts on the frame before the one it caused.
-</Callout>
-
-### A whole window
-
-`zgui-platform-headless` runs the real frame loop over an offscreen surface and records every
-accessibility update the surface was handed:
-
-| Method on `OffscreenSurface` | Answers |
-|---|---|
-| `last_a11y_update()` | the most recent `TreeUpdate` |
-| `a11y_log()` | the whole sequence, in order |
-| `a11y_updates()` | how many were published |
-
-The whole sequence is kept because an update is a difference: what it names resolves against
-everything sent before it.
-
-`zgui_a11y::dump(&update)` turns one update into stable, sorted text — one line per node, with
-identifiers rewritten as small ordinals — which is what a golden file compares against. A screenshot
-cannot show a missing relation, and a combobox that stopped pointing at its active option looks
-identical and is unusable.
-
-```text
-tree root=#1
-focus #1
-#1 Window children=[#2]
-#2 GenericContainer children=[#3 #4 #5]
-#3 GenericContainer label="Full name"
-#4 TextInput required labelled_by=[#3] described_by=[#5]
-#5 GenericContainer label="As it appears on your passport"
-```
-
-`zgui_a11y::dangling(&update, retained)` answers the other question: does every identifier this
-update mentions resolve, either inside the update or inside what the consumer already holds. The
-runtime runs it in a debug assertion around every published update.
-
-[Testing](/docs/building/testing) covers both harnesses in full.
-
-## A worked example: an accessible toggle
-
-Everything above, in one component. No component library, no primitives — a `control`, a `label` and
-a style sheet.
-
-```rust
-use zgui::prelude::*;
-
-/// A switch with a caption beside it, operable by pointer, keyboard and screen reader.
-#[component]
-fn Toggle(
-    /// Whether it is on. Written back to when it is flipped.
-    on: RwSignal<bool>,
-    /// What it is called.
-    #[prop(into)]
-    caption: String,
-    /// Whether it can be operated.
-    #[prop(into, default = Signal::stored(false))]
-    disabled: Signal<bool>,
-) -> impl IntoView {
-    let name = NodeRef::new();
-
-    view! {
-        row(class = "toggle") {
-            label(class = "toggle__caption", node_ref = name) {{caption}}
-            control(
-                class = "toggle__switch",
-                // What CSS matches.
-                state:checked = move || on.get(),
-                state:disabled = move || disabled.get(),
-                // What a screen reader is told. Separate, and both are needed.
-                a11y:role = Role::Switch,
-                a11y:labelled_by = name,
-                a11y:toggled_on = move || on.get(),
-                a11y:disabled = move || disabled.get(),
-                a11y:state_description = move || {
-                    zgui::vocab::SharedString::from(if on.get() { "on" } else { "off" })
-                },
-                on:click = move |_| {
-                    if !disabled.get_untracked() {
-                        on.update(|value| *value = !*value);
-                    }
-                }
-            ) {
-                box(class = "toggle__thumb")
-            }
-        }
-    }
-}
-
-const SHEET: &str = css!(
-    ".toggle {
-        align-items: center;
-        gap: 12px;
-    }
-
-    .toggle__switch {
-        width: 44px;
-        height: 24px;
-        padding: 2px;
-        border-radius: 999px;
-        background-color: #2b3243;
-        display: flex;
-        justify-content: flex-start;
-    }
-
-    .toggle__thumb {
-        width: 20px;
-        height: 20px;
-        border-radius: 999px;
-        background-color: #e8ecf4;
-    }
-
-    .toggle__switch:checked { background-color: #3b6cf6; justify-content: flex-end; }
-    .toggle__switch:focus-visible { outline: 2px solid #7aa2ff; outline-offset: 2px; }
-    .toggle__switch:disabled { opacity: 0.4; }"
-);
-```
-
-What each part earns:
-
-| Written | Gives |
-|---|---|
-| `control` | focusable by nature, so Tab reaches it and Enter or Space activates it |
-| `a11y:role = Role::Switch` | announced as a switch, with two positions and no mixed one |
-| `a11y:labelled_by = name` | named by the caption beside it, which is not its ancestor |
-| `a11y:toggled_on` | the position, announced on every change |
-| `state:checked` | the position, matched by `:checked` in the sheet |
-| `a11y:disabled` + `state:disabled` | announced as disabled, refuses pointer events, and drops out of the tab order |
-| `a11y:state_description` | "on" and "off" instead of the consumer's default wording |
-| `on:click` | one handler for the pointer, the keyboard and the accessibility action |
-
-Nothing here declares bounds, children, actions or focus. All four are derived.
-
-### What is left to check by hand
-
-- **Contrast and size.** The framework does not check either. `:focus-visible` gets an outline from
-  the framework's own sheet; a sheet of yours that removes it removes the only sign of where the
-  keyboard is.
-- **Reading order.** The tree follows document order. If the visual order differs from the source
-  order, the two disagree.
-- **Screen coordinates on Wayland.** The compositor does not report window position, so features
-  that need "where is this on the screen" — a magnifier following the caret — are degraded there.
-  <Status kind="partial">A platform limitation, not a framework one.</Status>
 
 ## Next
 
@@ -827,7 +601,7 @@ Nothing here declares bounds, children, actions or focus. All four are derived.
   <Card
     title="Testing"
     href="/docs/building/testing"
-    description="Both harnesses end to end: driving input, asserting on the document and the scene."
+    description="Component tests, headless application tests, input, and golden files."
   />
   <Card
     title="Theming"

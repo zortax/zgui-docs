@@ -1,18 +1,15 @@
 ---
 title: Animation
-description: CSS transitions and keyframe animations, the three paths an animating element takes, what a moving frame costs, and how to hold content on screen for its exit.
+description: CSS transitions and keyframe animations, which properties are cheap to animate, animation events, enter and exit animations, and per-frame animation from Rust with request_frame.
 ---
 
-Animation in zgui is declared in a style sheet, not driven from Rust. This page covers what the
-style engine animates, what a moving frame costs, and the one case a style sheet cannot answer on
-its own: content that has to stay in the document until its exit finishes. It assumes
-[Styling](/docs/learn/styling), [Events](/docs/learn/events) and
-[Effects and lifecycle](/docs/learn/effects-and-lifecycle).
+You declare animations in CSS, as transitions and keyframe animations, and zgui runs them without
+any Rust code. For values only Rust can compute, use [`request_frame`](#animate-from-rust).
 
-## A transition
+## Transitions
 
-A **transition** moves one property from the value it had to the value it now has, over a time you
-declare. The view says nothing about it.
+A **transition** animates a property from its old computed value to its new one. The view does not
+mention it.
 
 ```rust
 use zgui::prelude::*;
@@ -34,72 +31,58 @@ fn Swap() -> impl IntoView {
 }
 ```
 
-The pointer arriving makes `:hover` match. The cascade runs and produces a different
-`background-color`. The engine compares that result against the one before it, sees a property the
-element declares a transition for, and creates a transition. Every frame after that samples it.
-
-### The declaration
+When `:hover` starts matching, the cascade produces a new `background-color`. The element declares a
+transition for that property, so the engine starts one.
 
 | Longhand | Takes | Initial |
 |---|---|---|
-| `transition-property` | a property name, a comma-separated list, `all` or `none` | `all` |
+| `transition-property` | a property, a comma-separated list, `all` or `none` | `all` |
 | `transition-duration` | a `<time>` | `0s` |
 | `transition-timing-function` | a timing function | `ease` |
 | `transition-delay` | a `<time>` | `0s` |
-| `transition-behavior` | `normal` or `allow-discrete` — parses, and nothing reads it | `normal` |
+| `transition-behavior` | `normal` or `allow-discrete` | `normal` |
 
-The `transition` shorthand takes them in any order except that **the first time is the duration and
-the second is the delay**. A comma separates one property's transition from the next.
+In the `transition` shorthand, the first time is the duration and the second is the delay. Commas
+separate transitions for different properties:
 
 ```css
 transition: opacity 180ms ease-out 40ms, transform 180ms ease-out 40ms;
 ```
 
-During the delay the transition exists and is not moving. It starts when the delay is over, and
-that is the moment `on:transition_start` reports.
+`transition-behavior: allow-discrete` lets a discrete property (such as `align-items`) transition;
+without it, discrete properties change immediately.
 
 ### Timing functions
 
-The engine's own parser accepts every timing function CSS defines.
+All CSS timing functions are accepted: `linear`, `ease`, `ease-in`, `ease-out`, `ease-in-out`,
+`cubic-bezier(x1, y1, x2, y2)` (with `x1` and `x2` between 0 and 1), `steps(n)`,
+`steps(n, <position>)`, `step-start`, `step-end`, and `linear(<stop>#)`.
 
-| Written | What it does |
-|---|---|
-| `linear` | a constant rate |
-| `ease` | the initial value: slow, fast, slow |
-| `ease-in`, `ease-out`, `ease-in-out` | the three named variants |
-| `cubic-bezier(x1, y1, x2, y2)` | a curve of your own. `x1` and `x2` must be between 0 and 1 |
-| `steps(n)`, `steps(n, <position>)` | `n` discrete jumps |
-| `step-start`, `step-end` | one jump, at the beginning or at the end |
-| `linear(<stop>#)` | a piecewise-linear curve through the stops given |
-
-The repository's own tests and its component library exercise `linear`, `ease` and
-`cubic-bezier()` (`crates/zgui-runtime/tests/anim.rs`, `crates/zgui-ui-tokens/src/token/motion.rs`).
-The rest come from the same parser and are not exercised anywhere.
-
-### What starts one, and what does not
+### What starts a transition
 
 | Situation | Result |
 |---|---|
-| the cascade gives a declared property a different computed value | a transition starts |
-| the element has no previous cascade result — the frame it was created on | **no transition** |
-| the destination moves while a transition is running | the running one is cancelled and a new one starts from where the value had got to |
-| the property leaves `transition-property` | the running one is cancelled |
-| the new style is `display: none` | every transition on the element is cancelled |
+| a declared property gets a different computed value | a transition starts |
+| the element was just created (no previous style) | **no transition** |
+| the target changes while a transition runs | it restarts from the current value toward the new target |
+| the property leaves `transition-property` | the running transition is cancelled |
+| the element becomes `display: none` | all its transitions are cancelled |
 
-Anything that moves a computed value is a trigger: a `class:` binding, a `style:` declaration, a
-`var:` custom property, an `attr:` a selector matches on, or a pseudo-class such as `:hover` or
-`:focus-visible` changing under the pointer or under focus.
+Anything that changes a computed value can trigger one: a `class:` binding, a `style:` declaration, a
+`var:` custom property, an attribute a selector matches, or a pseudo-class such as `:hover` or
+`:focus-visible`. This includes writes made in response to a [geometry
+observation](/docs/learn/effects-and-lifecycle); such a transition starts in the same frame and keeps
+animating.
 
 <Callout type="warn">
-The second row is the one that catches people. A transition is made by comparing two cascade
-results, and an element that has just been created has only one. **Nothing transitions on the frame
-it appears.** An entrance is written as a keyframe animation.
+A transition compares two computed styles, and a new element has only one. **Nothing transitions
+on the frame an element appears.** Write entrances as keyframe animations.
 </Callout>
 
 ## Keyframe animations
 
-A **keyframe animation** names a sequence of styles and plays it. It needs no previous value, so it
-runs on the frame the element is created.
+A **keyframe animation** plays a named sequence of styles. It needs no previous value, so it runs
+from the frame the element is created.
 
 ```css
 @keyframes pulse {
@@ -110,73 +93,56 @@ runs on the frame the element is created.
 .cell { animation: pulse 2s linear infinite }
 ```
 
-Percentage stops work too, and a stop may carry its own timing function.
-
-```css
-@keyframes skeleton {
-    0%   { background-color: #23262c }
-    50%  { background-color: #2f333b }
-    100% { background-color: #23262c }
-}
-```
+Percentage stops work, and each stop may set its own `animation-timing-function`.
 
 | Longhand | Takes |
 |---|---|
 | `animation-name` | a `@keyframes` name, or `none` |
-| `animation-duration` | a `<time>`, one iteration |
-| `animation-timing-function` | the same set as a transition; a keyframe may override it |
-| `animation-delay` | a `<time>` before the first iteration |
+| `animation-duration` | a `<time>` per iteration |
+| `animation-timing-function` | any timing function |
+| `animation-delay` | a `<time>` before the first iteration; negative starts part-way through |
 | `animation-iteration-count` | a number, or `infinite` |
 | `animation-direction` | `normal`, `reverse`, `alternate`, `alternate-reverse` |
 | `animation-fill-mode` | `none`, `forwards`, `backwards`, `both` |
 | `animation-play-state` | `running` or `paused` |
 
-The framework's own tick reads four of these directly: the duration, the delay, the iteration count
-and the fill mode. The interpolation, the easing and the direction are the engine's
-(`crates/zgui-style/src/driver/animations/tick.rs`).
+A paused animation holds its current value, and the window stops rendering frames for it.
 
-### Fill mode decides what is left behind
+### Fill mode
 
-A finished animation is **dropped** from the document's animation table unless its fill mode is
-`forwards` or `both`, in which case its last keyframe stays in force. Without a fill mode the
-element goes back to what its own style asks for on the frame the animation ends.
+Without a fill mode, the element returns to its own style when the animation ends. With `forwards`
+or `both`, the last keyframe stays in effect:
 
 ```css
 .panel { animation: fade 200ms linear forwards }   /* the faded value stays */
 ```
 
-Both behaviours are deliberate. Leaving a merely finished animation in the table would keep the
-element reporting values it no longer owns; dropping a filling one is `forwards` snapping back one
-frame after it ended, which is the whole thing the property prevents.
+A forwards fill survives later restyles of the element, such as a theme change or an unrelated class
+toggle. If a restyle sets `animation-play-state: paused` on a finished fill, it stays finished and
+does not fire a second `animation_end`. If a restyle removes the animation from `animation-name`, the
+fill is dropped without an `animation_cancel` event, because the animation had already ended.
 
-## Which properties animate, and what each costs
+## Which properties are cheap to animate
 
-Every animating element takes one of three paths through the frame, chosen per element per frame
-from the set of properties it is currently moving.
+Each frame, every animating element takes one of three paths, chosen from the properties it is
+currently animating.
 
-| Properties | Path | What the frame does | What it owes |
-|---|---|---|---|
-| `opacity`; `background-color`, `border-top-color`, `border-right-color`, `border-bottom-color`, `border-left-color`, `outline-color` | repaint | the value is written into the element's **own** override column and composed over the shared style when the element is painted | `REPAINT`, `REHIT` |
-| `transform`, `translate`, `rotate`, `scale`, `transform-origin` | placement | the matrix is put where the fragment pass reads it. No style is computed, no size measured, no box rebuilt | `REFRAGMENT`, `REHIT` |
-| everything else: any length, any filter, `color` and any inherited value, any custom property | cascade | the element computes its style again with only its animation and transition declarations replaced. Its selector matches are kept | `RECASCADE` |
+| Properties | Path | Per-frame work |
+|---|---|---|
+| `opacity`, `background-color`, `border-*-color`, `outline-color` | repaint | the value is applied when painting; no style recomputation |
+| `transform`, `translate`, `rotate`, `scale`, `transform-origin` | placement | the element's matrix changes; no style, size or box rebuild |
+| anything else: lengths, filters, `color` and other inherited values, custom properties | cascade | the element's style is recomputed, which can also relayout |
 
-Two rules follow from the table.
-
-**One property on the cascade path takes the whole element there.** A transition of `opacity` and
-`width` together is a cascade, because `width` moves every box around it.
-
-**`transform` and `opacity` together stay on the placement path.** They are two overrides read by
-two consumers, and neither consumer is the cascade. This is why the usual "slide and fade" pair is
-the cheapest interesting animation there is.
+- One cascade property moves the whole element to the cascade path. Animating `opacity` and
+  `width` together costs a cascade per frame.
+- `transform` plus `opacity` stays cheap, so a slide-and-fade is the cheapest useful animation.
+- Animating a value on one element does not affect siblings that share its style.
 
 <Callout type="warn">
-An animation that gives an element its **first** transform, or takes its **last** one away, goes to
-the cascade path whatever else it moves. Whether a box is transformed decides whether it establishes
-a [stacking context](/docs/learn/layout) and whether it is the containing block for the positioned
-boxes inside it, and both answers are read from the shared style rather than from the matrix.
-</Callout>
-
-Declare the resting transform, and the animation only moves one that already exists:
+An animation that gives an element its **first** transform, or removes its **last**, takes the
+cascade path. Whether an element has a transform decides whether it creates a
+[stacking context](/docs/learn/layout) and contains positioned descendants. Declare a resting
+transform so the animation only changes an existing one:
 
 ```css
 .bar {
@@ -188,163 +154,33 @@ Declare the resting transform, and the animation only moves one that already exi
     to   { transform: translateX(300px) }
 }
 ```
+</Callout>
 
-The override is written per element and never into the shared style. Eight buttons matching one rule
-share one computed style, and fading the fourth of them moves the fourth of them only
-(`crates/zgui-runtime/tests/anim.rs::animating_one_button_does_not_touch_its_seven_identical_siblings`).
+### Frame rate
 
-## How an animation drives the frame loop
+While any element is animating, the window renders at the display's refresh rate. Frames are paced
+to the display, so input and timers do not shift or speed up an animation. When the last animation
+ends, the window stops rendering until something changes.
 
-A **frame loop** that has nothing to do sleeps. Something has to tell it to come back, and for an
-animation that something is one bit.
+Running animations do not write signals or wake the reactive graph. Their cost per frame grows with
+the number of animating elements, not with the size of the document. The
+[cost model](/docs/performance/cost-model) shows what each kind of frame costs.
 
-<Steps>
+## Animation events
 
-<Step>
-
-Every element with something still to advance is marked `ANIMATING`. All three paths mark it,
-not only the one that restyles.
-
-</Step>
-
-<Step>
-
-The mark propagates upwards: each ancestor records it in the half of its invalidation word that
-summarises the subtree. The loop answers "is anything animating" by reading one word at the root.
-
-</Step>
-
-<Step>
-
-An animating window **does not ask for another frame**. That would spin at whatever rate the
-machine manages. It leaves a **deadline**, and the loop sleeps until it.
-
-</Step>
-
-<Step>
-
-At the start of the next tick every `ANIMATING` mark from the previous frame is cleared, then
-re-marked for whatever is still running.
-
-</Step>
-
-</Steps>
-
-The deadline is a **phase**, not a delay: the next frame is owed one refresh interval after the
-moment the animation's phase was laid down, not one interval after now. A deadline recomputed as
-"now plus an interval" is pushed forward by every unrelated wake, so two unrelated wakes per interval
-halve the frame rate — invisibly, because the values stay correct and only the number of steps
-drops.
-
-A frame that lands late advances the phase by whole intervals until it is in the future. That is one
-deadline, never a backlog of eight frames drawn at once. Past eight missed intervals the phase is
-abandoned and re-anchored, because that is a stall or a suspend rather than a slow frame.
-
-### What stops it
-
-When the last animation on an element ends, nothing re-marks the bit. The root's word no longer
-carries it, the cadence parks, the animation deadline disappears, and the loop blocks until input
-arrives. A window that finished animating draws nothing at all
-(`crates/zgui-runtime/tests/anim_cadence.rs::an_animation_that_finishes_leaves_no_deadline_and_draws_nothing_for_ten_seconds`).
-
-Stopping also writes obligations, and they are not optional. An element that stops carrying a
-repaint override owes `REPAINT` and `REHIT`. An element that stops being placed owes `REFRAGMENT`
-and `REHIT` — without that second one the box stays where the animation's last frame put it for the
-rest of the document's life.
-
-An **occluded** window keeps its timer deadline and loses its animation deadline. Animations go on
-running against the clock and draw correctly the moment the window is shown again; only the phase is
-not kept.
-
-### Animation and the reactive flush
-
-The frame runs its stages in this order:
-
-<PhaseDiagram
-  label="The frame phases in execution order"
-  phases={[
-    'drain',
-    'timers',
-    'device',
-    'animate',
-    'flush',
-    'restyle',
-    'brushes',
-    'boxes',
-    'layout',
-    'deliver',
-    'rehit',
-    'publish',
-    'paint',
-    'draw',
-    'announce',
-    'park',
-  ]}
-/>
-
-Three consequences matter to an author.
-
-**The animation stage runs before the flush, and therefore before the restyle.** Both of the things
-it produces are inputs to what follows: the elements it decided must cascade are marked before the
-restyle looks for work, and the values it wrote for the elements that do not cascade are in place
-before anything is painted.
-
-**The animation stage writes no signal.** A running animation does not wake the reactive graph at
-all. A screen full of loading skeletons runs the flush over an empty queue every frame. The only
-coupling in the other direction is the count `NodeRef::running_animations()` reads, which is
-published twice per frame.
-
-**A keyframe animation is created by the cascade, which runs after the tick.** On the frame that
-starts one there is nothing in the tick's report, so a separate step after the restyle marks exactly
-those elements. Without it the loop would park for good on the first frame of every keyframe
-animation.
-
-One clock reading is taken at the top of the frame and handed to every stage. Reading it again in
-the animation stage would sample each frame at a slightly different offset, and a motion made of
-even steps would be drawn as uneven ones.
-
-## What a moving frame costs
-
-| What the loop is doing | Measured |
-|---|---:|
-| one turn over a still document | 0.07 µs |
-| frames drawn by a still document | 0 |
-| one turn over the same document with one animation running | 23.31 µs |
-
-Both figures come from `docs/performance.md`, which is generated by `cargo xtask perf`. The document
-is the gallery at 1 851 boxes; the animation is the indeterminate progress bar it ships
-(`crates/zgui-bench/src/scenario/kitchen.rs`).
-
-The counts are the sharper half of the picture, and they come from the runtime's own tests.
-
-| Case | Result |
-|---|---|
-| one hover transition, one frame | `elements_restyled == 0`, `tier_b_transitions == 1`, and the loop parks **with** a deadline |
-| five hundred pulsing cells, one frame | `tier_b_transitions == 500`, `elements_restyled == 0`, exactly one frame per deadline |
-
-`tier_b_transitions` counts the repaint path and `tier_c_placements` counts the placement path. Both
-live in `zgui-profile`.
-
-So the cost of an animation is proportional to the number of animating **elements** on the repaint
-and placement paths, and to nothing about the size of the document. On the cascade path it is one
-cascade per animating element per frame, which is why animating a length, a filter or an inherited
-colour is the expensive spelling of the same idea.
-
-## Lifecycle events
-
-Eight listeners report what a running animation is doing. Each is aimed at the element the animation
-runs on and travels the ordinary capture and bubble path, so a listener on an ancestor sees it.
+Eight events report animation progress. Each targets the element the animation runs on and
+bubbles, so an ancestor can listen.
 
 | Listener | Payload | Fires when |
 |---|---|---|
-| `on:animation_start` | `AnimationEvent` | a declared animation begins, after its delay |
-| `on:animation_iteration` | `AnimationEvent` | one iteration ends and another begins |
-| `on:animation_end` | `AnimationEvent` | it finishes on its own |
-| `on:animation_cancel` | `AnimationEvent` | it is stopped before it finishes |
-| `on:transition_run` | `TransitionEvent` | the transition is created, including its delay |
-| `on:transition_start` | `TransitionEvent` | the delay is over and the value begins moving |
+| `on:animation_start` | `AnimationEvent` | the animation begins, after its delay |
+| `on:animation_iteration` | `AnimationEvent` | one iteration ends and the next begins |
+| `on:animation_end` | `AnimationEvent` | it finishes |
+| `on:animation_cancel` | `AnimationEvent` | it is stopped before finishing |
+| `on:transition_run` | `TransitionEvent` | the transition is created (before its delay) |
+| `on:transition_start` | `TransitionEvent` | the delay is over and the value starts moving |
 | `on:transition_end` | `TransitionEvent` | the value arrives |
-| `on:transition_cancel` | `TransitionEvent` | it is stopped before the value arrives |
+| `on:transition_cancel` | `TransitionEvent` | it is stopped before arriving |
 
 ```rust
 box(
@@ -357,53 +193,31 @@ box(
 )
 ```
 
-An `AnimationEvent` carries `name` (the `@keyframes` name), `elapsed`, `phase`, and `pseudo`. A
-`TransitionEvent` carries `property` (the property being moved) and the same other fields. `pseudo`
-is `Some(Pseudo::Before)` or `Some(Pseudo::After)` for generated content; its event is dispatched
-at the owning element because the pseudo-element has no node. Both payloads have `is_final()`,
-which is true for the ended and cancelled phases.
+| Field | Meaning |
+|---|---|
+| `name` (`AnimationEvent`) | the `@keyframes` name |
+| `property` (`TransitionEvent`) | the property being transitioned |
+| `elapsed` | active time, excluding a positive delay; a negative delay reports its start offset |
+| `phase` | which of the four events this is |
+| `pseudo` | `Some(Pseudo::Before)` or `Some(Pseudo::After)` for generated content; the event is dispatched at the owning element |
 
-`elapsed` is active animation time and excludes a positive delay. A negative delay starts part-way
-through the animation, so its start event reports that offset instead of zero. Completed edges use
-the declared animation position, not the late wall-clock instant at which a frame observed them.
+`is_final()` is true for the end and cancel phases. With no delay, `transition_run` and
+`transition_start` arrive in that order in the same frame.
 
-`transition_run` and `transition_start` are separate. A delayed transition reports `run` when the
-cascade creates it and `start` after the delay. With no delay, both events arrive in that order in
-one tick.
+### Count running animations
 
-### Asking what is still running
-
-```rust
-pub fn running_animations(&self) -> usize;   // on NodeRef
-```
-
-It counts what is still to be advanced on that node — animations and transitions together. A
-transition kept one extra frame so its end can be reported does not count.
-
-The number is published **twice** per frame: once inside the animation stage before the lifecycle
-events are dispatched, and once after the restyle. The first publication is what makes a handler for
-`on:transition_end` see the post-tick answer. Published only at the end of the frame, the number a
-handler read would be the one taken before the animation it is being told about had finished — and
-everything written against it would wait for an end that has already happened.
+`NodeRef::running_animations() -> usize` counts the animations and transitions still running on a
+node. It is already up to date inside lifecycle handlers: in `on:transition_end`, a value of `0`
+means nothing else is still moving.
 
 ## Enter and exit animations
 
-This is the hard case, and it has two halves.
+- **Enter:** a new element cannot transition. Use a keyframe animation on its class.
+- **Exit:** `if move || open.get() { … }` removes the element immediately when the condition turns
+  false. Keep it mounted until its exit animation ends.
 
-- **Enter.** An element that has just appeared has no previous cascade result, so no transition can
-  start on it. Write the entrance as a keyframe animation on the element's own class.
-- **Exit.** `if move || open.get() { … }` takes the whole subtree away the moment the condition
-  flips. There is nothing left to animate. Something has to keep the element in the document until
-  its exit is over.
-
-The exit needs two pieces of state, and they differ for exactly the length of the animation.
-
-| Signal | Means | Read by |
-|---|---|---|
-| `mounted` | there is an element at all | the `if` |
-| `closing` | the element is on its way out | the style sheet, through a class |
-
-### A panel that slides and fades
+An exit needs two signals: `mounted` (is the element in the document) and `closing` (is it on its
+way out, read by the style sheet through a class).
 
 ```rust
 use zgui::prelude::*;
@@ -429,9 +243,9 @@ const SHEET: &str = css!(
 
 #[component]
 fn SlidePanel(
-    /// Whether the panel belongs on the screen.
+    /// Whether the panel should be shown.
     open: Signal<bool>,
-    /// What it shows. Built again every time it opens.
+    /// Its content, rebuilt each time it opens.
     children: ChildrenFn,
 ) -> impl IntoView {
     install_stylesheet("slide-panel", SHEET);
@@ -440,7 +254,7 @@ fn SlidePanel(
     let closing = RwSignal::new(false);
     let panel = NodeRef::new();
 
-    // The falling edge of `open` is not a function of `open`, so it cannot be a reactive hole.
+    // Reacts to the edges of `open`: true mounts, a change to false starts closing.
     let watching = RenderEffect::new(move |was: Option<bool>| {
         let now = open.get();
         if now {
@@ -460,7 +274,7 @@ fn SlidePanel(
                 class:closing = move || closing.get(),
                 node_ref = panel,
                 on:transition_end = move |_| {
-                    // Both halves are needed: this may be the first of two properties to arrive.
+                    // Two properties transition; unmount after the last one.
                     if closing.get_untracked() && panel.running_animations() == 0 {
                         mounted.set(false);
                     }
@@ -473,66 +287,55 @@ fn SlidePanel(
 }
 ```
 
-What each part does:
-
-- **The `@keyframes` rule and `animation` declaration** run the entrance. They start on the first
-  cascade of a freshly created element, which is the frame a transition cannot act on.
-- **The base `transform: translateX(0px)`** keeps the element transformed at rest, so the animation
-  moves a transform rather than creating one. Both the entrance and the exit stay on the placement
-  path.
-- **`RenderEffect`** turns the input into the two pieces of state. `open` going true mounts and
-  clears `closing`; `open` going false sets `closing` and leaves `mounted` alone. The handle lives in
-  a cleanup closure so that the effect lives exactly as long as the component.
-- **`class:closing`** is what the transition triggers on. Adding it changes two computed values, and
-  two transitions start.
-- **`on:transition_end`** unmounts, and only when nothing is still running on the node. The panel
-  moves two properties, so this listener fires twice; the first time, `running_animations()` is
-  still 1.
-- **Reopening mid-exit works.** `closing` goes back to false, the transitions reverse from wherever
-  the values had got to, and the element was never unmounted.
-
-Nothing here guesses a duration. The duration lives in the style sheet and in no other place.
+- The keyframe animation runs the entrance on the frame the panel is created.
+- The resting `transform: translateX(0px)` keeps both entrance and exit on the placement path.
+- `class:closing` changes two computed values, so two transitions start. `on:transition_end` fires
+  twice; the first time `running_animations()` is still 1.
+- Reopening during the exit sets `closing` back to false. The transitions reverse from where they
+  are, and the element is never unmounted.
+- The duration is defined only in the style sheet.
 
 <Callout type="warn">
-If the class change produces no transition — a sheet that failed to install, a zero duration, a
-property nobody declared — the end event never arrives and the element stays mounted for ever,
-invisible, over the window. Arm a backstop when `closing` is set:
+If the class change starts no transition (the sheet failed to install, the duration is zero, the
+property is not declared), `transition_end` never fires and the invisible element stays mounted.
+Arm a fallback timeout when you set `closing`:
 
 ```rust
 let pending = StoredValue::new_local(None::<TimeoutHandle>);
 let clock = Timers::current().expect("a component body is inside a window");
 
-// inside the effect, on the branch that sets `closing`
-pending.set_value(Some(clock.set_timeout(
-    Duration::from_secs(1),
-    move || mounted.set(false),
-)));
+// in the effect, where `closing` is set
+pending.set_value(Some(clock.set_timeout(Duration::from_secs(1), move || mounted.set(false))));
 ```
 
-Writing `pending` again, or dropping it with the component, cancels the previous timeout, so the
-listener firing first is what discards it.
+Overwriting or dropping `pending` cancels the timeout.
 </Callout>
 
-## There is no imperative animation API
+## Animate from Rust
 
-`zgui` re-exports `atlas`, `bits`, `elements`, `geom`, `platform`, `reactive`, `render`, `runtime`,
-`scene`, `text`, `view` and `vocab`. The animation crate is not among them and is not a dependency of
-`zgui` at all. There is no `use_animation`, no `animate()` helper, and no scripted animation object.
-Everything the framework animates for you is declared in CSS.
-
-For a number only Rust can compute, drive a signal from an interval and bind it:
+There is no imperative animation object. For a value that CSS cannot express, drive a signal from
+`request_frame`. The callback runs once, early in the next frame (before animations are sampled and
+before the restyle), and receives that frame's `Timestamp`. While a request is pending, the window
+renders at the display's refresh rate. Request again from the callback to run every frame.
 
 ```rust
-use core::time::Duration;
+use zgui::view::FrameHandle;
+
+fn spin(timers: Timers, angle: RwSignal<f32>, pending: StoredValue<Option<FrameHandle>, LocalStorage>) {
+    let next = timers.clone();
+    pending.set_value(Some(timers.request_frame(move |now| {
+        // Derive the value from the timestamp, so a slow frame is one bigger step.
+        angle.set((now.since_origin().as_secs_f32() * 90.0) % 360.0);
+        spin(next, angle, pending);
+    })));
+}
 
 #[component]
 fn Sweep() -> impl IntoView {
     let angle = RwSignal::new(0.0f32);
-
-    let ticking = set_interval(Duration::from_millis(16), move || {
-        angle.update(|angle| *angle = (*angle + 6.0) % 360.0);
-    });
-    on_cleanup_local(move || drop(ticking));
+    // Dropped with the component, which cancels the pending request.
+    let pending = StoredValue::new_local(None::<FrameHandle>);
+    spin(Timers::current().expect("a component body is inside a window"), angle, pending);
 
     view! {
         box(
@@ -543,21 +346,17 @@ fn Sweep() -> impl IntoView {
 }
 ```
 
-Know what this costs. Each write replaces an inline declaration, so the element cascades on every
-tick: this is the cascade path, driven by a timer deadline instead of an animation deadline, and it
-is not tied to the output's refresh rate. The same rotation written as `@keyframes` takes the
-placement path and never restyles. Reach for the interval only when the value genuinely cannot be
-expressed in a sheet.
+Each write replaces an inline declaration, so the element takes the cascade path every frame. The
+same rotation written as `@keyframes` takes the placement path. See
+[UI tasks and timers](/docs/learn/async-and-timers#run-work-on-the-next-frame) for the full
+`request_frame` API.
 
-## What is not wired up
+## Not supported
 
 | Feature | State |
 |---|---|
-| `animation-timeline`, `animation-range-start`, `animation-range-end` | parse and cascade; nothing reads them. There are no scroll-driven animations |
-| `animation-composition` | parses; nothing reads it |
-| `transition-behavior: allow-discrete` | parses; nothing reads it |
-| `animation-play-state` | reaches the engine, which creates a paused animation. No test in the repository exercises it |
-| `prefers-reduced-motion` | not a media feature the engine answers. An application that wants it reads the setting itself and switches a class or a sheet |
+| `animation-timeline`, `animation-range-start`, `animation-range-end`, `animation-composition` | parsed and ignored; there are no scroll-driven animations |
+| `prefers-reduced-motion` | not a supported media feature, and an `@media` rule using it is dropped. Detect the preference yourself and set an attribute or class on the root, for example `[reduced-motion] .toast { animation: none }` |
 
 ## Next
 

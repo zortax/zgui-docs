@@ -1,37 +1,36 @@
 ---
 title: The style engine
-description: How zgui drives Stylo — the DOM traits, selector matching, the state word, the cascade, computed-style sharing, the restyle walk and damage translation.
+description: How zgui drives Stylo — the DOM traits, stylesheets, the mutation filter, the restyle pass, selector matching, custom-property narrowing, computed-style sharing, damage translation and animations.
 ---
 
-zgui does not implement CSS. It implements the seven traits a CSS engine asks a document for, and
-drives that engine once per frame over the elements that owe a restyle. This page is the whole of
-that arrangement: what the engine is handed, what it hands back, and what turns its answer into work
-for the stages below. It assumes [the architecture overview](/docs/architecture/overview) and the
-guide's [Styling](/docs/learn/styling) page.
+`zgui-style` computes a style for every element using Stylo, the CSS engine from the Servo project.
+It runs in the `f.restyle` step of [the frame](/docs/architecture/the-frame): after the reactive
+flush has changed the document, and before the box tree is patched and laid out. It takes the
+elements that owe a restyle, matches selectors and runs the cascade for them, and turns the result
+into invalidation marks that tell layout, text and paint what to redo.
 
-## Stylo is a library
+The sections follow that flow: what zgui gives the engine (the document and the sheets), how a
+document change reaches the restyle, the pass itself, and what comes out of it. The user-facing
+model is in [Styling](/docs/learn/styling).
 
-**Stylo** is the CSS engine written for the Servo browser project. It is a Rust library, not an
-embedded browser. What it contains is exactly four things:
+## Stylo and the crates around it
+
+**Stylo** is used as a Rust library (`stylo = "=0.19.0"`, pinned exactly). It provides four things:
 
 | Part | What it does |
 |---|---|
-| The parser | Turns sheet text into rules, at-rules and declaration blocks. |
-| The rule set (`Stylist`) | Indexes those rules so that the ones that can match an element are found without scanning. |
-| The selector matcher | Answers whether one selector matches one element. |
-| The cascade | Resolves every property on one element to one value, with no keywords and no relative units left. |
+| Parser | Turns sheet text into rules, at-rules and declaration blocks. |
+| Rule set (`Stylist`) | Indexes rules so the ones that can match an element are found without a scan. |
+| Selector matcher | Answers whether one selector matches one element. |
+| Cascade | Resolves every property on an element to one computed value. |
 
-What it does **not** contain: an HTML parser, a script engine, a network stack, a layout algorithm,
-a painter, or a notion of a window. Every one of those is zgui's, and none of them is derived from
-the engine's.
-
-Three crates carry the arrangement.
+It has no HTML parser, script engine, layout, painter or window. Those are all zgui's.
 
 | Crate | Role |
 |---|---|
-| `zgui-css` | Names the engine, and is the only crate that does. Re-exports `ComputedStyle`, the computed value types, the engine's length unit, the feature flags and the parity register. |
-| `zgui-dom` | Implements the engine's seven DOM traits over `Node<'doc>`. This is the tree the engine walks. |
-| `zgui-style` | Owns the `Stylist`, the device and the installed sheets. Runs the traversal, then translates what it produced into obligations. |
+| `zgui-css` | The public face of the engine. Re-exports `ComputedStyle`, the computed value types, the engine's length unit, the feature flags and the parity register. |
+| `zgui-dom` | Implements the engine's DOM traits over `Node<'doc>`. This is the tree the engine walks. |
+| `zgui-style` | Owns the `Stylist`, the device and the installed sheets. Runs the traversal and turns its result into invalidation marks. |
 
 <ExchangeDiagram
   label="The relationship between zgui-style, the CSS engine, and zgui-dom"
@@ -50,793 +49,568 @@ Three crates carry the arrangement.
   foundation="zgui-dom · the document and its CSS-engine trait implementations"
 />
 
-`crates/zgui-css/src/lib.rs` is a firewall. Sixteen crates read computed styles, and none of them
-names the engine, the engine's length unit or the geometry library its container-query hook answers
-in. Those three edges stop at `zgui-css`, so replacing or patching the engine is a change to three
-manifests rather than to sixteen.
+Only these three crates name Stylo directly. Every other crate that reads computed styles (layout,
+text style, paint, runtime and others) goes through `zgui-css`, so an engine upgrade touches three
+manifests rather than every consumer.
 
-Two engine-wide decisions are made once and never revisited:
+Two engine-wide settings are fixed:
 
-- **Quirks mode is off**, always. `stylist::new` calls `Stylist::new(device, QuirksMode::NoQuirks)`
-  (`crates/zgui-style/src/engine/stylist.rs`), and `TDocument::quirks_mode` answers
-  `QuirksMode::NoQuirks` as well.
-- **The engine's feature preferences are set before any sheet is parsed.**
-  `StyleEngine::new` calls `zgui_css::enable_css_features()` first. Every flag is read at *parse*
-  time, so a sheet parsed before the flags are set loses those declarations without reporting them.
+- **Quirks mode is always off.** `Stylist::new(device, QuirksMode::NoQuirks)` in
+  `crates/zgui-style/src/engine/stylist.rs`, and `TDocument::quirks_mode` answers the same.
+- **Feature preferences are set before any sheet is parsed.** `StyleEngine::new` calls
+  `zgui_css::enable_css_features()` first. Stylo reads these flags at parse time, so a sheet parsed
+  earlier would silently lose the gated declarations.
 
 ## The DOM traits
 
-Seven trait implementations, all on one handle: `Node<'doc>`, a `Copy` handle the size of a `usize`.
-They live under `crates/zgui-dom/src/stylo/`.
+Stylo reads the document only through a set of traits. All of zgui's implementations are on one
+handle, `Node<'doc>`, a `Copy` value the size of a `usize`. They live under
+`crates/zgui-dom/src/stylo/`.
 
-| Trait | File | What it has to answer |
+| Trait | File | What it answers |
 |---|---|---|
-| `TDocument` | `document.rs` | Is this an HTML document? Which quirks mode? Which lock do style sheets, style attributes and restyle guards share? |
-| `NodeInfo` | `node.rs` | Is this node an element, or text? |
-| `TNode` | `node.rs` | The plain tree links, the node's opaque identity, and whether it is attached. |
-| `TShadowRoot` | `shadow_root.rs` | Nothing. There are no shadow trees; the trait is satisfied because `TNode` names a concrete shadow-root type and there is no way to say "none". |
-| `TElement` | `element/mod.rs` | The cascade's whole view: the traversal children, the inline declaration block, the animation and transition rules, the state word, the identifier, the classes, the custom states, the attribute names, the engine's per-element data, and what a layout-affecting change costs. |
-| `selectors::Element` | `selectors/mod.rs` | The matcher's view: one method per simple selector, plus the steps to a parent, a sibling and a first element child. |
-| `AttributeProvider` | `attributes.rs` | One attribute's value by name, as a string. |
+| `TDocument` | `document.rs` | HTML or not, the quirks mode, and the lock shared by sheets, style attributes and restyle guards. |
+| `NodeInfo` | `node.rs` | Element or text. |
+| `TNode` | `node.rs` | Tree links, opaque identity, whether the node is attached. |
+| `TShadowRoot` | `shadow_root.rs` | Nothing. There are no shadow trees; the type exists only because `TNode` must name one. |
+| `TElement` | `element/mod.rs` | Traversal children, inline declarations, animation rules, the state word, id, classes, custom states, attribute names, per-element style data, and layout damage. |
+| `selectors::Element` | `selectors/mod.rs` | One method per simple selector, plus steps to parent, sibling and first element child. |
+| `AttributeProvider` | `attributes.rs` | One attribute's value by name. |
 
-Three properties hold across the whole surface.
+Rules that hold across all of them:
 
-**Nothing here holds state.** Every method is a read of the node record, or of a table reached
-through the record's back-pointer. That is what makes the surface safe to call from several workers
-at once: the engine hands one element to each worker, and each worker walks *outwards* — up for a
-descendant combinator, sideways for a sibling one, down for a structural pseudo-class — so any
-method may run against an element another worker is standing on.
+- **Reads are stateless.** Every method reads the node record or a table it points to, so several
+  style workers can call them at once, even on neighbouring elements.
+- **Only two kinds of write exist,** and both use atomics: `apply_selector_flags` (which writes on
+  the element and its parent) and the bookkeeping-bit setters. A plain read-modify-write in
+  `apply_selector_flags` could lose a flag when two workers match two siblings
+  (`crates/zgui-dom/src/stylo/selectors/flags.rs`).
+- **Element methods are never called on a text node.** The matcher reaches elements only through
+  links that already filter to elements. Debug assertions enforce this.
 
-**Exactly two things write.** `apply_selector_flags`, which writes on the element *and on its
-parent*, and the bookkeeping-bit setters. Both go through atomics. A read-modify-write of a plain
-integer in `apply_selector_flags` would lose one of two flags written by two workers matching two
-siblings, and the symptom would appear much later as a rounded corner that stops updating
-(`crates/zgui-dom/src/stylo/selectors/flags.rs`).
+Some methods always return the same answer:
 
-**The element half is unreachable from a text node.** The matcher reaches an element only through
-the parent link, the element-only sibling chain or the matching context's roots, and every one of
-those already filters to elements. A debug assertion at the head of each identity and state module
-says so, so a future change that widens an entry point fails loudly instead of matching a text node
-against a class selector and quietly answering no.
-
-Several methods answer a constant, and each constant is a decision rather than a stub:
-
-| Method | Answer | Consequence |
+| Method | Answer | Effect |
 |---|---|---|
-| `parent_node_is_shadow_root`, `containing_shadow_host`, `shadow_root`, `is_html_slot_element` | never | `:host`, `::slotted()` and `::part()` parse and can never match. |
-| `is_html_element`, `is_svg_element`, `is_mathml_element`, `is_html_document` | false | There is no document language, so names match case-sensitively as written. |
-| `query_container_size` | `(None, None)` | The hook remains in the engine contract, but `@container` rules are dropped whole during parsing. |
-| `subtree_bloom_filter` | `SUBTREE_FILTER_UNFILTERED`, which is `u64::MAX` | "Anything may be below here." A real subtree summary costs an update on every ancestor of every insertion, and nothing here is bounded by the walk it would save. |
-| `lang_attribute`, `matches_lang` | `None`, `false` | `:lang(en)` and `:lang(fr)` both fail, rather than both succeeding. |
-| `may_generate_pseudo` | true, except `::first-letter` | Inline layout builds no first-letter box, so resolving that style would store a value nothing reads, on every element, on every restyle. |
+| `parent_node_is_shadow_root`, `containing_shadow_host`, `shadow_root`, `is_html_slot_element` | never | `:host`, `::slotted()` and `::part()` parse but never match. |
+| `is_html_element`, `is_html_document` and friends | `false` | Names match case-sensitively as written. |
+| `query_container_size` | `(None, None)` | Unused: `@container` blocks are dropped at parse time and reported as dropped at-rules. |
+| `subtree_bloom_filter` | `u64::MAX` | "Anything may be below." A real summary would cost an update on every ancestor of every insertion. |
+| `lang_attribute`, `matches_lang` | `None`, `false` | `:lang(...)` never matches. |
+| `may_generate_pseudo` | `true` except `::first-letter` | Inline layout builds no first-letter box, so its style is never resolved. |
 
-## Selector matching
-
-A **selector** is a chain of *compound* selectors joined by *combinators*. `.card > .title:hover` is
-two compounds — `.card`, and `.title:hover` — joined by the child combinator. The matcher works
-right to left: it tests the rightmost compound against the candidate element, then steps to another
-element and tests the next compound there.
-
-### One method per simple selector
-
-Each *simple* selector — one name, one class, one attribute test, one pseudo-class — is one method
-on `selectors::Element`, and each answers in constant time.
-
-| Written | Method | How it is answered |
-|---|---|---|
-| `row` | `has_local_name` | `&self.tag_name().0 == name`. Both sides are interned `web_atoms::LocalName` handles, so this is a handle comparison, not a string comparison. |
-| `#main` | `has_id` | The identifier is a copyable handle in the node record, resolved through the document's identifier table. |
-| `.card` | `has_class` | A scan over a pre-split, pre-interned run of names. |
-| `[data-state="open" i]` | `attr_matches` | A lookup by name, then `operation.eval_str(value)` — the engine's own comparison, which carries the operator *and* the `i` or `s` case flag. |
-| `:hover`, `:checked`, and thirty-one more | `match_non_ts_pseudo_class` | One mask test against the element's state word. See below. |
-| `:state(selected)` | `has_custom_state` | A lookup in the element's own custom-state column. |
-| `:empty` | `is_empty` | No element child, and no text child holding anything. A marker node and an empty text node both leave the element empty. |
-| `:root` | `is_root` | The parent is the document node. Read from the link, not from a stored bit, so a reparent changes the answer without touching the element. |
-| `:nth-child()`, `:first-child`, `:only-of-type` | — | Counted by the selector library itself, by stepping the element-only sibling chain. |
-| `::before`, `::after` | `match_pseudo_element` | Always `false`. There is no pseudo-element node, which is why generated content does not shift `:nth-child` or `+`. |
-
-Every one of those passes its answer through `tally::tested`, which bumps
-`Counter::SelectorMatches`. Steps to another candidate are deliberately **not** counted: walking is
-not testing, and counting it would make the number depend on the shape of the tree rather than on
-the shape of the rule set.
-
-### Interning makes a name test one comparison
-
-`class = "btn btn-primary large"` is one string when a view writes it and three names when the
-matcher reads it. The split and the interning happen **once, at the write**, in
-`crates/zgui-dom/src/arena/class_pool.rs`. The node record then holds a `ClassSpan` — an offset and
-a length into the document's class pool — and nothing else.
-
-```rust
-pub struct ClassPool {
-    /// Every run of names ever written, back to back.
-    names: Vec<AtomIdent>,
-}
-
-impl ClassPool {
-    pub fn resolve(&self, span: ClassSpan) -> &[AtomIdent];
-    pub fn intern<'a>(&mut self, names: impl IntoIterator<Item = &'a str>) -> ClassSpan;
-}
-```
-
-So selector matching never splits a string, never allocates and never compares characters. Names are
-appended and never removed: rewriting a node's classes appends a new run and leaves the old one
-behind. That is the trade the pool exists to make. Reclaiming the old run would mean either moving
-names other nodes point at, or maintaining a free list over a structure whose whole value is that a
-lookup is a slice index.
-
-Element names go the same way. `Node::tag_name` hands back a reference *into* the record rather than
-constructing an interned string on every test.
-
-### Combinators step one pointer
-
-Two sibling chains are maintained on every node, and keeping them apart is the point.
-
-| Chain | Who walks it | Includes text and markers? |
-|---|---|---|
-| The plain chain — `first_child`, `next_sibling`, `prev_sibling` | The style traversal, because a text node inherits from the element above it and something has to visit it to say so. | yes |
-| The element-only chain — `prev_element`, `next_element`, `first_element_child` | Selector matching. | no |
-
-Both are written when a node is linked in, so every step of a combinator is one pointer hop.
-
-| Combinator | Step | Method |
-|---|---|---|
-| `A B` (descendant) | to the parent, repeatedly | `parent_element_handle` |
-| `A > B` (child) | to the parent, once | `parent_element_handle` |
-| `A + B` (next sibling) | back one element | `prev_element_sibling` |
-| `A ~ B` (subsequent sibling) | back along elements, repeatedly | `prev_element_sibling` |
-
-Deriving the element-only chain from the plain one at match time would turn a constant-time step
-into a scan past however much text happens to be in the way
-(`crates/zgui-dom/src/stylo/element/tree.rs`).
-
-### The ancestor filter
-
-Before walking ancestors for a descendant combinator, the matcher consults a **bloom filter** — a
-fixed-size bit set that answers either "definitely not present" or "possibly present", and never
-gives a false negative. A negative answer is certain and costs one word, which is what makes a sheet
-full of `.card .title` rules affordable. A positive answer means the ancestor walk runs as usual.
-
-Filling that filter is one method, `add_element_unique_hashes`, and it must insert the same hashes
-the matcher will later look for: the element's local name, its identifier and each of its classes.
-Deriving them by hand is exactly the mistake that would break it, so
-`crates/zgui-dom/src/stylo/bloom.rs` defers to the engine's own `each_relevant_element_hash`. A
-missing hash would make the filter answer "no" for an ancestor that is really there, and the rule
-would stop applying with no diagnostic.
-
-## The state word
-
-One `u64` per element, held as an `AtomicU64` in the node record. It is the single source of truth
-for the state pseudo-classes: there is no second hover set and no second focus set anywhere in the
-framework. Input routing writes the bits, selector matching reads them, and the engine invalidates by
-comparing the word across a mutation.
-
-The word has two names. Everything above the document speaks `zgui_vocab::UiState`, which carries no
-engine vocabulary; the engine speaks its own `ElementState`. They are the same bits in the same
-positions:
-
-```rust
-/// The style engine's form of an interaction state.
-pub const fn to_engine(state: UiState) -> ElementState {
-    ElementState::from_bits_retain(state.bits())
-}
-```
-
-That is a reinterpretation, not a translation, and it stays true because both sides state the layout
-at compile time. `crates/zgui-vocab/src/state/assert.rs` writes out every bit position longhand as a
-`const` assertion, and `crates/zgui-dom/src/node/element/state.rs` — the one module that names both
-types — asserts each pair against the engine's own constant. A bit that moves on either side stops
-the build instead of matching the wrong pseudo-class, which is a defect with no stack trace.
-
-A pseudo-class therefore becomes a mask test:
-
-```rust
-pub fn matches_pseudo_class(
-    self,
-    class: &NonTSPseudoClass,
-    context: &mut MatchingContext<SelectorImpl>,
-) -> bool {
-    let flag = class.state_flag();
-    if !flag.is_empty() {
-        return self.element_state().intersects(flag);
-    }
-    match class {
-        NonTSPseudoClass::Lang(lang) => self.matches_lang(None, lang),
-        NonTSPseudoClass::CustomState(state) => self.has_custom_state_named(&state.0),
-        _ => false,
-    }
-}
-```
-
-Thirty-three of the engine's thirty-six non-tree-structural pseudo-classes carry a state flag, and
-the *engine itself* supplies the mapping. That is why the implementation is one line and not a
-thirty-three-arm match that could disagree with the engine's own invalidation about which bit means
-what. Three do not carry a flag and need arms of their own: `:lang()`, `:state()`, and one
-engine-internal legacy class about table borders.
-
-Three consequences follow from the word being the only home:
-
-- **`:link` and `:visited` are folded into the word** when an element's attributes are written,
-  rather than asked of the installed link resolver at match time. An answer computed on the fly
-  during matching would change without the word changing, so nothing would be invalidated and the
-  old style would stay on the screen.
-- **Author-defined states are not in the word.** The word is a closed set of bits with a fixed
-  meaning each, and an author's vocabulary has neither. They live in a column of their own, and the
-  invalidation they need comes from whatever set them.
-- **A view may assert eight bits.** `UiState::AUTHOR_SETTABLE` is `CHECKED | DISABLED | OPEN |
-  INDETERMINATE | PLACEHOLDER_SHOWN | READ_ONLY | REQUIRED | INVALID`. The rest are computed by the
-  framework, and a view that could assert `:hover` would be lying to the input system.
-
-## Origins and the cascade
-
-The **cascade** is the rule that decides one value when several declarations name one property on
-one element. It runs on three inputs in order: which origin the declaration came from, how specific
-its selector is, and where its sheet sits.
+## Stylesheets and origins
 
 ```rust
 pub enum SheetOrigin { UserAgent, User, Author }
-```
 
-| Rule | Behaviour |
-|---|---|
-| Ordinary declarations of equal specificity | A later origin wins. Author beats user, which beats user-agent. |
-| `!important` declarations | The order reverses. A user-agent `!important` rule beats an author one. |
-| Within one origin | Installation order. A sheet added later wins at equal specificity. |
-| Specificity | Counted by the engine, per selector: identifiers, then classes and attributes and pseudo-classes, then element names. |
-
-Nothing in zgui decides any of that. Specificity, inheritance, `!important`, and the
-`initial` / `inherit` / `unset` / `revert` keywords are the engine's own, and none of them is
-reimplemented or restricted here. `crates/zgui-style/tests/device.rs` asserts the origin ordering
-and the `!important` reversal, and asserts that a sheet inserted before another loses to it at equal
-specificity.
-
-The user-agent sheet is installed by `StyleEngine::new` and held for the engine's life. It must
-parse whole — a `debug_assert!` says so — because it is what gives every element name its display
-default before a single application rule is written.
-
-### The root-metrics fixpoint
-
-`rem`, `rlh`, `rex`, `rch` and `ric` resolve against the **root element's computed** values, which
-are only known once the root has been styled. So the root's metrics are pushed back into the device
-at the *tail* of a restyle:
-
-```rust
-pub(crate) fn push_root_metrics(
-    stylist: &Stylist,
-    document: &Document,
-    last: &mut RootMetrics,
-) -> bool
-```
-
-It returns `true` only when a metric **moved** *and* something had already resolved a unit against
-the value it moved from. Both halves are guarded, which is what keeps the fixpoint at one pass for a
-document that uses none of these units. A document whose root font size holds still converges in one
-pass; one whose root font size moves under something written in `rem` runs the traversal a second
-time. There is a hard limit of two ordinary passes, and a third could not converge on anything the
-second did not.
-
-## Computed-style sharing
-
-A **computed style** is one element's fully resolved style: every property with a value, no
-keywords, no inheritance and no relative units left.
-
-```rust
-pub type ComputedStyle = ServoArc<ComputedValues>;   // servo_arc::Arc
-```
-
-It is a reference-counted pointer, and so is each property group behind it — background, border,
-effects, outline, font, text, position, and the rest. Two elements that cascade to the same result
-share the same allocations, and two elements that differ only in their background still share one
-font group. That is what turns "a thousand identically styled buttons" into one unit of downstream
-work rather than a thousand.
-
-A consumer keys its own work on the identity of a group:
-
-```rust
-/// The identity of one property group's allocation.
-pub struct StructPtr(pub usize);
-
-impl StructPtr {
-    pub fn of<T>(group: &T) -> Self;
-    pub fn custom_properties(style: &ComputedStyle) -> (Self, Self);
-    pub fn font(style: &ComputedStyle) -> Self;
-    pub fn inherited_text(style: &ComputedStyle) -> Self;
-    pub fn inherited_box(style: &ComputedStyle) -> Self;
-}
-```
-
-<Callout type="warn">
-**Equal identity proves equal values. Unequal identity proves nothing.** The cascade runs across
-several worker threads, and each worker builds its own sharing cache — so *n* workers can produce
-*n* distinct allocations for one logical style. A cache keyed only on identity is therefore a fast
-path, never the only answer.
-</Callout>
-
-The fallback is a content hash, and `crates/zgui-paint/src/lower/cache.rs` is the worked example.
-`PaintStyleCache` holds two lookups:
-
-| Lookup | Type | Cost |
-|---|---|---|
-| `by_identity` | `FxHashMap<LoweringKey, PaintStyleRef>` | A handful of integer tests. This is the path a document full of similar elements takes. |
-| `by_content` | `FxHashMap<u64, SmallVec<[PaintStyleRef; 1]>>` | A hash narrows the search and equality settles it, because a hash collision that aliased two styles would paint one element in another's colours and report nothing. |
-
-An identity miss lowers the style, hashes the *lowering*, and on a content hit throws its own work
-away and aliases the new identity onto the entry that already exists. The hash is therefore paid
-only on the path that had already paid for a lowering. `Counter::StylesLowered` and
-`Counter::StylesLoweredFromCache` are the pair to read; what matters is the ratio.
-
-Sharing is also what makes anonymous boxes work. `zgui_css::inherited_style(parent)` builds the
-style of a box CSS requires but no element declares, and it hands out the parent's *own* inherited
-allocations rather than copies of them, plus a `OnceLock` of reset values shared by every such box.
-A style that copied the parent's values into fresh allocations would agree with the parent on every
-property and be a stranger to all of them — the run's glyphs would claim a colour slot no element
-owns, and a colour written through the element's slot would re-colour nothing on the screen.
-
-## The restyle walk
-
-`StyleEngine::restyle` is one call that does the traversal, the damage translation and the
-retirement, because the three cannot be separated.
-
-```rust
-pub fn restyle(&mut self, document: &mut Document, pool: Option<&StylePool>) -> Restyle;
-```
-
-### What is visited
-
-The traversal descends only where a node's invalidation word says there is style work at or below
-it. `Dirty::RESTYLE | Dirty::RECASCADE` is that pair, named `STYLE_WORK` in
-`crates/zgui-dom/src/stylo/flags.rs`, and the engine's `has_dirty_descendants` is a *view* of the
-subtree half of the word rather than a flag of its own.
-
-<Callout type="info">
-`unset_dirty_descendants` is implemented as a deliberate no-op. Storing the engine's flag as well
-would give one obligation two storages retired at two different times, and a mark taken between the
-two would be dropped silently. The rule the module states holds for every descent flag: **a descent
-flag may only be consumed by the traversal that retires the bits it was raised for.** The word is
-retired once, at the tail of `restyle`, by an explicit `walk::walk` over `RESTYLE | RECASCADE`.
-</Callout>
-
-The gate before any of that is `needs_restyle`, and it is a union of three inputs:
-
-```rust
-pub fn needs_restyle(&mut self, document: &Document) -> bool {
-    self.animation_restyle_owed
-        || driver::document_owes_restyle(document)
-        || self.sheets_have_changed()
-}
-```
-
-The third matters: adding, replacing or dropping a sheet marks nothing on any node, so a gate that
-read only the document's obligations would be false for it and a saved sheet would change nothing on
-screen.
-
-### The pre-mutation records
-
-Before the traversal, `RestyleSnapshots::take` removes the document's snapshot set and owns it for
-the whole restyle. A **snapshot** is a record of what an element looked like before it was changed.
-Without one, the engine re-matches the changed element and *only* the changed element, so every
-selector that reached the element sideways keeps the answer it had, and `.item:hover + .label` never
-lights up with nothing reporting a problem.
-
-Every record carries the previous state word and the element's attributes. A state change does not
-normally need the attributes, but a style sheet can be installed before the next traversal. The
-style engine then reads classes from the existing snapshot while invalidating the new sheet, so an
-attribute-free state record would make that valid sequence panic. Attribute writes additionally
-mark which class, identifier, or named attribute changed.
-
-One record per element per batch: the record describes the element as the last restyle left it, so
-the first change in a batch is the one worth recording.
-
-### What each worker does
-
-`RecalcStyle::process_preorder` (`crates/zgui-style/src/driver/traversal.rs`) reads two answers about
-the element *before* the call that destroys them, then styles it, then decides whether to record it.
-
-```rust
-pub struct Restyled {
-    pub node: NodeKey,
-    pub index: NodeIndex,
-    pub damage: RestyleDamage,
-    pub initial: bool,
-    pub matched: bool,
-    pub pseudos: [usize; 2],
-}
-```
-
-- `initial` is read before `recalc_style_at`, because giving the element styles destroys the answer.
-  A first-time cascade accumulates no damage at all, so this is the only signal that content which
-  has never been styled needs laying out.
-- `matched` distinguishes an element that ran selector matching from one that only re-ran its
-  cascade. The two mean different amounts of work, and they are counted separately as
-  `Counter::ElementsRestyled` and `Counter::ElementsRecascaded`.
-- `pseudos` holds the identities of the `::before` and `::after` cascade results, or zero. A
-  pseudo-element has no node and therefore no row in any per-node table, so without these a rule that
-  changes only the colour of generated content would produce no damage at all.
-- An element the traversal merely descended **through** is not recorded. Counting it would turn every
-  budget into a statement about how deep the document is.
-
-The set is collected **by the traversal**, into one `Mutex<Vec<Restyled>>` per worker index,
-concatenated at the end. The alternative is to read it back off the tree afterwards, because the
-engine records "this element was restyled" as a flag inside each element's data with no list behind
-it. On a ten-thousand-node document that scan costs about **fifteen times** the incremental restyle
-it is reporting on, and it would be paid on every frame.
-
-### The pool
-
-`StylePool::new(threads)` clamps to `zgui_css::MAX_STYLE_THREADS`, which is **6** — a hard ceiling
-of the engine's, because the extra workers fall outside what its per-worker storage is sized for.
-Workers are named `zgui-style-{index}`, run `initialize_layout_worker_thread` in their start handler,
-and get a 512 KiB stack, because matching and the cascade recurse with the document.
-
-<Status kind="partial">The shipped runtime passes `None`.</Status> `crates/zgui-runtime/src/window/frame.rs`
-calls `self.engine.restyle(&mut document, None)`, so a frame's cascade runs on the calling thread
-today. The pool is exercised by `crates/zgui-style/tests/restyle/throughput.rs`, which prints a
-sequential and a six-worker rate over 4 000 rows and asserts only that both styled the same
-elements — "a timing is a property of the machine, so nothing here is a threshold".
-
-### What the filter drops before the engine sees it
-
-Most of what a running interface writes to a document cannot change a single computed value. A
-component library styles `:hover` and `:focus-visible`; nothing in it styles `:read-only`,
-`:in-range` or `:indeterminate`, and nothing matches the data attributes its variants are driven by.
-
-The document's mutation API is handed a `StyleFilter`
-(`crates/zgui-dom/src/mutate/filter.rs`), implemented as `StyleFilterView`
-(`crates/zgui-style/src/deps/mod.rs`) by the crate that owns the rule set.
-
-```rust
-pub trait StyleFilter {
-    fn states_for(&self, element: Node<'_>) -> ElementState;
-    fn names_class(&self, class: ClassName) -> bool;
-    fn names_attr(&self, attr: AttrName) -> bool;
-    fn is_disabled(&self) -> bool;
-}
-```
-
-| Question | Source | Answered from |
-|---|---|---|
-| Does any selector mention this class name? | `deps/class_set.rs` | The rule set's *dependency* index, not its matching map — so `.theme-dark .btn { … }` correctly reports `theme-dark` as mattering. |
-| Does any selector mention this attribute name? | `deps/attr_set.rs` | The same index. |
-| Which state bits could any selector matching **this element** depend on? | `deps/state_mask.rs` | `invalidation_map().state_affecting_selectors`, looked up per element. |
-
-The third is per element and not per document, and that is the whole of its value. Any real sheet
-styles `:hover` somewhere, so a document-wide mask has the hover bit set and every hover anywhere
-takes the slow path. The lookup is bucketed by the element's root-ness, its identifier, each of its
-classes and its local name, so it visits only the buckets that element falls in.
-
-Because the answer is narrowed by the element's own identity, the cached copy is dropped **inside**
-the write that changes that identity — a class change, an identifier change, a reparent that changes
-root-ness, or a sheet-set change, which drops every cached answer at once. A cache that survived a
-class change would report that hover cannot matter for an element that has become a `.btn`, the
-hover write would be skipped, and the element would keep the wrong colour with no panic, no log and
-no counter to notice it by.
-
-Every method has a default that answers "this may matter". An implementation that errs that way is
-slow; one that errs the other way is wrong, because a change that is filtered out is a change nothing
-ever restyles for.
-
-## Damage: the translation step
-
-The engine reports what a restyle damaged in its own vocabulary. Turning that into obligations for
-the stages below is one function, and it is the step to name:
-
-```rust
-// crates/zgui-style/src/damage/translate.rs
-pub fn translate(
-    store: &mut DocumentStore,
-    texts: &mut TextKeyStore,
-    record: &Restyled,
-    style: &ComputedStyle,
-    out: &mut DamageSink,
-);
-```
-
-**Damage** here means the record of what became invalid. It is written on nodes as obligations —
-`Dirty::RELAYOUT`, `Dirty::REPAINT` and the rest — never as a global flag, and the stages below
-descend only where obligations live.
-
-Two facts make the translation necessary rather than cosmetic:
-
-- **The engine's relayout bit is not this pipeline's relayout.** It is set for a border colour, a
-  corner radius, a box shadow and a mask, because the layout the engine was written for keeps
-  painting fragments inside its boxes and rebuilds them. Taking the bit at its word rebuilt every box
-  in the document for a colour.
-- **The engine's repaint bit is not the paint predicate, and must not become one.** Border colours,
-  corner radii, visibility, masks and box shadows carry no damage annotation at all, so a hover that
-  changes a border colour arrives with empty damage.
-
-The engine's four damage levels are a nested lattice — relayout contains recalculate-overflow
-contains rebuild-stacking-context contains repaint — so the arms are tested widest first, and under
-a relayout the engine's own narrower bits are excluded.
-
-| Condition | Obligations produced |
-|---|---|
-| `record.initial` — an insertion, or a subtree returning from `display: none` | `RELAYOUT \| REBUILD_BOX` |
-| Any of the **embedder's** own bits (`CONSTRUCT_BOX`, `CONSTRUCT_FC`, `CONSTRUCT_DESCENDANTS`, `RELAYOUT_BOX`, `RESHAPE_TEXT`, `REBREAK_TEXT`) | `RELAYOUT`; plus `REBUILD_BOX` for `CONSTRUCT_BOX`; plus `REBUILD_BOX` on the node **and** its subtree for `CONSTRUCT_DESCENDANTS`; plus `RESHAPE` / `REBREAK`, narrowed by the text keys below |
-| `RECALCULATE_INK`, or `RECALCULATE_OVERFLOW` without `RELAYOUT` | `REFRAGMENT \| REHIT \| REPAINT`. Transforms, `transform-origin`, `perspective-origin`, text decorations, corner radii, box shadows, clips and masks. Nothing moves in layout. |
-| `REBUILD_STACKING_CONTEXT` without `RELAYOUT` | `RESTACK \| REHIT \| REPAINT`. `z-index`, and anything that changes whether the element establishes a **stacking context** — a group of elements painted together as one unit, in an order the group decides. |
-| The paint-key comparison, run for **every** restyle | `REPAINT` when the key moved; plus `REBUILD_BOX` when only the pseudo-element identities moved |
-| The a11y-key comparison, run for every restyle | `A11Y` |
-
-The embedder's bits are the top twelve of the engine's damage word, filled in by the engine calling
-back into the document with both styles in hand — `TElement::compute_layout_damage`, which routes to
-`crates/zgui-dom/src/stylo/element/damage/`. There is deliberately **no** restacking bit among them:
-an embedder-relayout carrying none of the embedder's own bits is a change the engine could not
-classify more finely and this framework can.
-
-### The paint key
-
-The predicate that catches a colour change is a key of **addresses**, not of values.
-
-```rust
-pub struct PaintStyleKey {
-    pub background: usize,
-    pub border: usize,
-    pub effects: usize,
-    pub outline: usize,
-    pub svg: usize,
-    pub inherited_ui: usize,
-    pub inherited_box: usize,
-    pub text: usize,
-    pub box_: usize,
-    pub position: usize,
-    pub inherited_text: usize,
-    pub pseudo_before: usize,
-    pub pseudo_after: usize,
-    pub custom: (usize, usize),
-}
-```
-
-Two elements with the same key necessarily paint the same, because the cascade hands out shared
-immutable groups and two elements that cascaded alike hold the very same allocations. Comparing this
-frame's key with last frame's is therefore a handful of integer tests.
-
-Two details are worth stating exactly:
-
-- **The custom-property field over-fires and never under-fires.** The engine exposes no accessor for
-  a custom-property map's own allocation, so the identity is the address of the map's first entry
-  multiplied by 31 and exclusive-ored with its length. A fresh allocation holding the same properties
-  repaints an element that did not need it, and the elements that pay are exactly those that declare
-  custom properties of their own.
-- **A `::before` or `::after` change rebuilds the box.** A generated-content style is *cloned into*
-  the box that carries it, so a change to one has to rebuild that box rather than repaint the element
-  it hangs off. `pseudos_moved` is the test.
-
-The key names more groups than a paint lowering reads, and it has to: it must be a superset, or a
-change to a group a lowering consumes would produce no damage and no repaint at all.
-
-### Reshape against rebreak
-
-The engine's damage hook is an associated function with no receiver and no memory, so the only
-classification it can make is the conservative one — any layout-affecting change re-shapes. A
-**glyph** is one drawn shape from a font. **Shaping** turns a run of text into a sequence of
-positioned glyphs, and **breaking** decides where that sequence is cut into lines. Shaping is more
-expensive than breaking, and a width change or an alignment change moves no glyph.
-
-`TextKeyStore` supplies the memory the hook lacks:
-
-```rust
-pub enum TextWork { None, Rebreak, Reshape }
-
-impl TextKeyStore {
-    pub fn record(&mut self, node: NodeKey, style: &ComputedStyle) -> TextWork;
-    pub fn retire(&mut self, store: &DocumentStore) -> bool;
-}
-```
-
-Each element's `ShapingKey` and `BreakingKey` are hashed from exactly the properties the shaper and
-the line breaker read, and the classification and the hash are derived from one definition, so a
-property cannot be classified one way and hashed the other. An element with no previous keys reports
-`Reshape`, because it has never been shaped.
-
-Two guards apply. The narrowing runs **only inside a relayout**. And it is **not** applied when the
-engine reports its widest damage, `RestyleDamage::reconstruct()`, because that means a
-generated-content box started or stopped existing — the text under the element changed without any
-property of the element's own style moving.
-
-`retire` sweeps the store only once it has **doubled** since the last sweep, with a floor of 64. Each
-sweep is then paid for by at least as many insertions as it examines, and what a churning document
-holds stays within a factor of two of what it uses.
-
-### Text colour crosses as data
-
-A shaped paragraph stores an *index* into a paint table rather than a colour, so a theme change
-rewrites a handful of table entries instead of re-shaping every string. Producing the list is the
-style crate's job; the table belongs to the display list, which the style crate does not depend on.
-
-```rust
-pub enum TextRun { Own, Before, After }
-
-pub struct TextPaintUpdate {
-    pub node: NodeKey,
-    pub index: NodeIndex,
-    pub run: TextRun,
-    pub paint: TextPaint,
-}
-
-pub fn text_paint_updates(&self) -> &[TextPaintUpdate];
-```
-
-An element is the source of three runs — its own content, and what its `::before` and `::after`
-generate — and each cascades separately and holds its own colour. Naming which run an update is about
-is what keeps them apart.
-
-## Installing a sheet, and what it costs
-
-```rust
 pub fn add_sheet(&mut self, document: &Document, origin: SheetOrigin, source: SheetSource<'_>)
     -> (SheetHandle, CssDiagnostics);
 pub fn insert_sheet_before(&mut self, document: &Document, origin: SheetOrigin,
     source: SheetSource<'_>, before: &SheetHandle) -> (SheetHandle, CssDiagnostics);
 pub fn replace_sheet(&mut self, document: &Document, handle: &SheetHandle,
     source: SheetSource<'_>) -> CssDiagnostics;
+pub fn force_author_rules_dirty(&mut self);
 ```
 
-Installation **never fails**. An unrecognised declaration drops that declaration, a rejected selector
-drops that whole rule, an at-rule this build does not implement drops that block, and everything else
-applies. The `CssDiagnostics` are the only place a dropped item is visible, and every entry is also
-logged under the tracing target `zgui::css` at parse time, in release as well as in debug.
+- **Installation never fails.** An unknown declaration drops that declaration, a rejected selector
+  drops its rule, an unsupported at-rule (`@container`, for example) drops its block. Everything
+  else applies. The `CssDiagnostics` list each dropped item with its line; the runtime logs them
+  under the tracing target `zgui::css`.
+- **Removal is by dropping the handle.** The drop is recorded thread-safely and applied the next time
+  `sheets_have_changed()` runs.
+- **Replacement keeps the sheet's position** in the cascade. Removing and re-adding would move it to
+  the end of its origin, where it would start winning against sheets that used to beat it.
 
-Removal is by dropping the handle. The removal is *recorded* on drop, thread-safely, and *applied* at
-the start of the next frame that asks `sheets_have_changed()`. Replacement keeps the sheet's place in
-the cascade; removing and re-adding would move it to the end of its origin, where it would start
-winning against sheets that used to beat it.
+Specificity, inheritance, `!important` and the `initial` / `inherit` / `unset` / `revert` keywords
+are all handled by Stylo unchanged:
 
-### The cost is one frame of un-narrowed mutations
+| Rule | Behaviour |
+|---|---|
+| Normal declarations, equal specificity | Later origin wins: author over user over user-agent. |
+| `!important` declarations | Order reverses: user-agent `!important` beats author `!important`. |
+| Within one origin | Later-installed sheet wins at equal specificity. |
 
-A sheet change is invisible to every node's invalidation word, so it reaches the frame through
-`sheets_have_changed()` alone. What it costs is the **dependency filters**, and the schedule is two
-phases and not one:
+`crates/zgui-style/tests/device.rs` asserts the origin order, the `!important` reversal and
+insertion order. The user-agent sheet is installed by `StyleEngine::new`, must parse completely
+(checked by a `debug_assert!`), and gives every element name its default display.
 
-<Steps>
+### View sheets
 
-<Step>
+Components install their own sheets at run time (`install_stylesheet`, used by `style!`). The view
+queues a command, and the window applies it after the reactive flush and before the restyle
+(`crates/zgui-runtime/src/window/sheets.rs`), so a component is styled by its own sheet in the frame
+it first appears.
 
-**Before the reactive flush**, `disable_filters_if_sheets_changed` runs
-(`crates/zgui-runtime/src/window/frame.rs`). If the sheet set moved, the filter is switched off:
-`states_for` answers `ElementState::all()`, and both name predicates answer `true`. Every mutation in
-that one frame takes the full path — a snapshot, an ancestor mark and a traversal.
+| Case | What happens |
+|---|---|
+| New name | `add_sheet` appends it. Stylo invalidates existing elements by the new sheet's own selectors, and the component's new elements have no style yet, so they are styled against it anyway. The rest of the author rules are not rebuilt. |
+| Existing name, new text | `replace_sheet` keeps its position, then `force_author_rules_dirty` makes the next restyle re-collect the author origin and re-match the document. Rules that were removed have no selector left to invalidate by, so this is the only correct option. |
+| Same name, same text | No-op. |
 
-</Step>
+A sheet that arrives while the document is being built ("late sheet") therefore still reaches the
+elements already in the tree: a new sheet through its selectors, a replaced one through the forced
+author re-collection.
 
-<Step>
+## The mutation filter
 
-**The restyle flushes the rule set**, which repopulates the dependency index the filters are built
-from. `stylist.flush(guards).process_style(root, …)` also reports the elements the sheet change
-itself invalidates, which is how a sheet reaches a document in which nothing else changed.
+Most writes from a running interface cannot change any computed value. Before a class, attribute
+or state write is recorded for the restyle, the document asks a `StyleFilter` whether any selector
+could depend on it. A write the filter rules out takes no snapshot and causes no restyle.
+[The document](/docs/architecture/the-document#style-filters) describes the filter's methods, its
+defaults and the per-element state-mask cache.
 
-</Step>
+The style engine implements the filter as `StyleFilterView` (`crates/zgui-style/src/deps/`),
+answering from the rule set's dependency index:
 
-<Step>
+| Question | Source | Answered from |
+|---|---|---|
+| Does any selector mention this class? | `deps/class_set.rs` | The dependency index, so `.theme-dark .btn` reports `theme-dark`. |
+| Does any selector mention this attribute? | `deps/attr_set.rs` | The same index. |
+| Which state bits could selectors matching *this element* depend on? | `deps/state_mask.rs` | `invalidation_map().state_affecting_selectors`, looked up by the element's root-ness, id, classes and local name. |
 
-**At the tail of the same restyle**, `self.deps.rebuild(&self.stylist)` runs. This is the one phase at
-which the index describes the sheets that are installed. Rebuilding at the start of the frame cannot
-work and does not fail loudly: at that point the index still describes the previous set, and the flag
-that would trigger a rebuild is cleared by the flush in the same frame.
+## Sheet and media-query changes
 
-</Step>
+A sheet change marks no node. It reaches the frame through `sheets_have_changed()`, and its main
+cost is the mutation filter:
 
-</Steps>
+1. **Before the reactive flush**, the frame calls `disable_filters_if_sheets_changed`
+   (`crates/zgui-runtime/src/window/frame.rs`). If the sheet set changed, `states_for` returns
+   `ElementState::all()` and both name checks return `true`, so every mutation in that frame takes
+   the full path (snapshot, ancestor mark, traversal).
+2. **The restyle flushes the rule set.** `stylist.flush(guards).process_style(root, …)` also reports
+   the elements the sheet change invalidates, which is how a sheet reaches a document where nothing
+   else changed.
+3. **At the end of the same restyle**, `self.deps.rebuild(&self.stylist)` rebuilds the dependency
+   index. This is the only point where the index matches the installed sheets: earlier, it would
+   read the previous sheet set, and the flush clears the flag that would trigger a later rebuild.
 
-The traversal cost is the same shape for a media-query boundary that a resize crosses.
-`crates/zgui-style/tests/device.rs` asserts both directions:
+Media queries follow the same pattern. `crates/zgui-style/tests/device.rs` checks both directions:
 
 | Event | Result |
 |---|---|
-| A resize crossing no query boundary | `epoch.origins` is empty, `pass.styled == 0`, `pass.traversed` is false. |
-| A resize crossing a boundary | `pass.styled == harness.element_count()` — "the honest cost of re-collecting a whole origin's rules". |
+| Resize that crosses no media-query boundary | `epoch.origins` is empty (`OriginMask::EMPTY`), `pass.styled == 0`, `pass.traversed` is false. |
+| Resize that crosses a boundary | `pass.styled == harness.element_count()`: the whole origin is re-collected. |
 
-`OriginMask::EMPTY` is the interesting value, and the whole point of asking is to be able to do
-nothing when it holds.
+## The restyle pass
+
+```rust
+pub fn restyle(&mut self, document: &mut Document, pool: Option<&StylePool>) -> Restyle;
+```
+
+`StyleEngine::restyle` (`crates/zgui-style/src/engine/restyle.rs`) runs the traversal, translates
+damage and retires the style marks in one call.
+
+`needs_restyle` is true when an animation marked an element, when the document has style marks, or
+when `sheets_have_changed()`. The last input matters because adding, replacing or dropping a sheet
+marks no node.
+
+### Order of work
+
+1. **Settle the readers column** (`zgui_dom::side::readers::settle`), which records which subtrees
+   read which custom properties. See [Custom properties](#custom-properties).
+2. **Trim the rule-chain cache.** If the sheet set changed it is cleared; otherwise it is cleared
+   only when it holds more than 4,096 chains.
+3. **Take the snapshots** (`RestyleSnapshots::take`). A snapshot records an element's state word and
+   attributes before the first change in the batch, so the engine can re-evaluate selectors that
+   reach it from a sibling or ancestor (`.item:hover + .label`). Without one, only the changed
+   element itself would be re-matched.
+4. **Run the animation-only traversal**, if an animation marked an element. See
+   [Animations](#animations).
+5. **Run up to two ordinary passes**, the second only for
+   [root-relative units](#root-relative-units).
+6. **Translate each pass's records** into invalidation marks and text-colour updates. See
+   [Damage translation](#damage-translation).
+7. **Apply the marks**, garbage-collect the rule tree, rebuild the dependency index if it was
+   disabled, and drop text keys for removed nodes.
+8. **Retire `RESTYLE | RECASCADE`** with one `walk::walk`. The engine owns the traversal, so this
+   pair of bits has no other stage to retire it.
+
+### What is visited
+
+The traversal descends only where a node's invalidation word has `Dirty::RESTYLE` or
+`Dirty::RECASCADE` at or below it (`STYLE_WORK` in `crates/zgui-dom/src/stylo/flags.rs`). The
+engine's `has_dirty_descendants` reads the subtree half of that word.
+
+<Callout type="info">
+`unset_dirty_descendants` is a no-op. The word is cleared once, at the end of `restyle`. Keeping a
+separate copy of the engine's flag would store one obligation twice, cleared at different times, and
+a mark set between the two clears would be lost.
+</Callout>
+
+zgui also replaces the engine's per-element step (`crates/zgui-style/src/driver/recalc.rs`, derived
+from Stylo's `traversal.rs`). Stylo's version tells every child to recascade after any change to a
+reset property or a custom property. zgui's version derives the children's hint from what they can
+actually inherit, so a subtree is left alone when no inherited group moved.
+
+### Root-relative units
+
+`rem`, `rlh`, `rex`, `rch`, `rcap` and `ric` depend on the root element's computed style, which is
+known only after the root is styled. At the end of each pass, `push_root_metrics`
+(`crates/zgui-style/src/engine/stylist.rs`) writes the root's font size, line height and font
+metrics into the device. It requests a second pass only if a metric changed **and** something had
+already resolved a unit against the old value. A document that does not use these units always
+finishes in one pass. The limit is two passes; a third could not settle anything the second did not.
+
+### What each element reports
+
+`RecalcStyle::process_preorder` (`crates/zgui-style/src/driver/traversal.rs`) records each styled
+element as a `Restyled` (`node`, `index`, the engine's `damage`, and the fields below):
+
+| Field | Meaning |
+|---|---|
+| `initial` | First-time cascade. Read before styling, because styling erases it. A first cascade produces no engine damage, so this is the only signal that new content needs layout. |
+| `matched` | Selector matching ran (`Counter::ElementsRestyled`), as opposed to only the cascade (`Counter::ElementsRecascaded`). |
+| `pseudos` | Identities of the `::before` / `::after` results, or zero. Pseudo-elements have no node, so without these a colour change on generated content would produce no damage. |
+| `readers` | The bloom set of custom properties this element's rules read, for the readers column. |
+
+Elements the traversal only passed through are not recorded. Records go into one
+`Mutex<Vec<Restyled>>` per worker and are concatenated at the end; reading them back off the tree
+afterwards would cost far more than the incremental restyle itself.
+
+### The worker pool
+
+`StylePool::new(threads)` clamps to `zgui_css::MAX_STYLE_THREADS` (**6**); more workers would
+overflow the engine's per-worker storage. Workers are named `zgui-style-{index}` and get a 512 KiB
+stack.
+
+The application sets the worker count with `App::with_style_threads` (default: the machine's
+parallelism; `ZGUI_STYLE_THREADS` overrides it; `0` or `1` means no pool). The window hands the pool
+to `restyle` only for **broad** restyles:
+
+- the first cascade of a window;
+- a device change that flips a media query (`epoch.origins` is non-empty);
+- a resize that invalidates 32 or more elements using viewport units.
+
+Incremental restyles stay on the frame thread. Waking the pool for a handful of elements costs more
+than it saves (measured at about 4% of a scroll-recycle frame). On an ordinary resize step, viewport
+units are checked read-only first and the element data is borrowed for writing only where a unit was
+actually used.
+
+## Selector matching
+
+A selector is a chain of compound selectors joined by combinators. The matcher works right to left:
+it tests the rightmost compound against the element, then steps to a parent or sibling and tests the
+next one.
+
+### Simple selectors
+
+Each simple selector maps to one constant-time method on `selectors::Element`:
+
+| Selector | Method | How it is answered |
+|---|---|---|
+| `row` | `has_local_name` | Comparison of two interned `web_atoms::LocalName` handles. |
+| `#main` | `has_id` | The id is an interned handle stored in the node record. |
+| `.card` | `has_class` | A scan over the node's pre-interned class run. |
+| `[data-state="open" i]` | `attr_matches` | Look up the value, then the engine's own `operation.eval_str`, which handles the operator and the `i`/`s` flag. |
+| `:hover`, `:checked`, … | `match_non_ts_pseudo_class` | One mask test against the [state word](#the-state-word). |
+| `:state(selected)` | `has_custom_state` | A lookup in the element's custom-state column. |
+| `:empty` | `is_empty` | No element child and no non-empty text child. |
+| `:root` | `is_root` | The parent is the document node (read from the link, not a stored bit). |
+| `:nth-child()` and similar | — | Counted by the selector library along the element-only sibling chain. |
+| `::before`, `::after` | `match_pseudo_element` | Always `false`. Generated content has no node, so it does not shift `:nth-child` or `+`. |
+
+**Attribute selectors see `id` and `class`.** The id and class list live in the node record, not in
+the attribute table, for speed. `Node::attr_text` reads them anyway: `class` is returned as the
+class names joined by single spaces, in the order they were set. So `[class]`, `[id]`,
+`[class*=card]`, `[class~=red]`, `[class^="swatch gr"]` and `attr(id)` all see the same values that
+`.card` and `#id` do. The element also reports `id` and `class` in its attribute-name list, so
+attribute-selector invalidation fires when either changes.
+
+Every test result passes through `tally::tested`, which increments `Counter::SelectorMatches`.
+Steps between elements are not counted, so the counter reflects the rule set, not the tree depth.
+
+### Matching fast paths
+
+- **Class names are interned at write time.** `"btn btn-primary large"` is split and interned once.
+  The node record holds only a `ClassSpan` into the document's append-only `ClassPool`
+  (`crates/zgui-dom/src/arena/class_pool.rs`), so matching never splits, allocates or compares
+  characters. Rewriting a node's classes appends a new run and leaves the old one in place.
+- **Combinators are one pointer hop.** Each node keeps a plain sibling chain (with text, walked by
+  the style traversal) and an element-only chain (`first_element_child`, `next_element`,
+  `prev_element`, walked by matching). Both are written when the node is linked
+  (`crates/zgui-dom/src/stylo/element/tree.rs`).
+- **An ancestor bloom filter rejects most descendant selectors in one word.** It is filled by
+  `add_element_unique_hashes`, which calls the engine's own `each_relevant_element_hash`
+  (`crates/zgui-dom/src/stylo/bloom.rs`) so it inserts exactly the hashes the matcher looks for. A
+  missing hash would make a rule silently stop matching.
+
+## The state word
+
+Each element has one `u64` state word, stored as an `AtomicU64` in the node record. It is the only
+store of interaction state: input routing writes it, selector matching reads it, and the engine
+invalidates by comparing it before and after a change.
+
+Code above the document uses `zgui_vocab::UiState`; the engine uses `ElementState`. They share the
+same bit layout, so conversion is a reinterpretation:
+
+```rust
+pub const fn to_engine(state: UiState) -> ElementState {
+    ElementState::from_bits_retain(state.bits())
+}
+```
+
+Both sides assert every bit position at compile time (`crates/zgui-vocab/src/state/assert.rs` and
+`crates/zgui-dom/src/node/element/state.rs`). If a bit moves on either side, the build fails.
+
+A state pseudo-class is then one mask test: `self.element_state().intersects(class.state_flag())`,
+using the flag the engine itself assigns. Only `:lang()`, `:state()` and one engine-internal class
+have no flag and need their own branch.
+
+Consequences:
+
+- **`:link` and `:visited` are stored in the word** when attributes are written. Computing them
+  during matching would change the answer without changing the word, so nothing would invalidate.
+- **Author-defined states (`:state(...)`) are not in the word.** They live in their own column.
+- **Views may set only eight bits:** `UiState::AUTHOR_SETTABLE` is `CHECKED | DISABLED | OPEN |
+  INDETERMINATE | PLACEHOLDER_SHOWN | READ_ONLY | REQUIRED | INVALID`. The framework computes the
+  rest (`:hover`, `:focus`, and so on).
+
+## Custom properties
+
+A custom property reaches descendants only through `var()`. When an element's inherited
+custom-property map changes, zgui narrows the work in three steps.
+
+**1. Skip subtrees that read none of the changed names.** The traversal records the names that
+changed (`ChangedNames`). Each element stores a 64-bit bloom set of the names its own rule chains
+read, plus the union over its subtree (`zgui_dom::side::readers`). A child subtree whose union has
+no bit in common with the change is skipped and counted in `Counter::CustomSubtreesSkipped`.
+
+**2. Refresh, don't recascade, elements that don't read the change.** An element inside a visited
+subtree whose rules read none of the changed names keeps every property group and only swaps in the
+parent's new map (`Counter::CustomMapsRefreshed`). Elements that read a changed name, or declare
+custom properties of their own, recascade.
+
+**3. Diff only the names that can have changed.** When a declaring element recascades only because
+its parent's map moved, its own map can differ only in the parent's changed names plus the names its
+own rules declare. zgui compares just those candidates instead of the whole map, and passes the
+resulting (possibly smaller) set down. A row that sets `--accent` itself stops an `--accent` change
+from reaching anything below it.
+
+The narrowing falls back to treating every descendant as a reader when:
+
+- more than 16 names changed (`NAMED_AT_MOST`);
+- a changed name starts with `--zgui-` (properties the framework reads on the element's behalf);
+- the element declares `--zgui-shader`, `--zgui-shape`, `--zgui-filter` or `--zgui-backdrop-filter`
+  (`zgui_css::values::custom::WILDCARD_DECLARERS`), because effects read parameters by name with no
+  `var()` in any declaration;
+- for step 3 only: the element has running animations, which can write custom properties.
+
+**Rule-chain reads are cached across restyles.** Finding which names a rule chain reads means
+serialising its declarations and scanning the text, because Stylo keeps parsed references private.
+The answer (`RuleRefs`: names read, names declared, and the bloom set) is cached in a `RefsCache`
+owned by the engine, keyed by a hash of the declaration-block addresses in the chain. The cache holds
+a strong reference to each chain, so those addresses stay valid. It is cleared when the sheet set
+changes and when it exceeds 4,096 chains, since every new inline style value creates a new chain.
+
+## Computed-style sharing
+
+A computed style is a reference-counted pointer, and so is each property group behind it
+(background, border, font, text, position, …):
+
+```rust
+pub type ComputedStyle = ServoArc<ComputedValues>;   // servo_arc::Arc
+```
+
+Elements that cascade to the same result share allocations, and elements that differ only in their
+background still share the same font group. Downstream stages key caches on group identity through
+`zgui_css::StructPtr` (`StructPtr::of(group)`, plus helpers such as `StructPtr::font(style)` and
+`StructPtr::inherited_text(style)`).
+
+<Callout type="warn">
+**Equal identity proves equal values. Unequal identity proves nothing.** Each cascade worker keeps
+its own sharing cache, so *n* workers can produce *n* allocations for one logical style. An
+identity-keyed cache is a fast path, never the only lookup.
+</Callout>
+
+`PaintStyleCache` in `crates/zgui-paint/src/lower/cache.rs` shows the pattern:
+
+| Lookup | Type | Purpose |
+|---|---|---|
+| `by_identity` | `FxHashMap<LoweringKey, Identity>` | Fast path on group addresses. The entry holds the source style, so its addresses cannot be reused while cached. |
+| `by_content` | `FxHashMap<u64, SmallVec<[PaintStyleRef; 1]>>` | Fallback. The hash narrows the search and an equality check confirms it. |
+
+On an identity miss the style is lowered, the lowering is hashed, and a content hit reuses the
+existing entry. Read `Counter::StylesLowered` against `Counter::StylesLoweredFromCache` for the
+sharing ratio. Identity entries are swept once the table holds more than 1,024 entries and has
+doubled since the previous sweep; entries whose style only the cache still holds are removed.
+
+Anonymous boxes rely on sharing too. `zgui_css::inherited_style(parent)` builds the style for a box
+that CSS requires but no element declares. It reuses the parent's inherited group allocations and a
+shared `OnceLock` of reset values. Copying the values instead would break identity: text in that box
+would claim a colour slot no element owns, and a later colour change would not reach it.
+
+## Damage translation
+
+After the traversal, `translate` (`crates/zgui-style/src/damage/translate.rs`) turns each element's
+record into dirty bits on its node, and the marks are applied once the pass is done. In outline:
+
+| Source | Marks |
+|---|---|
+| A first cascade (`record.initial`) | `RELAYOUT \| REBUILD_BOX` |
+| Layout damage from zgui's damage hook | `RELAYOUT`, plus `REBUILD_BOX`, `RESHAPE` or `REBREAK` as needed |
+| Ink or stacking changes without relayout | `REFRAGMENT` or `RESTACK`, with `REHIT \| REPAINT` |
+| A changed paint key | `REPAINT` |
+| A changed accessibility key | `A11Y` |
+
+Stylo's own damage bits are not used directly: its relayout bit is set for changes that only need a
+repaint, and its repaint bit is missing for border colours, radii, visibility, masks and shadows.
+zgui therefore classifies layout changes through its own damage hook
+(`TElement::compute_layout_damage`), decides repainting by comparing **paint keys** (addresses of
+shared computed-value groups), and narrows text work to a reshape or a rebreak by comparing each
+element's previous text keys in `TextKeyStore`. The
+[invalidation page](/docs/architecture/invalidation#translating-damage-into-dirty-bits) has the full
+mapping, the [paint key](/docs/architecture/invalidation#the-paint-key) and the
+[reshape and rebreak rules](/docs/architecture/invalidation#reshaping-and-rebreaking-text).
+
+One detail of the paint key is specific to custom properties: Stylo exposes no address for a
+custom-property map's allocation, so the key derives its identity from the address of the map's
+first entry and its length. A fresh map with the same contents causes an extra repaint, never a
+missed one.
+
+### Text colour
+
+A shaped paragraph stores a brush **slot** rather than a colour, so a colour change rewrites a slot
+instead of reshaping text. After a restyle, `StyleEngine::text_paint_updates()` lists a
+`TextPaintUpdate` for each text run whose colour group changed. An element has up to three runs
+(`TextRun::Own`, `Before`, `After`), each cascaded and coloured separately. The `restyled` flag says
+the element was reported before; if the consumer has no record of it, its shaping is treated as
+stale.
+
+The runtime applies these in the `f.brushes` step (`crates/zgui-runtime/src/window/brushes.rs`).
+Slots are claimed per cascade result, and several elements can share one. Two rules keep colours
+correct:
+
+- A slot is rewritten in place only if every element drawn through it is being re-coloured in the
+  same batch, to the same colour.
+- If an element's new cascade result already owns a different slot (claimed by another element), the
+  element moves onto that slot and its text is reported for reshaping. Staying on the old slot would
+  let a later re-colour of this element overwrite a slot that other elements share.
+
+## Animations
+
+CSS animations and transitions run inside Stylo. zgui adds two entry points
+(`crates/zgui-style/src/engine/animate/`):
+
+- `StyleEngine::animation_tick` advances the clock, moves every running animation on and reports
+  what is still running. It returns immediately when nothing is animating.
+- `StyleEngine::mark_animation_restyle` is called when an animated value cannot be applied as a
+  repaint. It gives the element an animation-only hint (replace animation and transition
+  declarations, keep selector matches) and records it.
+
+### Reaching marked elements
+
+The animation-only traversal starts at the root and descends only through ancestors flagged as
+having animation work below. Those flags are raised at the start of the restyle
+(`settle_animation_marks`), from where each marked element stands **at that moment**, not where it
+was when marked. So an element that a view moved between the mark and the restyle is still reached.
+An element that is out of the document at restyle time keeps its hint and waits
+(`StyleEngine::animation_waiting` reports how many) until a later restyle finds it back in the tree.
+The flags are cleared by the traversal that reads them.
+
+### Fill-forwards animations
+
+Stylo drops a finished animation from its table when it restyles the element, whatever the fill
+mode. The table is also where later matches read animation declarations, so an element with
+`animation-fill-mode: forwards` would jump back to its base style on the next restyle (a theme
+change, for example). `driver/animations/fill.rs` keeps these animations in place:
+
+- Before each traversal, every finished fill-forwards animation is set back to running with its
+  start time unchanged, so it evaluates at its end.
+- After the traversal, each one that is still running (or that the traversal paused) and has ended is
+  marked finished again, with no second end event.
+- One that the traversal cancelled is removed without a cancel event, since it had already ended.
+- One that a new style moved away from its end keeps whatever state the traversal gave it.
+
+## Reading computed values
+
+Most consumers read groups directly from `ComputedStyle`. `zgui-css` adds helpers for values that
+need conversion:
+
+- **Colours.** `zgui_css::values::color::to_color` converts an engine colour to a `zgui_color::Color`,
+  keeping its colour space. Stylo stores the second and third components of `hsl()` and `hwb()` as
+  percentages (0–100); zgui stores them as fractions (0–1), and `to_color` scales them.
+- **Custom properties.** `zgui_css::values::custom` has `text`, `color`, `number`, `length` and
+  `names` for reading a computed custom property by name (without the `--` prefix).
+- **Test styles.** `zgui_css::StyleDraft` builds a computed style without a cascade, from initial
+  values (`StyleDraft::initial()`) or an existing style (`from_style`). It performs no inheritance
+  and resolves no units. `with_custom_property(name, value)` declares an inherited custom property,
+  so code that reads custom properties can be tested without a sheet.
 
 ## The parity register
 
-"Full CSS support" is not a claim that can be true or false. It is a count, and a count needs a
-denominator, a classification of every entry under it, and something that fails when the count goes
-down. The register is that instrument, in three parts.
+The parity register records, for every CSS property, whether zgui implements it, and tests check
+that record against the engine and against real output.
 
-**The declarations.** One macro, written in the module that *reads* the property, never in a central
-table.
+**Declarations.** Each property is classified by a `register_properties!` call in the module that
+reads it, for example in `crates/zgui-paint/src/lower/background.rs`:
 
 ```rust
-// crates/zgui-paint/src/lower/background.rs — beside the code that reads them
 register_properties! {
     background_color => Support::Implemented("zgui-paint::lower::background"),
     background_size  => Support::Ignored("a background layer fills the box it is painted on"),
 }
-
-// crates/zgui-css/src/parity/gap/inherited_svg.rs — a group with no reader anywhere
-register_properties! {
-    fill_rule => Support::Absent(AbsentReason::GeckoOnly),
-    clip_rule => Support::Absent(AbsentReason::GeckoOnly),
-}
 ```
 
-The macro expands to one hidden constant per property plus a `REGISTERED` slice built from those
-constants, so a row cannot be declared and left out of the list, and the list cannot name a row that
-was never declared. Declaring the same property twice in one module is a compile error.
-
-| `Support` variant | Meaning |
+| Classification | Meaning |
 |---|---|
-| `Implemented(module)` | Parsed, cascaded and consumed. The string names the consuming module. |
-| `Ignored(reason)` | Parsed and cascaded, deliberately unread. |
-| `Absent(reason)` | Not available from the engine. `PrefOff`, `GeckoOnly`, `NotInStylo`, `NeedsFork` or `NotInLayout` — five different fixes, five different owners. |
+| `Implemented(module)` | Parsed, cascaded and read by that module. |
+| `Ignored(reason)` | Parsed and cascaded but not read. |
+| `Absent(reason)` | The engine does not provide it (`PrefOff`, `GeckoOnly`, `NotInStylo`, `NeedsFork` or `NotInLayout`). |
 
-**The checks.** Three instruments exist only to ask whether a row is still true:
+**Checks.** `Registration::check` fails when the engine contradicts a declaration.
+`Registry::unclassified` lists longhands with no declaration (`parity::catalog::longhands`). The
+evidence probe lays out a fixture with and without each implemented property and compares fragment
+geometry, hit testing, clip shapes and paint lowering; `Verdict::Unchanged` fails as an over-claim,
+and `Verdict::Inert` (the declaration never reached a computed style) is reported separately. A timed
+survey covers animations and transitions.
 
-- `Registration::check` asks the engine, as built and configured right now, what it says about the
-  property, and fails when the answer contradicts the declaration. A row saying `GeckoOnly` about a
-  name the parser happily accepts is a test failure.
-- `Registry::unclassified` counts longhands with no declaration at all, against a denominator read
-  out of the engine's own build (`parity::catalog::longhands`). A property nobody classified is a
-  failure rather than a silence.
-- The **evidence probe** writes each property claimed implemented into a fixture, lays the fixture
-  out twice — once without the declaration and once with it — and compares the two fragment trees.
-  `Verdict::Unchanged` is the over-claim and fails. `Verdict::Inert` means the declaration did not
-  even reach a computed style, so the probe is broken and proves nothing either way; it is reported
-  separately and never counted as evidence.
+**Report.** `crates/zgui-conformance/src/report.rs` generates `docs/parity.md` byte-deterministically,
+and a test checks the committed file matches. As committed, all 250 distinct longhands (behind 322
+generated property names) are classified: 178 implemented, 72 parsed and cascaded but not yet
+implemented, and 159 shown by probe to change what a frame produces.
 
-**The document.** `crates/zgui-conformance/src/report.rs` renders the whole measurement into
-`docs/parity.md`. Nothing in it is typed by hand, and it is byte-deterministic — no timestamp, no
-path, no hash-decided iteration order — so regenerating it is a test: the committed file must equal
-what the harness produces.
+Some implemented properties cannot be observed by the deterministic fixture (font selection needs
+real faces; `cursor`, `caret-color` and `user-select` need a window). These carry a stated reason in
+the report. An implemented property with no observable effect and no reason fails the build.
 
-As committed, that file reports:
+## Cost
 
-| | Count |
-|---|---:|
-| Property names the engine generates | 322 |
-| Distinct longhands behind them | 250 |
-| Classified | 250 |
-| Implemented | 178 |
-| Parsed and cascaded, not yet implemented | 72 |
-| Shown by probe to change what a frame produces | 159 |
-| Out of reach: register rows | 7 |
-| Not yet implemented: register rows | 0 |
+`cargo xtask perf` regenerates `docs/performance.md` with current values. The style-relevant
+measurements and their limits:
 
-`zgui_conformance::registrations()` includes declarations from style, text style, layout, paint,
-runtime, inherited-SVG gaps, and the remaining CSS backlog. Evidence compares fragment geometry,
-hit testing, clip shapes, and paint lowering. A separate timed survey advances animations and
-transitions, so a property whose effect appears only on a later frame is still measured.
+| Measurement | Band | Budget | What it measures |
+|---|---:|---:|---|
+| `kitchen.click` | 15.12 µs | — | One class on one element, 1 851 boxes. |
+| `hover.crossing` | 266.00 µs | 500 µs | One pointer crossing over a 1 000-row table: two elements restyled, two boxes repainted. |
+| `hover.primitives_emitted` | 200 prims | 200 | Only two rows changed, so emitting the whole table is a defect. |
+| `scroll.translation.restyles` | 0 elements | 0 | Scrolling changes no computed style. |
+| `cold.first_frame` | 140 ms | 250 ms | Headless: font enumeration, sheet parsing, first cascade, first layout, first emission. |
+| `idle.frames` | 0 frames | 0 | A still document draws nothing. |
 
-Some consumers need an environment the deterministic fixture does not have. Font selection needs
-real faces; `cursor`, `caret-color`, and `user-select` need a window and interaction state. These
-rows remain implemented only with a specific reason in the report. An unexplained declaration with
-no observable consequence fails the build.
-
-## What it costs, measured
-
-Every number below is from `docs/performance.md`, which `cargo xtask perf` regenerates. Each carries
-a **band** — a baseline and a tolerance for a time, a ceiling with no tolerance for a count — and a
-run outside its band fails the gate.
-
-| Measurement | Value | Band | Budget | What it is |
-|---|---:|---:|---|---|
-| `kitchen.click` | 11.34 µs | 15.12 | — | The measured p50 at 1 851 boxes: one class on one element. |
-| `hover.crossing` | 207.78 µs | 266.00 | 500.00 met | One pointer crossing over a 1 000-row table at 120 Hz. Two elements restyled, the paint key moves, two boxes repaint. |
-| `hover.primitives_emitted` | 41.56 prims | 200.00 | 200.00 met | Two rows changed, so a frame that emits the whole table is the defect. |
-| `scroll.translation.restyles` | 0.00 elements | 0.00 | 0.00 met | Moving content changes no computed style. A ceiling of zero, with no tolerance. |
-| `cold.first_frame` | 103.31 ms | 140.00 | 250.00 met | Headless. Font enumeration, sheet parsing, the first cascade, the first layout, the first emission. |
-| `idle.frames` | 0.00 frames | 0.00 | 0.00 met | A still document draws nothing. |
-
-Counters to read when a number moves:
+Counters to check when a number moves:
 
 | Counter | Meaning |
 |---|---|
-| `ElementsRestyled` | Elements whose selector matching ran again. |
-| `ElementsRecascaded` | Elements whose cascade ran again with the matches they already had. |
-| `SelectorMatches` | Individual simple-selector-against-element tests. A bloom filter that stopped working shows up here long before it shows up in an element count. |
-| `NodesVisited` | Nodes a traversal looked at, whether or not they owed work. |
+| `ElementsRestyled` | Elements whose selector matching ran. |
+| `ElementsRecascaded` | Elements whose cascade ran with their existing matches. |
+| `ElementsTraversed` | Elements the traversal entered, styled or not. |
+| `SelectorMatches` | Simple-selector tests. A broken bloom filter shows here first. |
+| `CustomSubtreesSkipped` | Subtrees a custom-property change skipped. |
+| `CustomMapsRefreshed` | Elements that took a new custom-property map without a cascade. |
+| `NodesVisited` | Nodes any phase traversal looked at. |
 | `StylesLowered` / `StylesLoweredFromCache` | The sharing ratio. |
 
-Three costs are worth stating as rules, because each is proportional to something a reader controls:
+Rules of thumb:
 
-- **One class toggle restyles the elements whose selectors mention that class**, and nothing else.
-  If no selector mentions it, nothing is restyled at all.
-- **A colour change costs one paint-key comparison per restyled element**, and produces `REPAINT`
-  and nothing wider.
-- **Replacing a sheet costs one frame of un-narrowed mutations, plus a re-collection of that
-  origin's rules.** Changing a custom property on a container is the cheap way to do the same work.
+- **A class toggle restyles only elements whose selectors mention that class.** If no selector
+  mentions it, nothing is restyled.
+- **A colour change costs one paint-key comparison per restyled element** and produces `REPAINT`
+  only.
+- **A custom-property change visits only subtrees that read it.** Theming through custom properties
+  on a container is cheap.
+- **Adding a sheet invalidates only what its selectors match; replacing a view sheet re-matches the
+  author origin.** Prefer classes or custom properties to swapping sheets.
 
 ## Next
 
@@ -844,12 +618,12 @@ Three costs are worth stating as rules, because each is proportional to somethin
   <Card
     title="The layout engine"
     href="/docs/architecture/layout-engine"
-    description="The box tree, the Taffy integration, incremental patching and fragments."
+    description="The box tree, the Cephal integration, incremental patching and fragments."
   />
   <Card
     title="Invalidation"
     href="/docs/architecture/invalidation"
-    description="Every bit, how obligations propagate and retire, and why it is a lattice."
+    description="Every bit, how obligations propagate and retire, and how damage rectangles merge."
   />
   <Card
     title="Paint and the scene"

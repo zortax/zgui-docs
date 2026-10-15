@@ -1,65 +1,17 @@
 ---
 title: Writing fast interfaces
-description: The practical rules that follow from the cost model, each named against the measured behaviour it follows from.
+description: Guidelines for state, lists, styling, text, drawing and resizing, each with the reason it keeps frames cheap.
 ---
 
-[The cost model](/docs/performance/cost-model) says what each kind of change costs. This page says
-what to do about it. Every rule below names the measurement or the mechanism it follows from, and
-nothing is here because it sounds prudent.
+A zgui frame does work in proportion to what changed, so most interfaces are fast without special
+effort. The guidelines below keep them fast as they grow. Each says what to do and why it helps;
+[the cost model](/docs/performance/cost-model) has the measured numbers behind them.
 
-## Lists
-
-### Key every list, and never by index
-
-```rust
-use zgui::prelude::*;
-
-#[derive(Clone, Debug)]
-struct Todo {
-    id: u64,
-    label: String,
-}
-
-view! {
-    column(class = "list") {
-        for item in move || items.get(), key = |item: &Todo| item.id {
-            row(class = "todo") { text {{item.label.clone()}} }
-        }
-    }
-}
-```
-
-When the collection changes, the list compares the new key list with the old one and produces one
-step per position: **keep**, **move**, or **create**. A kept row is placed again and **is not
-rebuilt**. It keeps its nodes, its signals, its timers and the data it was built with.
-
-That last clause is why an index is the wrong key. Insert one item at the front of a three-row list:
-
-| Key function | Old keys | New keys | Plan | What is drawn |
-|---|---|---|---|---|
-| `item.id` | `7, 8, 9` | `6, 7, 8, 9` | create, keep, keep, keep | the new row, then the three old ones |
-| the index | `0, 1, 2` | `0, 1, 2, 3` | keep, keep, keep, create | the three old rows unchanged, then the last one twice |
-
-The second row is not a slow list. It is a wrong list: the new item never appears, and the old last
-item is drawn at two positions. An index is a position, and a position is not an identity.
-
-A good key also decides the work. Inserting at the front of a thousand-row list is one node
-insertion, not a thousand rewrites.
-
-<Callout type="error">
-Two rows that produce the same key make "which row is this" unanswerable, so the list panics and
-says so. The check runs in **every** profile, release included, because a check compiled out of the
-build you ship is a check for the one case that never happens.
-</Callout>
+## State
 
 ### Give each row its own signal
 
-The list's only reactive dependency is the closure after `in`. Every write to that closure's
-sources re-runs it, and one re-run reads the whole collection, clones every key, builds a map of
-every key and produces a plan — work proportional to the whole list, before anything on screen has
-changed.
-
-So keep what changes inside a row out of the collection:
+Keep per-row state in the row's data as a signal, not in the collection:
 
 ```rust
 #[derive(Clone, Debug)]
@@ -82,24 +34,16 @@ view! {
 }
 ```
 
-Ticking one item writes that item's `done`. The collection signal is untouched, so the list does
-not compare keys at all, and one class binding runs.
-
-What that buys, measured: one class toggled on one element of an 1 851-box document is **11.34 µs**
-(`kitchen.click`, `docs/performance.md`). Over a document of ten thousand controls, the same change
-restyles **one** element, lays out **none**, diffs **six** fragments, emits **one** primitive and
-takes **one** draw-order insertion — at every size from 1 250 controls to 10 000
-(`static-slope`, `docs/perf/reference-workloads.md`).
+**Why:** ticking an item writes only that item's `done`, so one class binding runs and the list does
+nothing. If `done` lived in the collection, every tick would re-run the collection closure, clone
+every key and diff the whole list.
 
 <Callout type="warn">
-A row that reads the collection to find itself has subscribed to the collection again. Give the row
-its value, or a `Field` handle, and let it read that.
+A row that reads the collection to find itself subscribes to the whole collection again. Pass the
+row its value, or a store `Field`, and read that.
 </Callout>
 
-### Use a `Selector` for "which one is selected"
-
-Selection written as a plain signal makes every row read it, so every row subscribes to it, and
-moving the selection wakes all of them. A `Selector` keeps one small signal per watched key.
+### Use a `Selector` for the selected item
 
 ```rust
 use zgui::reactive::Selector;
@@ -120,32 +64,27 @@ view! {
 }
 ```
 
-Measured directly in the repository: eight rows produce eight first runs, and moving the selection
-produces exactly **two** more — the row that lost it and the row that gained it
-(`only_the_two_affected_rows_re_run`, `crates/zgui-reactive/src/reexport/selector.rs`). See
-[Stores and selectors](/docs/learn/stores-and-selectors).
+**Why:** if every row reads a plain `selected` signal, moving the selection re-runs every row. A
+`Selector` keeps one small signal per watched key, so only two rows re-run: the one that lost the
+selection and the one that gained it. See [Stores and selectors](/docs/learn/stores-and-selectors).
 
-### Read the narrow thing
+### Read the narrowest field
 
-An observer of a store's root, or of any ancestor field, re-runs on **any** descendant write. The
-isolation a store gives you is only there if you read at the depth the write happens at.
-
-| Hand a hole | Wakes on |
+| A hole reads | It re-runs on |
 |---|---|
-| `Store<Settings>` | every write to every field. Never do this. |
+| `Store<Settings>` | every write to every field |
 | `store.rows()` | every write to every row |
-| `store.rows().at_key(id).value()` | that one field of that one row |
-| `Field<u32>` | whatever field the handle names |
+| `store.rows().at_key(id).value()` | writes to that one field of that one row |
+| `Field<u32>` | writes to the field the handle names |
 
-The same rule applies to a plain signal holding a struct: a wide value read by many holes wakes
-them all, and each one re-runs to produce the same answer.
+**Why:** a hole re-runs on every write to what it read, including writes to anything below it. A
+plain signal that holds a struct behaves like the store root: every reader re-runs when any part
+changes.
 
-## Branching
-
-### Prefer `if` to a closure hole
+### Use `if` for structure and closure holes for values
 
 ```rust
-// Compares the answer. Adding a row to a list that already had rows swaps nothing.
+// Compares the boolean. Adding a row to a list that already had rows swaps nothing.
 if move || items.get().is_empty() {
     label(class = "empty") {"Nothing to do yet."}
 } else {
@@ -153,428 +92,359 @@ if move || items.get().is_empty() {
 }
 ```
 
-`if` reads its condition inside one effect and compares the **boolean**. A closure hole compares
-nothing: it re-runs whenever any signal it read changed, and rebuilds what it produced.
-
-The difference is not only work. Rebuilding a subtree runs its cleanups, cancels and restarts its
-timers, and rebinds every handle inside it — so a subtree rebuilt on an unrelated write is a
-subtree that loses whatever it was keeping, including a scroll position and a half-typed field.
-
-| Branches | Use | Compares |
+| What you are choosing between | Use | What is compared |
 |---|---|---|
-| two, known in advance | `if` | the boolean |
-| many, of different view types | `Dynamic` | the view type; the same type rebuilds in place |
-| none — the branch produces a value, not a subtree | a closure hole | nothing, but a text node compares the string it writes |
+| two branches, known in advance | `if` | the boolean |
+| several branches of different view types | `Dynamic` | the view type; the same type updates in place |
+| no branches; the hole produces a value | a closure hole | for text, the string it writes |
 
-The last row is worth keeping in mind: a hole that produces the **same** string writes nothing to
-the document, because the text node remembers its last value. That hole costs the closure and no
-more.
+**Why:** `if` swaps only when its answer changes. A closure hole that returns a subtree rebuilds it
+whenever anything it read changes. A rebuild runs cleanups, restarts timers and loses state such as
+a scroll position or a half-typed field.
 
-### Where a memo pays for itself
+### Add a memo only where readers share a result
 
-A memo does two things: it runs its closure once per flush however many readers it has, and it
-stops the notification when the new value compares equal to the old one.
-
-| Situation | Memo? | Why |
-|---|---|---|
-| several holes, or several rows, read one derived value | **yes** | one computation instead of one each |
-| the answer is narrower than its inputs and the reader rebuilds a subtree | **yes** | the reader is woken only when the answer moves |
-| one reader, and it is a text hole | no | the text node already compares the string it writes |
-| in front of an `if` condition | no | `if` already compares the answer |
-| `a.get() + b.get()` | no | the memo's own bookkeeping costs more than the addition |
-| the value is a large `Vec` or `String` that is cheap to rebuild | no | every run pays a full `PartialEq` over it |
-
-A memo is not a way to coalesce writes and does not need to be. The notification behind each task
-holds one slot, so **a signal written a thousand times between two flushes costs one re-run, not a
-thousand** (`crates/zgui-reactive/src/executor/frame.rs`).
-
-## Style
-
-### Toggle the class on the element, not on an ancestor
-
-The repository measures exactly this, with one declaration reached two ways:
-
-```css
-.cell.hot   { background-color: rgb(47, 107, 255) }   /* a class on one control */
-.warm .cell { background-color: rgb(47, 107, 255) }   /* a class on the root, above every control */
-```
-
-One property, two reaches. The ratio of the local change to the ancestor change is gated at
-**≤ 0.09** and measured at **0.0679–0.0702**
-(`STATIC-locality`, `crates/zgui-bench/src/bin/static-slope/criteria.rs`). In the advisory numbers
-beside it, the local change costs **70.7–72.8 ns per control** and the ancestor change
-**1 031–1 041 ns per control** (`docs/perf/reference-workloads.md`).
-
-Two mechanisms sit under that.
-
-- **A class no selector mentions costs nothing at all.** Before any style work is scheduled, the
-  framework asks whether any selector mentions this class name, whether any mentions this attribute
-  name, and which state bits could matter for this element. A change nothing depends on needs no
-  record, no marking and no traversal.
-- **A class an ancestor rule sits under reaches every descendant those rules could match.** The
-  dependency index is built from the rule set's invalidation map rather than from the matching map,
-  precisely so that `.warm` is known to matter (`crates/zgui-style/src/deps/class_set.rs`).
-
-For a theme, prefer a custom property on a container. It inherits, so one declaration re-themes the
-subtree with no rule matching anywhere ([Styling](/docs/learn/styling)). Prefer either to swapping a
-sheet: the frame in which the installed sheet set changes **disables the filters above**, so every
-mutation in that one frame takes the full path.
-
-### Prefer a colour change to a size change
-
-Where the design accepts either, change the colour.
-
-| Change | Reaches |
+| Situation | Memo? |
 |---|---|
-| `color`, `background-color`, a border colour, a shadow | restyle, paint, draw |
-| `width`, `padding`, `gap`, `font-size` | restyle, **layout**, paint, draw |
+| several holes or rows read one derived value | **yes**: one computation instead of one each |
+| the result is narrower than its inputs, and the reader rebuilds a subtree | **yes**: the reader re-runs only when the result changes |
+| one reader, and it is a text hole | no: the text node already compares |
+| an `if` condition | no: `if` already compares |
+| `a.get() + b.get()` | no: the bookkeeping costs more than the addition |
+| a large `Vec` or `String` that is cheap to rebuild | no: every run pays a full comparison |
 
-A repaint cost yields empty layout damage, so the box tree, the layout, the fragment geometry and
-the shaped text are all still valid and are all kept. A geometry cost relays out the box, its
-descendants, and its ancestors up to the first whose size does not depend on it. Both rows are
-measured in [the cost model](/docs/performance/cost-model).
+**Why:** a memo runs once per flush however many readers it has, and notifies them only when its
+value changes. Where neither of those saves anything, it is pure overhead.
 
-The same choice appears in animation: a transition on `opacity` or `transform` does not enter
-layout, while one on `width` does on every frame of it.
+You do not need a memo to batch writes. A signal written a thousand times between two flushes causes
+one re-run, not a thousand.
 
-<Callout type="info">
-Damage is at most **four** disjoint rectangles, and adding a fifth merges the pair whose union
-wastes the least area (`MAX_DAMAGE`, `crates/zgui-bits/src/damage_set/mod.rs`). A frame that changes
-five unrelated places therefore redraws the bounding box of two of them. Changes that happen
-together are cheaper when they are near each other.
-</Callout>
+## Lists
 
-### Avoid intrinsic sizing you do not need
-
-`fit-content`, `min-content`, `max-content` and an `auto` flex basis all ask the content how big it
-wants to be, and for text that means shaping it. A fixed size, a percentage or a flex share asks
-nothing.
-
-For the content keywords, zgui keeps intrinsic answers across frames. A new layout pass does not
-measure an unchanged `fit-content` box again. A content, style, scale, or gutter change invalidates
-the affected answer. Avoid unnecessary intrinsic sizing because the first measurement and each
-valid invalidation still lay out the complete subtree at min-content and max-content.
-
-The case to watch is a grid. Track sizing measures every item at min-content and again at
-max-content, once per pass of an algorithm that runs several passes per axis, with an area estimate
-that moves between the passes. One item is asked ten questions of the same shape and different
-numbers. The framework holds sixteen complete size-only answers per box for this case.
-
-The instrument is `sizes_measured` against `sizes_held`. A grid whose items are sized intrinsically
-and whose measurements are missing shows up there first.
-
-### Know which ancestors composite their whole subtree
-
-A **stacking context** is a subtree that is painted as one unit, at one place in its parent's paint
-order. An **offscreen target** is a texture that subtree is drawn into before it is placed. They are
-different lists, and only the second one costs a frame.
-
-Establishing a stacking context is nearly free and changes the paint order. Anything that changes
-whether one is established owes a restack, a re-hit and a repaint, and moves the whole subtree in
-front of or behind content it used to sit beside. [Layout](/docs/learn/layout) has the list.
-
-An offscreen target is the expensive one:
-
-| On an ancestor | Target? |
-|---|---|
-| `opacity` below 1, subtree ink that does not overlap itself, nothing blending below | **no** — the alpha is multiplied into each primitive's own paint |
-| `opacity` below 1, subtree ink that overlaps, or any blending descendant | **yes** |
-| `opacity: 0` | **no** — the group contributes no pixel |
-| a two-dimensional `transform`, `translate`, `rotate` or `scale` | **no** — the draw call applies it |
-| `perspective`, `transform-style: preserve-3d`, `backface-visibility: hidden` | **yes** |
-| any `filter` or `backdrop-filter` | **yes** |
-| `mix-blend-mode` other than `normal` | **yes** |
-| `isolation: isolate` | **yes** |
-| a `clip-path` shape or box keyword | **yes** |
-
-All of it is decided in `crates/zgui-paint/src/emit/group.rs` and
-`crates/zgui-paint/src/lower/`. The counter is `group_targets`.
-
-So a fade written as `opacity` on a panel whose children do not overlap costs no target, and the
-same fade over overlapping content costs one. A `filter: blur(…)` on an ancestor costs one
-unconditionally, on every frame that reaches it.
-
-## Long lists
-
-### Virtualise
-
-Build the rows the scrollport can show, and let the container's own padding stand in for the rest.
+### Key every list by a stable ID
 
 ```rust
-const ROW: f32 = 24.0;
-const OVERSCAN: usize = 4;
-
-const SHEET: &str = css!(
-    ".list__pane {
-        display: flex;
-        flex-direction: column;
-        padding-top: var(--lead, 0px);
-        padding-bottom: var(--trail, 0px);
-    }
-    .list__pane > * { height: 24px; flex: none }"
-);
-
-#[component]
-fn Rows(rows: Signal<Vec<Todo>>) -> impl IntoView {
-    let offset = RwSignal::new(0.0_f32);
-    let port = RwSignal::new(0.0_f32);
-
-    let first = move || ((offset.get() / ROW) as usize).saturating_sub(OVERSCAN);
-    let count = move || (port.get() / ROW).ceil() as usize + OVERSCAN * 2;
-    let shown = move || {
-        let all = rows.get();
-        let start = first().min(all.len());
-        let end = (start + count()).min(all.len());
-        all[start..end].to_vec()
-    };
-
-    view! {
-        scroll(
-            class = "list",
-            on:scroll = move |ev| {
-                offset.set(ev.offset.y.0);
-                port.set(ev.scrollport.height.0);
-            }
-        ) {
-            column(
-                class = "list__pane",
-                var:--lead = move || Some(format!("{}px", first() as f32 * ROW)),
-                var:--trail = move || {
-                    let below = rows.get().len().saturating_sub(first() + count());
-                    Some(format!("{}px", below as f32 * ROW))
-                }
-            ) {
-                for item in move || shown(), key = |item: &Todo| item.id {
-                    row(class = "todo") { text {{item.label.clone()}} }
-                }
-            }
+view! {
+    column(class = "list") {
+        for item in move || items.get(), key = |item: &Todo| item.id {
+            row(class = "todo") { text {{item.label.clone()}} }
         }
     }
 }
 ```
 
-Three details in that sketch are deliberate.
+**Why:** when the collection changes, the list compares old and new keys and keeps, moves or creates
+each row. A kept row is not rebuilt; it keeps its nodes, signals, timers and the data it was built
+with. With real keys, inserting at the front of a thousand rows is one node insertion.
 
-- **The space above and below is padding on the container, not two empty elements.** A box that
-  exists only to be empty is a box the style engine, layout and the painter each visit for nothing,
-  twice a frame, for ever.
-- **The window slides, so the keys of the rows that stayed do not change.** Moving down by one row
-  destroys one row, builds one row, and leaves the rest exactly where they are. That is the recycle
-  frame measured below.
-- **A virtualiser that has only a row count keys by the model index.** That is an identity while the
-  model does not move under the window, and stops being one the moment the model gains, loses or
-  reorders rows. When the rows have identities of their own, use them.
+An index is the wrong key. Insert one item at the front of a three-row list:
 
-The scrollport height arrives with the scroll event, so it is not known before the first scroll.
-[Scrolling](/docs/building/scrolling) has the complete version — measuring the container, the glide
-and the scrollbars.
+| Key | Old keys | New keys | Plan | Shown |
+|---|---|---|---|---|
+| `item.id` | `7, 8, 9` | `6, 7, 8, 9` | create, keep, keep, keep | the new row, then the three old ones |
+| the index | `0, 1, 2` | `0, 1, 2, 3` | keep, keep, keep, create | the old rows unchanged, then the last item again |
 
-### What it is worth
+With index keys the new item never appears.
 
-| Measurement | Value | Source |
-|---|---|---|
-| one translation frame, 10 000-row virtual list | 44.18 µs, with 0 restyles, 0 relayouts and 0 hit-index rebuilds | `scroll.translation`, `docs/performance.md` |
-| one recycle frame — rows entering and leaving | **1021.42 µs** | `scroll.recycle`, `docs/performance.md` |
-| what one row shift actually does | 8 boxes rebuilt, 29 nodes relaid out, 404 primitives emitted | `docs/performance.md` |
-| a wheel over 100 000 rows ÷ the same over 12 500 | 0.9991–1.0123, gated at ≤ 1.05 | `LIST-virtualisation-wheel` |
-| fragments rebuilt per drawn glide frame | 7.52 | `LIST-rebuilds-wheel` |
-| frames of a scroll that declared the whole surface damaged | 0, gated at ≤ 0 | `LIST-full-frames` |
-
-The 8 and the 29 are the row that arrived. The 404 are the viewport, and they are what the rest of a
-recycle frame costs. Eight times the data changes the wheel cost by an amount indistinguishable
-from zero.
-
-Without virtualisation the same shape is a cliff rather than a slope. Over a document with every row
-mounted, a glide frame costs 172 ns per box at 17 507 boxes, 287 at 70 007, and **5 660 at
-140 007** — about **792 ms a frame** at twenty thousand rows
-(`unvirtualised-probe`, `docs/perf/reference-workloads.md`). A rigid scroller crosses a 16.6 ms
-budget at roughly 160 000 boxes (`docs/perf/glide-split.md`).
-
-<Callout type="info">
-Carrying rows past a port is not free: one glide frame costs about **nine tenths** of repainting the
-same realised rows from their styles (`LIST-glide` = 0.92). Virtualisation wins by making the number
-of realised rows a property of the window instead of a property of the data.
+<Callout type="error">
+Two rows with the same key panic, in every build profile.
 </Callout>
+
+### Virtualise long lists
+
+Build only the rows the scrollport can show. The component library ships a virtualised list:
+
+```rust
+use zgui_ui::prelude::*;
+
+view! {
+    VirtualList(
+        count = lines,
+        row_size = 22.0,
+        label = "Log",
+        row = move |index: usize| view! { text {{move || format!("line {index}")}} }
+    )
+}
+```
+
+**Why:** scrolling, resizing and restyling all cost more as the number of boxes grows. A virtualised
+list keeps that number at what fits on screen, so its cost does not grow with the row count. Without
+it, one scroll frame over 20 000 mounted rows takes about 790 ms
+([numbers](/docs/performance/cost-model#scrolling)).
+
+If you [build your own](/docs/building/scrolling#virtualise-a-long-list):
+
+- **Stand in for hidden rows with padding on the container**, written with `style:padding-top` and
+  `style:padding-bottom` ([why](#write-per-frame-values-on-the-element)), not with empty elements.
+- **Declare row heights.** Measuring row 4 200 means building it.
+- **Slide the window, so kept rows keep their keys.** Scrolling by one row then destroys one row and
+  builds one.
+
+## Styling
+
+### Toggle a class on the element it styles
+
+```css
+.cell.hot   { background-color: rgb(47, 107, 255) }   /* class on the element: cheap */
+.warm .cell { background-color: rgb(47, 107, 255) }   /* class on an ancestor: costly */
+```
+
+**Why:** a class change on an ancestor restyles every descendant the rule could match. On the
+reference workload the ancestor toggle costs about fifteen times as much as the local one. A class
+that no selector mentions costs nothing: zgui checks the selector set before scheduling style work.
+
+### Theme with custom properties on a container
+
+Set theme values as custom properties on a container rather than swapping style sheets.
+
+**Why:** when a custom property changes, only elements that read it recascade. Elements that do not
+read it take the new inherited values without matching, and subtrees that read none of it are
+skipped. Replacing an installed sheet re-matches every element, and in that frame the filters that
+let a class change skip unaffected elements are off. Adding a new sheet invalidates only what its
+own selectors match.
+
+### Write per-frame values on the element
+
+A value that changes on many frames, such as a drag offset or a scroll-linked position, belongs on
+the element that uses it:
+
+```rust
+box(
+    class = "handle",
+    style:transform = move || Some(format!("translateX({}px)", offset.get()))
+)
+```
+
+**Why:** a custom property inherits, so every descendant takes the new value on every change. A
+`style:` property touches one element. Moving the `zgui-ui` virtual list's spacers from custom
+properties to `style:padding-top` halved the cost of a recycle frame.
+
+### Prefer colour, opacity and transform changes to size changes
+
+| Change | Reaches |
+|---|---|
+| `color`, `background-color`, a border colour, a shadow, `opacity`, `transform` | restyle, paint, draw |
+| `width`, `padding`, `gap`, `font-size` | restyle, **layout**, paint, draw |
+
+**Why:** a size change relays out the box, its descendants, and its ancestors up to the first whose
+size does not depend on it. The same holds for animation: a transition on `opacity` or `transform`
+never enters layout, while one on `width` does on every frame.
+
+Changes that happen together are also cheaper when they are near each other. A frame's damage is
+at most six rectangles, and beyond that nearby rectangles are merged.
+
+### Avoid intrinsic sizing you do not need
+
+`fit-content`, `min-content`, `max-content` and an `auto` flex basis ask the content how big it wants
+to be. A fixed size, a percentage or a flex share asks nothing.
+
+**Why:** answering means laying out the subtree at its minimum and maximum content size, and for text
+that means shaping it. zgui keeps the answers across frames, so a settled document measures nothing,
+but every content, style or scale change measures again. Grids multiply the cost, because track
+sizing asks each item several sizing questions per pass. Compare `SizesMeasured` with `SizesHeld` to
+see it.
+
+### Avoid effects that need an offscreen target
+
+A **stacking context** only changes paint order and is cheap. An **offscreen target** is a texture the
+subtree is drawn into first, which costs memory and a composite on every frame that reaches it.
+
+| On an ancestor | Offscreen target? |
+|---|---|
+| `opacity` below 1, over children whose ink does not overlap and with no blending descendant | **no**: the alpha is folded into each primitive |
+| `opacity` below 1 over overlapping ink, or with a blending descendant | **yes** |
+| `opacity: 0` | **no**: nothing is drawn |
+| a 2D `transform`, `translate`, `rotate` or `scale` | **no** |
+| `perspective`, `transform-style: preserve-3d`, `backface-visibility: hidden` | **yes** |
+| any `filter` or `backdrop-filter` | **yes** |
+| a custom shader in `--zgui-filter` or `--zgui-backdrop-filter` | **yes** |
+| a custom shader in `--zgui-shader` (it paints the box) | **no** |
+| `mix-blend-mode` other than `normal` | **yes** |
+| `isolation: isolate` | **yes** |
+| a `clip-path` shape or box keyword | **yes** |
+
+**Why:** a fade written as `opacity` on a panel whose children do not overlap costs no target, while a
+`filter: blur(…)` on an ancestor costs one every frame. `GroupTargets` counts them.
+
+## Text
+
+### Avoid replacing large text often
+
+**Why:** a text hole that produces the same string writes nothing. A new string costs one shaping
+pass, proportional to the paragraph's bytes, so one large replacement can dominate a frame even
+though only one paragraph changed. `TextBytesShaped` shows the volume.
+
+### Recolour and resize text freely
+
+**Why:** the colour is not part of what is shaped. Glyphs draw through a paint slot, and a theme
+change or colour transition rewrites the slot. A width change re-breaks lines without reshaping, and
+each paragraph remembers its last four line-breaking widths.
+
+### Make frequently changing labels repeat
+
+Labels that change every frame, such as axis ticks on a zooming plot, each cost one shaping pass. If
+the values repeat, format them so the strings repeat too.
+
+**Why:** shaped paragraphs are cached by content, so a repeated string is a cache hit. When a frame
+has 16 or more new strings, the shaping is spread across the layout workers; fewer are shaped on the
+frame thread, where that is cheaper.
+
+## Drawing
+
+zgui draws each vector shape by the cheapest route that can draw it: analytic quads for circles,
+rectangles and simple strokes, shared mark payloads for many recognised primitives, path glyphs for
+repeated outlines, atlas masks for small solid paths, a CPU-rasterised layer for a still, complex
+drawing, and a general GPU rasteriser for the rest. These guidelines keep content on the cheap
+routes. [Vector and canvas](/docs/building/vector-and-canvas) covers the API and
+[Paint and scene](/docs/architecture/paint-and-scene#vector-routes) covers the routes.
+
+### Reuse sources and geometry
+
+- **Use one source for repeated icons.** A source text is parsed once, and every element that draws
+  it shares its shapes.
+- **Recolour through `color` or `--zgui-fill`.** Colour is never part of a geometry key, so a
+  recoloured icon re-rasterises nothing.
+- **Build unchanging canvas paths once and keep them in an `Arc`.** Push them with
+  `ShapeBuilder::shared(Arc::clone(&path))`. Recognition, payloads and encodings are keyed by the
+  path's allocation, so a draw closure that rebuilds its paths on every run misses every cache.
+
+### Plot data as a `Series`
+
+```rust
+use std::sync::Arc;
+use zgui::canvas::{Brush, Lod, Series};
+use zgui::elements::kurbo::{Affine, Stroke};
+use zgui::prelude::*;
+
+let data: Arc<[[f32; 2]]> = samples.into();
+let plot = CanvasHandle::new();
+
+plot.draw(|scene| {
+    scene.push_series_lod(
+        Series::Line {
+            data: Arc::clone(&data),
+            to_canvas: Affine::scale_non_uniform(2.0, -40.0),
+            stroke: Stroke::new(1.5),
+            brush: Brush::Inherited { alpha: 1.0 },
+        },
+        Lod::Columns,
+    );
+});
+
+// On every drag step: move the view, not the data.
+plot.set_transform(Affine::translate((dx, 0.0)));
+```
+
+**Why:** a `Series` (`Points` or `Line`) is drawn as one union mark per part, from a payload built
+once per data allocation. Thousands of separate shapes, or one path with thousands of subpaths, cost
+far more.
+
+- **Pan and zoom with `set_transform`.** It changes no content, so nothing is recognised again and
+  every payload is kept. Rebuilding the scene for a pan throws all of that away.
+- **Keep the data in one `Arc`.** The payload is found again by the data allocation. Points far from
+  the origin keep their precision.
+- **Turn on line reduction for dense lines.** `push_series_lod(series, Lod::Columns)`, or
+  `--zgui-vector-lod: columns` on the element, reduces a left-to-right line with many more points
+  than device columns to each column's first, lowest, highest and last points. A pan then builds
+  nothing, and a zoom rebuilds only past twice or half the scale. It is opt-in because, on noisy data
+  denser than a pixel, the reduced line looks lighter under antialiasing.
+- **Use `Marker::Path` for custom markers.** Path markers are drawn as path glyphs, so panning and
+  zooming rasterise nothing. Keep them under 64 device pixels across and do not rotate or skew the
+  element.
+
+Very large series need nothing from you. A series of 65 536 points or more builds its payload on a
+worker thread and draws a provisional version until it is ready, and a large payload draws only the
+chunks near the view.
+
+### Keep repeated outlines small and simple
+
+A shape whose subpaths repeat a few outlines (a scatter of triangles, crosses or stars) is drawn like
+text: each distinct outline is rasterised once per device scale, and a pan rasterises nothing. It
+stays on this route when it has:
+
+- at least 8 subpaths, with few distinct outlines (at most 16 in the first 64, and at most one in
+  eight overall);
+- each subpath within 64 device pixels of its first point;
+- a solid or inherited paint, no clip and no dash pattern;
+- an element transform that keeps the axes (scale, mirror, quarter turn), with equal scales for a
+  stroke;
+- no self-intersecting subpaths, and no overlapping subpaths that use the even-odd rule or wind in
+  opposite directions.
+
+### Keep complex drawings still
+
+A drawing with gradients or clips that the cheaper routes cannot draw, and no series, is rasterised
+on the CPU into one atlas tile and drawn as one sprite. Moving it by whole pixels redraws the same
+sprite, and a static page of such drawings never starts the GPU vector rasteriser.
+
+- **Scale it, but do not rotate it.** The element's transform must be a positive scale; a turn, skew
+  or mirror uses the general route.
+- **Let zooms settle.** During a zoom the nearest cached scale is stretched, and three frames after
+  the zoom stops the drawing is rasterised at the new scale.
+- **Do not animate its content.** A drawing rasterised three times within 30 frames is kept off this
+  route for the next 30.
+
+Large drawings are handled for you: over 2 048 pixels a side or 4 MiB, a drawing is cut into
+512-pixel tiles, and an edit to one canvas shape re-rasterises only the tiles it touches.
+
+### Clip a canvas with a box
+
+A canvas does not clip its drawing. Put it in a box with `overflow: hidden`.
+
+### Check which route a shape took
+
+The `VectorRoute*` counters (`VectorRouteAnalytic`, `VectorRouteMarks`, `VectorRoutePathGlyphs`,
+`VectorRouteMask`, `VectorRouteLayer`, `VectorRouteGeneral`) count shapes per route. If
+`VectorEncodeMisses`, `VectorLayersRasterised` or `PathGlyphTilesRasterised` rise during a pan,
+something is being rebuilt that should be reused. `VectorTierChanges` counts shapes switching between
+the mask route and another.
 
 ## Resize
 
-A resize is the one interaction that genuinely invalidates everything, and there is nothing to keep.
-[The cost model](/docs/performance/cost-model) has the measured frame and the pacing table.
+### Do not debounce resizes yourself
 
-**Do not debounce it yourself.** Two mitigations are already in the frame loop. A configure arriving
-less than one frame of the output after the last resize frame is recorded and answered at the merged
-deadline, and a resize that repeats the extent runs no frame at all — the repository asserts the
-second by name (`a_resize_that_repeats_the_extent_runs_no_frame_at_all`,
-`crates/zgui/tests/wall_clock.rs`).
+**Why:** the frame loop already merges size changes that arrive within one frame of the display, and
+a resize to the current size runs no frame. A resize also does not reshape text, and only what moved
+is repainted.
 
-What is left for you is the size of the document and what a size change drags in with it.
+### Reduce what a size change reaches
 
-| Lever | Why |
+A resize lays out every box again. You control how much work that is:
+
+| Do | Why |
 |---|---|
-| Fewer boxes in the window | a resize costs about **1.00 µs per box** (`resize-slope` advisory, `docs/perf/reference-workloads.md`). Virtualising a list is the largest single reduction available. |
-| Percentages and flex shares instead of `vw` and `vh` | a viewport unit resolves at computed-value time, so every size change makes the frame scan every element to find the ones that read one (`crates/zgui-style/src/device/viewport.rs`). A document with none marks nothing. |
-| Few media-query boundaries, far apart | a resize that crosses no boundary disturbs no rule at all. One that crosses a boundary re-collects that origin's rules and restyles every element. |
-| No intrinsic sizing you do not need | the first measurement and valid invalidations are nested subtree layouts; unchanged intrinsic answers are reused during resize. |
+| keep fewer boxes in the window | a resize costs about 1 µs per box; virtualising is the largest single saving |
+| use percentages and flex shares instead of `vw` and `vh` | every element that resolved a viewport unit is recascaded on every size change |
+| keep media-query breakpoints few | a resize that crosses no breakpoint changes no rule; one that crosses a breakpoint re-matches |
+| avoid unneeded intrinsic sizing | each new measurement is a nested layout of the subtree |
+| make size observers settle | an observer whose handler keeps changing layout costs extra passes and, past the pass budget, an extra frame (`ObservationsTruncated`) |
 
-A scale-factor change is worse than a resize and you cannot avoid it: it throws away every box's
-layout and misses both caches keyed on device size. Do not treat a display change as a resize you
-can smooth over.
+Moving a window to a display with a different scale factor costs more than a resize and cannot be
+avoided: it discards all layout and misses every cache keyed on device pixels.
 
-## Finding out which one is your problem
+## Find a slow frame
 
-Do this in order. Each step is cheaper than the one after it.
-
-<Steps>
-
-<Step>
-
-**Count the frames.** Install a `FrameProbe` and see whether frames are being drawn at all. A still
-document must draw **zero**. A window that draws when nothing happened is a different bug from a
-window whose frames are expensive.
-
-</Step>
-
-<Step>
-
-**Read the counters.** They say what a frame did, in numbers rather than durations, so an answer
-survives being measured on a slow machine.
-
-</Step>
-
-<Step>
-
-**Set `ZGUI_FULL_DAMAGE=1`** and restart. If the artefact goes away, it is a damage-tracking
-problem and not a drawing one. This is the first thing to try when something looks wrong on screen.
-
-</Step>
-
-<Step>
-
-**Set `ZGUI_LATENCY=/tmp/trace.jsonl`** and reproduce the interaction. Both desktop backends start
-the recording, and the frame loop marks every stage. The portable backend periodically flushes the
-file; for an interrupt-safe native Wayland file trace, force `ZGUI_PLATFORM=winit`. What is recorded
-is *instants*, so every gap between two consecutive marks is visible whether or not anyone named the
-thing that filled it.
-
-</Step>
-
-<Step>
-
-**Open the inspector** with <kbd>F12</kbd> in a program that has one wired in, to see what one
-element computed to and why it is the size it is.
-
-</Step>
-
-</Steps>
-
-### The probe
-
-```rust
-use std::cell::Cell;
-use std::rc::Rc;
-use zgui::runtime::{FrameProbe, Window};
-
-#[derive(Default)]
-struct Frames(Cell<u64>);
-
-impl FrameProbe for Frames {
-    fn frame_ended(&self, window: &Window) {
-        self.0.set(self.0.get() + 1);
-        // The scene, the damage, the layout and the caches this frame left behind.
-        let _ = (window.scene(), window.damage());
-    }
-}
-
-fn main() -> Result<(), zgui::Error> {
-    let probe: Rc<dyn FrameProbe> = Rc::new(Frames::default());
-    app().with_probe(probe).run(|| view! { Shell() })
-}
-```
-
-The probe is called once at the end of every frame and handed the window as it stands. It takes
-`&self`, so anything it keeps goes through a cell or a signal. One seam, one occupant: installing a
-second replaces the first.
-
-### The counters
-
-Add the crate that owns them. The framework already compiles them in — `zgui-runtime` names the
-feature — but the umbrella does not re-export them, so an application that wants to read them names
-the crate itself.
-
-```toml
-[dependencies]
-zgui-profile = { path = "../zgui/crates/zgui-profile", features = ["counters"] }
-```
-
-```rust
-use zgui_profile::{COUNTERS_ENABLED, Counter, Counters, counter};
-
-assert!(COUNTERS_ENABLED, "this build has no counters compiled in");
-
-let before: Counters = counter::snapshot();
-// … the interaction …
-let after = counter::snapshot();
-let frame = before.delta(&after);
-
-println!("{frame:?}");                              // only the non-zero fields
-println!("{}", frame.get(Counter::ElementsRestyled));
-```
-
-Counters accumulate until `counter::reset()` is called; nothing resets them per frame. Take two
-snapshots and subtract.
-
-| The question | The counter | What a healthy answer looks like |
-|---|---|---|
-| Did one change restyle more than one thing? | `elements_restyled` | the elements you actually changed |
-| Is a stage walking the whole document? | `nodes_visited` | this is the counter that notices a traversal touching six thousand clean nodes to service one |
-| Was the box tree rebuilt? | `boxes_rebuilt` | zero for a colour, a class or a hover |
-| Did layout run at all? | `layouts_held` against `nodes_relaid_out` | held, for any frame that moved no box |
-| Did layout start from the root? | `layout_reached_root` | rarely; a resize, a scale change, a first frame |
-| Are intrinsic measurements missing? | `sizes_held` against `sizes_measured` | mostly held once the document has settled |
-| Is text being reshaped? | `text_shaped`, `text_rebroken` | shaping is more expensive than breaking |
-| Are glyphs being rasterised again? | `glyphs_rasterised` against `glyphs_placed` | **zero** rasterised on a repaint of unchanged text |
-| Is the display list being replayed? | `chunks_translated` against `chunks_reencoded` | translated, for anything that only moved |
-| Is anything being culled? | `primitives_culled` against `primitives_emitted` | over the hover-storm scenario, 96 % of primitives considered are culled |
-| Are ancestors forcing offscreen targets? | `group_targets` | one per genuinely isolated subtree, and no more |
-| Is the hit index being rebuilt? | `hit_index_rebuilds` | zero while scrolling |
-| Is the loop spinning? | `wakes` | one per thing that asked for one |
-
-Read the pairs as pairs. A counter of avoided work reads zero when everything is broken and zero
-when everything is perfect, so it means nothing without the counter of work done beside it.
-
-## The checklist
-
-- Every list has a key, and no key is an index into the rendered list.
-- Row state lives in the row, not in the collection signal.
-- "Which one is selected" is a `Selector`, not a signal every row reads.
-- Holes read a store field or a `Field` handle, never the store root.
-- A two-way branch is `if`; many branches are `Dynamic`; a value is a closure hole.
-- Memos sit where several readers share one answer, and nowhere else.
-- A class that changes often is on the element it affects, not on an ancestor every rule sits under.
-- A theme is custom properties on a container, not a sheet swap.
-- Where the design accepts either, the change is a colour and not a size.
-- Intrinsic sizes are used where they are needed and not by default, especially inside a grid.
-- No ancestor carries a filter, a blend mode or an isolation it does not need.
-- Any list that can hold thousands of rows is virtualised.
-- No `vw` or `vh` where a percentage or a flex share would do.
-- The application has a `FrameProbe`, and you have read its counters at least once.
+Start with the cheapest question. Check that a still window draws no frames at all, then read the
+work counters for one slow interaction, then record a latency trace to see where the time went.
+[Measure your own application](/docs/performance/measurements#measure-your-own-application) shows how
+to do each.
 
 ## Next
 
 <Cards>
   <Card
-    title="Caches"
-    href="/docs/performance/caches"
-    description="Every cache in the pipeline: what fills it, what invalidates it, what a miss costs."
-  />
-  <Card
     title="Measurements"
     href="/docs/performance/measurements"
-    description="The bands, the budgets, the reference workloads, and how to run them yourself."
+    description="Measure your own application, and the benchmarks and gates behind the numbers."
   />
   <Card
-    title="Scrolling"
-    href="/docs/building/scrolling"
-    description="The offset model, scrollbars, the glide, and a virtual list in full."
+    title="Cost model"
+    href="/docs/performance/cost-model"
+    description="What each kind of change costs, in numbers."
+  />
+  <Card
+    title="Vector and canvas"
+    href="/docs/building/vector-and-canvas"
+    description="Drawing with vector elements and canvases, series and the view transform."
   />
 </Cards>

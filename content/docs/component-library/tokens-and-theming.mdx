@@ -1,79 +1,345 @@
 ---
 title: Tokens and theming
-description: zgui-ui-tokens — the 127 design tokens, the light and dark theme model, which selector carries them, and what switching a theme costs.
+description: Theme the zgui component library with ThemeProvider, light and dark schemes, themes written as CSS, presets and run-time switching, plus a reference of all 141 design tokens.
 ---
 
-`zgui-ui-tokens` is the crate the rest of the component library is coloured, spaced and paced from.
-It is one dependency deep, it is optional, and everything it does is a style sheet you could write
-yourself. This page names every token, states the theme model exactly, and ends by building the same
-mechanism from the framework's own API. It assumes [Styling](/docs/learn/styling) and the
-[section index](/docs/component-library).
+`zgui-ui-tokens` holds the design tokens the component library is styled with, and
+`ThemeProvider`, which installs them in a window. Every token is a CSS custom property starting with
+`--zui-`. Component sheets read tokens with `var()` and never name a concrete colour, so you
+re-theme the whole library by changing token values.
 
-## What the crate is
-
-A **design token** is a name for a decision. `--zui-color-primary` means *the colour of the control
-that carries the main action*. A component that names it knows nothing else: not which colour it
-is, not whether the interface is light or dark, and not what the application did to it.
-
-Every token is a **custom property** — a name of your own starting with `--`, holding text, which
-inherits down the tree (see [Styling](/docs/learn/styling)). Every token in this crate is under one
-prefix, `--zui-`.
-
-The crate is on layer L8 and has exactly one dependency, `zgui`. Two tests in
-`crates/zgui-ui-tokens/tests/downstream.rs` hold that in place: one reads the manifest and fails on
-a second dependency, the other reads every source file and fails on any mention of a crate below the
-public API. The manifest states the reason.
-
-```toml
-# One dependency, and it is the umbrella crate an application depends on. The component library is
-# an ordinary downstream consumer of the public API: anything it needs, an application author needs
-# too, so a second edge here would be a hole in that API rather than a convenience.
+```toml title="Cargo.toml"
 [dependencies]
-zgui = { path = "../zgui", version = "0.1.0" }
+zgui-ui-tokens = "0.1"
 ```
 
-Seven groups, 127 properties. Each group is a Rust struct whose fields are `String`, because a token
-*is* a CSS value: anything the style engine parses is expressible without the crate knowing about
-it.
+```rust
+use zgui_ui_tokens::prelude::*;
+```
 
-| Group | Type | Prefix | Tokens |
+The crate depends only on `zgui`, so you can also use it without `zgui-ui`: the tokens plus your
+own `css!` sheets make a complete design system.
+
+## Apply a theme
+
+Wrap your interface in a `ThemeProvider`. It installs the tokens as a style sheet and renders a
+single `display: contents` element.
+
+```rust
+view! {
+    ThemeProvider(scheme = ColorScheme::System) {
+        App()
+    }
+}
+```
+
+| Prop | Type | Default |
+|---|---|---|
+| `light` | `Signal<Theme, LocalStorage>`, `into` | `Theme::light()` |
+| `dark` | `Signal<Theme, LocalStorage>`, `into` | `Theme::dark()` |
+| `scheme` | `Signal<ColorScheme, LocalStorage>`, `into` | `ColorScheme::System` |
+| `children` | `Children` | required |
+
+`light` and `dark` are two independent slots: the theme used when the scheme is light, and the one
+used when it is dark. Pass a signal to make a slot switchable. `scheme` decides which slots are
+written to the sheet:
+
+| `ColorScheme` | Sheet contents |
+|---|---|
+| `Light` | the light theme only |
+| `Dark` | the dark theme only |
+| `System` | the light theme, then the dark theme inside `@media (prefers-color-scheme: dark)` |
+
+With `System`, nothing is resolved in Rust. The media query follows the window's light or dark
+preference: the desktop's, or the one set with `app().with_theme(…)` or `WindowHandle::set_theme(…)`
+(see [Theming](/docs/building/theming)).
+
+<Callout type="warn">
+`zgui-ui` never installs tokens itself. Without a provider, or custom properties you declare
+yourself, every component's `var(--zui-…)` resolves to nothing and the components render unstyled.
+</Callout>
+
+### Where the tokens are declared
+
+| Provider | Declares on | Sheet name |
+|---|---|---|
+| the first in a window | `:root` | `zgui-ui-theme` (`THEME_SHEET`) |
+| a nested one, number N | `.zui-theme-N` | `zgui-ui-theme-N` |
+
+- The outermost provider declares on `:root`, so menus, dialogs and toasts are themed even though
+  they are portalled onto overlay bands outside the provider's subtree.
+- A nested provider themes only its own subtree. Portalled surfaces opened from inside it still use
+  the root tokens.
+- The tokens are a style sheet at the author origin, not inline styles, so your own rules can
+  override them.
+- Unmounting a provider removes its sheet.
+
+## Write a theme
+
+A theme is a set of CSS values, so the easiest way to write one is in CSS. `Theme::with_css` applies
+custom property declarations on top of a base theme:
+
+```rust
+let mocha = Theme::dark().with_css(
+    "--zui-color-background: #1e1e2e;
+     --zui-color-primary: #cba6f7;
+     --zui-radius-base: 8px;
+     --zui-space-base: 3.5px;
+     --zui-shadow-sm: none;
+     --zui-type-family-sans: 'Readex Pro';",
+);
+
+view! {
+    ThemeProvider(dark = mocha, scheme = ColorScheme::Dark) {
+        App()
+    }
+}
+```
+
+- Unknown property names are ignored, as in a style sheet. Comments are skipped, a wrapping
+  `:root { … }` is accepted, and the trailing semicolon is optional.
+- `apply_css(&mut self, text)` does the same in place and returns how many declarations matched a
+  token. `set(property, value)` sets one token and reports whether it exists.
+- The set of tokens is fixed: you cannot add a ninth group. Declare tokens of your own as ordinary
+  custom properties in your own sheet (see [Add your own tokens](#add-your-own-tokens)).
+- `Declarations::push` refuses a value containing `;`, `{`, `}` or `/*` (a debug assertion; in
+  release builds the token is dropped), so a value supplied at run time cannot break the sheet.
+
+### Start from a preset
+
+`Preset` lists the themes the library ships, each built with `with_css`:
+
+| Preset | Character |
+|---|---|
+| `Base` (default) | the default tokens: neutral, near-monochrome, soft corners |
+| `Ocean` | blue, wider corners, slower and softer motion |
+| `Ember` | warm orange, tight corners, the fastest motion |
+| `Terminal` | green, square corners, no motion (all durations zero) |
+| `Midnight` | violet, very round corners, long and gentle motion |
+
+```rust
+ThemeProvider(light = Preset::Ocean.light(), dark = Preset::Midnight.dark()) {
+    App()
+}
+```
+
+To build a theme picker, use `Preset::ALL`, `name()`, `label()` and `from_name()`.
+
+## Switch themes at run time
+
+| To change | Do this | What changes |
+|---|---|---|
+| the scheme | write the `scheme` signal | which slot is written to the sheet |
+| a whole slot | write the `light` or `dark` signal | that slot's theme |
+| some tokens | `use_theme()?.themes().patch(…)` | only the token groups that differ |
+| one context | a rule in your own sheet | your rule, if it wins the cascade |
+
+Each of the first three replaces the theme sheet once, keeping its place in the cascade. A patch
+that changes no token does not touch the document.
+
+```rust
+#[component]
+fn Page() -> impl IntoView {
+    let scheme = RwSignal::new_local(ColorScheme::Light);
+    let dark_theme = RwSignal::new_local(Preset::Base.dark());
+
+    view! {
+        ThemeProvider(scheme = scheme, dark = dark_theme) {
+            Switch(
+                default_checked = false,
+                on_change = UnsyncCallback::new(move |on: bool| {
+                    scheme.set(if on { ColorScheme::Dark } else { ColorScheme::Light })
+                }),
+                a11y:label = "Dark mode"
+            )
+            Button(on:click = move |_| dark_theme.set(Preset::Midnight.dark())) {"Midnight"}
+        }
+    }
+}
+```
+
+To patch tokens from anywhere below a provider:
+
+```rust
+use zgui::reactive::Patch;
+
+let theme = use_theme().expect("inside a ThemeProvider");
+let mut next = Themes::defaults();
+next.light.color.primary = "oklch(0.55 0.22 264)".to_owned();
+theme.themes().patch(next);
+```
+
+Code that reads one token group is not notified when another group changes.
+
+A theme switch restyles the whole document, and changing spacing or type tokens also re-runs
+layout and text shaping. Treat it as an occasional event. For changes on every frame, toggle a class
+or set a custom property on one element instead. See [Theming](/docs/building/theming) and
+[the cost model](/docs/performance/cost-model).
+
+## Override tokens in CSS
+
+Re-tinting the library takes five declarations:
+
+```css
+:root {
+    --zui-color-primary: oklch(0.55 0.22 264);
+    --zui-color-primary-foreground: oklch(0.985 0 0);
+    --zui-color-accent: oklch(0.95 0.03 264);
+    --zui-color-accent-foreground: oklch(0.4 0.16 264);
+    --zui-color-ring: oklch(0.55 0.22 264);
+}
+```
+
+<Callout type="warn">
+Your override must **win the cascade** against the theme sheet. Both are author sheets, and the
+theme sheet is installed when the provider mounts, after `app().with_stylesheet(…)` sheets. A rule
+of yours on `:root` ties on specificity and loses on order. Either pass the values to
+`ThemeProvider` as a theme (`with_css`), or use a more specific selector. Declaring the override on
+your own container also works through inheritance, but portalled surfaces are not inside that
+container.
+</Callout>
+
+## Add your own tokens
+
+Declare them in your own sheet. Define them in terms of the library's tokens where it makes sense;
+they then follow both schemes automatically.
+
+```css
+:root {
+    --app-sidebar-width: 260px;
+    --app-code-background: var(--zui-scale-neutral-3);
+}
+.sidebar { width: var(--app-sidebar-width); background-color: var(--zui-color-card); }
+```
+
+The library also reads a few properties that neither the theme nor the provider declares. Set them
+yourself; there is no theme rule to override.
+
+| Property | Read by | When undeclared |
+|---|---|---|
+| `--zui-icon-sm`, `-md`, `-lg`, `-xl` | the icon sheet, per size | `12px`, `16px`, `20px`, `24px` |
+| `--zui-icon-size` | every icon's width and height | the size token for its `size` |
+| `--zui-overlay-depth` | overlay `z-index` | written by the overlay components |
+| `--zui-surface-place`, `--zui-surface-motion` | overlay surface transform | no offset, no scale |
+
+For example, `:root { --zui-icon-md: 18px }` makes every default-size icon larger. See
+[Icons](/docs/component-library/icons).
+
+## Read tokens in Rust
+
+You rarely need to, because components work entirely in CSS. When you need a value in Rust (a chart
+colour, a duration), `use_theme()` returns the nearest `ThemeContext`, or `None` outside a provider.
+
+| `ThemeContext` method | Returns |
+|---|---|
+| `themes()` | `Store<Themes>`: the `light` and `dark` themes, readable group by group |
+| `scheme()` | the `scheme` signal (a `System` scheme is reported as `System`) |
+| `selector()` | `":root"` or `".zui-theme-N"` |
+
+## Token reference
+
+Each group is a Rust struct of `String` fields (a token is a CSS value) with `light()` and `dark()`
+defaults. A `Theme` holds one of each group.
+
+| Group | `Theme` field | Prefix | Tokens |
 |---|---|---|---:|
-| the two ramps | `ScaleTokens` | `--zui-scale-` | 24 |
-| semantic colour | `ColorTokens` | `--zui-color-` | 40 |
-| spacing | `SpacingTokens` | `--zui-space-` | 8 |
-| corner radii | `RadiusTokens` | `--zui-radius-` | 10 |
-| type | `TypeTokens` | `--zui-type-` | 26 |
-| elevation | `ShadowTokens` | `--zui-shadow-` | 9 |
-| motion | `MotionTokens` | `--zui-motion-` | 10 |
+| `ScaleTokens` | `scale` | `--zui-scale-` | 24 |
+| `ColorTokens` | `color` | `--zui-color-` | 43 |
+| `ControlTokens` | `control` | `--zui-color-control-` | 11 |
+| `SpacingTokens` | `space` | `--zui-space-` | 8 |
+| `RadiusTokens` | `radius` | `--zui-radius-` | 10 |
+| `TypeTokens` | `typography` | `--zui-type-` | 26 |
+| `ShadowTokens` | `shadow` | `--zui-shadow-` | 9 |
+| `MotionTokens` | `motion` | `--zui-motion-` | 10 |
 
-Every group carries the same four items: `PROPERTIES`, the custom property each field lowers to, in
-field order; `light()` and `dark()`, the two default sets; `declare()`, which writes the group out as
-declarations; and `pairs()`, which returns it as `(property, value)` pairs. `Theme::properties()`
-returns all 127 names in write order, and is what an application checks its own overrides against.
+Every group has `PROPERTIES` (its custom property names, in field order), `light()`, `dark()`,
+`declare()`, `pairs()` and `set(property, value)`. `Theme::properties()` lists all 141 names.
 
-## The tokens
+Spacing, radii, type, shadows and motion are the same in both schemes; only colours differ.
 
-### The two ramps
+### Semantic colours
 
-Twelve steps each, `--zui-scale-neutral-1` to `-12` and `--zui-scale-accent-1` to `-12`. A step means
-the same thing in both ramps and in both schemes, so a component asks for a step rather than for a
-colour.
+These are the tokens components use. All names start with `--zui-color-`, and values are written
+in `oklch()`.
 
-| Steps | What they are for |
+| Token | Light | Dark |
+|---|---|---|
+| `background` | `oklch(1 0 0)` | `oklch(0.145 0 0)` |
+| `foreground` | `oklch(0.145 0 0)` | `oklch(0.985 0 0)` |
+| `card`, `popover` | `oklch(1 0 0)` | `oklch(0.205 0 0)` |
+| `card-foreground`, `popover-foreground` | `oklch(0.145 0 0)` | `oklch(0.985 0 0)` |
+| `tooltip` | `var(--zui-color-foreground)` | same |
+| `tooltip-foreground` | `var(--zui-color-background)` | same |
+| `tooltip-border` | `var(--zui-color-tooltip)` | same |
+| `primary` | `oklch(0.205 0 0)` | `oklch(0.922 0 0)` |
+| `primary-foreground` | `oklch(0.985 0 0)` | `oklch(0.205 0 0)` |
+| `secondary`, `muted`, `accent` | `oklch(0.97 0 0)` | `oklch(0.269 0 0)` |
+| `secondary-foreground`, `accent-foreground` | `oklch(0.205 0 0)` | `oklch(0.985 0 0)` |
+| `muted-foreground` | `oklch(0.556 0 0)` | `oklch(0.708 0 0)` |
+| `destructive` | `oklch(0.577 0.245 27.325)` | `oklch(0.704 0.191 22.216)` |
+| `destructive-foreground` | `oklch(0.97 0.01 17)` | `oklch(0.58 0.22 27)` |
+| `danger` | `var(--zui-color-destructive)` | same |
+| `success` | `oklch(0.627 0.194 149.214)` | `oklch(0.723 0.219 149.579)` |
+| `success-foreground` | `oklch(0.982 0.018 155.826)` | `oklch(0.266 0.065 152.934)` |
+| `warning` | `oklch(0.769 0.188 70.08)` | `oklch(0.828 0.189 84.429)` |
+| `warning-foreground` | `oklch(0.279 0.077 45.635)` | same |
+| `info` | `oklch(0.546 0.245 262.881)` | `oklch(0.707 0.165 254.624)` |
+| `info-foreground` | `oklch(0.97 0.014 254.604)` | `oklch(0.282 0.091 267.935)` |
+| `border` | `oklch(0.922 0 0)` | `oklch(1 0 0 / 10%)` |
+| `input` | `oklch(0.922 0 0)` | `oklch(1 0 0 / 15%)` |
+| `ring` | `oklch(0.708 0 0)` | `oklch(0.556 0 0)` |
+| `scrim` | `oklch(0 0 0 / 50%)` | same |
+| `chart-1` … `chart-5` | `oklch(0.87 0 0)`, `0.556`, `0.439`, `0.371`, `0.269` (all achromatic) | same |
+| `sidebar`, `sidebar-foreground`, `sidebar-primary`, `sidebar-primary-foreground`, `sidebar-accent`, `sidebar-accent-foreground`, `sidebar-border`, `sidebar-ring` | the sidebar's own palette | its own dark set |
+
+- **The brand tint is five tokens:** `primary` and its foreground (solid calls to action), `accent`
+  and its foreground (hovered rows, highlighted menu items), and `ring` (the focus ring).
+- **The status tones** `destructive`, `success`, `warning` and `info` each have a foreground for
+  text on their fill. They are separate from the tint, so re-branding does not recolour a warning.
+  Toast icons use them.
+- `danger` is an alias for `destructive`, so you can make a message redder than a destructive
+  button.
+- A tooltip inverts the page by default. Set the three `tooltip` tokens to give it its own colours.
+- Chart colours are the same in both schemes, so a series keeps its colour.
+
+### Control colours
+
+`ControlTokens` holds the few colours where a control uses a different token in each scheme, not
+just a different value. They are part of the theme rather than a `@media (prefers-color-scheme)`
+rule, so they follow a fixed `ColorScheme` instead of the desktop setting.
+
+| Token (`--zui-color-control-…`) | Light | Dark |
+|---|---|---|
+| `ring-invalid` | destructive at 20% | destructive at 40% |
+| `destructive-fill` | `destructive` | destructive at 60% |
+| `ghost-hover` | `accent` | accent at 50% |
+| `outline-border` | `border` | `input` |
+| `outline-hover` | `accent` | input at 50% |
+| `switch-off` | `input` | input at 80% |
+| `switch-thumb` | `background` | `foreground` |
+| `switch-thumb-on` | `background` | `primary-foreground` |
+| `tab-ink` | foreground at 60% | `muted-foreground` |
+| `tab-fill` | `background` | input at 30% |
+| `tab-border` | `transparent` | `input` |
+
+"At N%" means `color-mix(in oklab, var(--zui-color-…) N%, transparent)`. Outlined buttons, toggles
+and fields have no fill at rest; they take the colour of the surface behind them.
+
+### Colour ramps
+
+`--zui-scale-neutral-1` … `-12` and `--zui-scale-accent-1` … `-12`. The semantic colours do not
+use the ramps; they are there for graded series and your own sheets.
+
+| Steps | Use |
 |---|---|
 | 1–2 | page and surface backgrounds |
-| 3–5 | component backgrounds: at rest, under the pointer, pressed |
-| 6–8 | borders: subtle, ordinary, and the one under the pointer |
-| 9–10 | the solid fill, and the solid fill under the pointer |
-| 11–12 | text: the readable weight, and the high-contrast one |
+| 3–5 | component backgrounds: rest, hover, pressed |
+| 6–8 | borders: subtle, normal, hover |
+| 9–10 | solid fill, solid fill on hover |
+| 11–12 | text: normal and high contrast |
 
-The dark ramps are not the light ones reversed. Each is chosen so that the *contrast* a step carries
-is the same in both, which is why a component styled in steps needs no dark-scheme rules of its own.
-A test in `crates/zgui-ui-tokens/src/token/scale.rs` asserts the two are not reverses, because a
-reversed ramp puts the same lightness at each step and every border comes out too strong.
-
-`accent-9` is the one step that holds across both schemes. A brand colour that changed with the
-scheme would not be one.
+The dark ramps are tuned to keep each step's contrast; they are not the light ramps reversed.
+`accent-9` (`#0090ff`) is the same in both schemes.
 
 <Accordions>
 <Accordion title="Every step, both ramps, both schemes">
@@ -96,496 +362,70 @@ scheme would not be one.
 </Accordion>
 </Accordions>
 
-### Semantic colour
-
-These are measured colours, not ramp steps. The palette the library is cut to does not form an even
-twelve-step ramp — its solid primary fill is pure black in light and near-white in dark, its muted
-surface and its accent surface are the same colour — so a derived value would land *near* the
-intended colour, which is the one thing a design system cannot ship. Every value is written in
-`oklch()`, and a test fails any that is not.
-
-| Token | light | dark |
-|---|---|---|
-| `--zui-color-background` | `oklch(1 0 0)` | `oklch(0.145 0 0)` |
-| `--zui-color-foreground` | `oklch(0.145 0 0)` | `oklch(0.985 0 0)` |
-| `--zui-color-card` | `oklch(1 0 0)` | `oklch(0.205 0 0)` |
-| `--zui-color-card-foreground` | `oklch(0.145 0 0)` | `oklch(0.985 0 0)` |
-| `--zui-color-popover` | `oklch(1 0 0)` | `oklch(0.205 0 0)` |
-| `--zui-color-popover-foreground` | `oklch(0.145 0 0)` | `oklch(0.985 0 0)` |
-| `--zui-color-primary` | `oklch(0.205 0 0)` | `oklch(0.922 0 0)` |
-| `--zui-color-primary-foreground` | `oklch(0.985 0 0)` | `oklch(0.205 0 0)` |
-| `--zui-color-secondary` | `oklch(0.97 0 0)` | `oklch(0.269 0 0)` |
-| `--zui-color-secondary-foreground` | `oklch(0.205 0 0)` | `oklch(0.985 0 0)` |
-| `--zui-color-muted` | `oklch(0.97 0 0)` | `oklch(0.269 0 0)` |
-| `--zui-color-muted-foreground` | `oklch(0.556 0 0)` | `oklch(0.708 0 0)` |
-| `--zui-color-accent` | `oklch(0.97 0 0)` | `oklch(0.371 0 0)` |
-| `--zui-color-accent-foreground` | `oklch(0.205 0 0)` | `oklch(0.985 0 0)` |
-| `--zui-color-destructive` | `oklch(0.577 0.245 27.325)` | `oklch(0.704 0.191 22.216)` |
-| `--zui-color-destructive-foreground` | `oklch(0.97 0.01 17)` | `oklch(0.58 0.22 27)` |
-| `--zui-color-danger` | `var(--zui-color-destructive)` | same |
-| `--zui-color-success` | `oklch(0.627 0.194 149.214)` | `oklch(0.723 0.219 149.579)` |
-| `--zui-color-success-foreground` | `oklch(0.982 0.018 155.826)` | `oklch(0.266 0.065 152.934)` |
-| `--zui-color-warning` | `oklch(0.769 0.188 70.08)` | `oklch(0.828 0.189 84.429)` |
-| `--zui-color-warning-foreground` | `oklch(0.279 0.077 45.635)` | same |
-| `--zui-color-info` | `oklch(0.546 0.245 262.881)` | `oklch(0.707 0.165 254.624)` |
-| `--zui-color-info-foreground` | `oklch(0.97 0.014 254.604)` | `oklch(0.282 0.091 267.935)` |
-| `--zui-color-border` | `oklch(0.922 0 0)` | `oklch(1 0 0 / 10%)` |
-| `--zui-color-input` | `oklch(0.922 0 0)` | `oklch(1 0 0 / 15%)` |
-| `--zui-color-ring` | `oklch(0.708 0 0)` | `oklch(0.556 0 0)` |
-| `--zui-color-scrim` | `oklch(0 0 0 / 50%)` | same |
-| `--zui-color-chart-1` … `-5` | `oklch(0.87 0 0)`, `oklch(0.556 0 0)`, `oklch(0.439 0 0)`, `oklch(0.371 0 0)`, `oklch(0.269 0 0)` | the same five |
-| `--zui-color-sidebar`, `-foreground`, `-primary`, `-primary-foreground`, `-accent`, `-accent-foreground`, `-border`, `-ring` | a palette of its own for the sidebar | its own dark set |
-
-Three tests hold the shape. `--zui-color-danger` is the **only** value written as a `var()`, and it
-aliases `--zui-color-destructive` so that a message can be made redder than the button without
-touching the button. A chart series keeps its colour when the scheme flips, because a series is
-identified by its colour across a legend, a tooltip and a printout. The sidebar carries eight tokens
-of its own, because it sits beside the page rather than on it.
-
-`destructive`, `success`, `warning`, and `info` are semantic tones. Each tone has a foreground for
-text placed on its fill. They are independent of the five tint tokens, so a brand override does not
-turn a warning or a success mark into the brand colour. Toast icons use these tones.
-
-Five tokens are the whole tint of an interface: `primary` and its foreground are every solid call to
-action, `accent` and its foreground are every hovered row and highlighted menu item, and `ring` is
-the focus ring around all of it.
-
 ### Spacing and radii
 
-| Token | Value | Meaning |
+Both scales are multiples of one base value, so **one declaration re-spaces or re-rounds the whole
+interface**: set `--zui-space-base` or `--zui-radius-base`.
+
+| Token | Value | Typical use |
 |---|---|---|
-| `--zui-space-base` | `0.25rem` | what every named step is measured from |
-| `--zui-space-xs` | `calc(var(--zui-space-base) * 1)` | a hairline: an icon and the label beside it |
-| `--zui-space-sm` | `calc(var(--zui-space-base) * 2)` | inside a dense control |
-| `--zui-space-md` | `calc(var(--zui-space-base) * 3)` | inside an ordinary control |
-| `--zui-space-lg` | `calc(var(--zui-space-base) * 4)` | inside a surface, and between groups |
-| `--zui-space-xl` | `calc(var(--zui-space-base) * 6)` | between sections of a page |
-| `--zui-space-2xl` | `calc(var(--zui-space-base) * 8)` | around a page's content |
-| `--zui-space-3xl` | `calc(var(--zui-space-base) * 12)` | between the major regions of a window |
+| `--zui-space-base` | `4px` | the unit |
+| `--zui-space-xs` | base × 1 | icon to label |
+| `--zui-space-sm` | base × 2 | inside a dense control |
+| `--zui-space-md` | base × 3 | inside a normal control |
+| `--zui-space-lg` | base × 4 | inside a surface, between groups |
+| `--zui-space-xl` | base × 6 | between page sections |
+| `--zui-space-2xl` | base × 8 | around page content |
+| `--zui-space-3xl` | base × 12 | between major window regions |
 
-**Set `--zui-space-base` alone and every gap follows.** Two tests hold the ladder: it only ever
-grows, and every named step is a multiple of the base.
-
-| Token | Value | Meaning |
+| Token | Value | Typical use |
 |---|---|---|
-| `--zui-radius-base` | `0.625rem` | what every derived step is measured from |
-| `--zui-radius-none` | `0px` | a square corner |
-| `--zui-radius-sm` | `calc(var(--zui-radius-base) * 0.6)` | a checkbox, a dense badge |
-| `--zui-radius-md` | `calc(var(--zui-radius-base) * 0.8)` | a button, an input, a menu item |
-| `--zui-radius-lg` | `var(--zui-radius-base)` | a card, a popover, a dialog |
-| `--zui-radius-xl` | `calc(var(--zui-radius-base) * 1.4)` | a sheet, a drawer |
-| `--zui-radius-2xl` | `calc(var(--zui-radius-base) * 1.8)` | a large panel |
-| `--zui-radius-3xl` | `calc(var(--zui-radius-base) * 2.2)` | larger still |
-| `--zui-radius-4xl` | `calc(var(--zui-radius-base) * 2.6)` | the roundest named step |
-| `--zui-radius-full` | `9999px` | a pill or a circle |
+| `--zui-radius-base` | `10px` | the unit |
+| `--zui-radius-none` | `0px` | square |
+| `--zui-radius-sm` | base × 0.6 | checkbox, dense badge |
+| `--zui-radius-md` | base × 0.8 | button, input, menu item |
+| `--zui-radius-lg` | base | card, popover, dialog |
+| `--zui-radius-xl` | base × 1.4 | sheet, drawer |
+| `--zui-radius-2xl`, `-3xl`, `-4xl` | base × 1.8, 2.2, 2.6 | larger panels |
+| `--zui-radius-full` | `9999px` | pill or circle |
 
-**Set `--zui-radius-base` alone and the whole interface follows.** The ladder scales rather than
-shifts, so every step keeps its proportion to the others. The two ends are absolute on purpose: a
-square corner stays square and a pill stays a pill however the base moves. The radii are identical in
-both schemes, and a test asserts it.
+The derived steps are `calc()` expressions over the base; `none` and `full` are fixed values.
 
 ### Type
 
 | Axis | Tokens | Values |
 |---|---|---|
-| family | `--zui-type-family-sans`, `--zui-type-family-mono` | `Geist, ui-sans-serif, system-ui, sans-serif`, `"Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace` |
-| size | `--zui-type-size-xs` … `-3xl` | `0.75rem`, `0.875rem`, `1rem`, `1.125rem`, `1.25rem`, `1.5rem`, `1.875rem` |
-| line height | `--zui-type-leading-xs` … `-3xl` | `1rem`, `1.25rem`, `1.5rem`, `1.75rem`, `1.75rem`, `2rem`, `2.25rem` |
+| family | `--zui-type-family-sans`, `-mono` | `Geist, ui-sans-serif, system-ui, sans-serif`; `"Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace` |
+| size | `--zui-type-size-xs` … `-3xl` | `12px`, `14px`, `16px`, `18px`, `20px`, `24px`, `30px` |
+| line height | `--zui-type-leading-xs` … `-3xl` | `16px`, `20px`, `24px`, `28px`, `28px`, `32px`, `36px` |
 | weight | `--zui-type-weight-normal`, `-medium`, `-semibold`, `-bold` | `400`, `500`, `600`, `700` |
 | letter spacing | `--zui-type-tracking-tighter`, `-tight`, `-normal`, `-wide`, `-wider`, `-widest` | `-0.05em`, `-0.025em`, `0em`, `0.025em`, `0.05em`, `0.1em` |
 
-The size and line-height steps are `xs`, `sm`, `md`, `lg`, `xl`, `2xl`, `3xl`, in that order.
+The size steps are `xs`, `sm`, `md`, `lg`, `xl`, `2xl` and `3xl`. Pair each size with the line
+height of the same name. Sizes are absolute pixels and independent of the spacing base, so larger
+text does not also enlarge every gap.
 
-A size carries its line height with it: `--zui-type-size-md` and `--zui-type-leading-md` are meant to
-be used together. Three tests hold the axis — every size has a leading under the same name, every
-leading is taller than its size, and every step is written in `rem` so that text follows the
-reader's own setting rather than the device.
+### Shadows and motion
 
-The Rust field is `typography` and the prefix is `--zui-type-`. The two names do not match, and the
-prefix is what appears in a style sheet.
-
-### Elevation and motion
-
-| Token | Rung |
+| Token | Use |
 |---|---|
-| `--zui-shadow-none` | flat on the page |
-| `--zui-shadow-2xs` | a hairline under an edge |
-| `--zui-shadow-xs` | a control raised very slightly: an input, a toggle |
-| `--zui-shadow-sm` | a card |
-| `--zui-shadow-md` | a popover, a menu, a tooltip |
-| `--zui-shadow-lg` | a dialog or a sheet |
-| `--zui-shadow-xl` | something dragged, held above everything |
-| `--zui-shadow-2xl` | the highest rung |
-| `--zui-shadow-inset` | a well: pressed into the page rather than lifted off it |
-
-One ladder, not two: the shadows are identical in both schemes and a test asserts it. Two more hold
-the shape — `inset` is the only rung drawn inside the box, and every rung above the hairline keeps a
-tight shadow under the soft one.
+| `--zui-shadow-none` | flat |
+| `--zui-shadow-2xs` | hairline under an edge |
+| `--zui-shadow-xs` | slightly raised control |
+| `--zui-shadow-sm` | card |
+| `--zui-shadow-md` | popover, menu |
+| `--zui-shadow-lg` | dialog, sheet |
+| `--zui-shadow-xl` | dragged item |
+| `--zui-shadow-2xl` | highest |
+| `--zui-shadow-inset` | pressed-in well |
 
 | Token | Value |
 |---|---|
-| `--zui-motion-duration-none` | `0ms` |
-| `--zui-motion-duration-fast` | `100ms` |
-| `--zui-motion-duration-normal` | `150ms` |
-| `--zui-motion-duration-slow` | `200ms` |
-| `--zui-motion-duration-slower` | `300ms` |
-| `--zui-motion-duration-slowest` | `500ms` |
+| `--zui-motion-duration-none` / `-fast` / `-normal` / `-slow` / `-slower` / `-slowest` | `0ms`, `100ms`, `150ms`, `200ms`, `300ms`, `500ms` |
 | `--zui-motion-ease-standard` | `cubic-bezier(0.4, 0, 0.2, 1)` |
 | `--zui-motion-ease-out` | `cubic-bezier(0, 0, 0.2, 1)` |
 | `--zui-motion-ease-in` | `cubic-bezier(0.4, 0, 1, 1)` |
-| `--zui-motion-ease-linear` | `linear` |
-
-Three tests: nothing takes longer than half a second, the durations only ever grow, and `ease-linear`
-is the one curve that is not a curve — it is the pacing a repeating animation needs, and every other
-name is a `cubic-bezier`.
-
-## How a token reaches a component
-
-A component reads a token with `var()` in its own scoped sheet, and reads nothing in Rust. This is
-the button's sheet, trimmed, from `crates/zgui-ui/src/button/style.rs`.
-
-```rust
-style! { pub ButtonStyle =>
-    ":scope {
-        gap: var(--zui-space-sm);
-        padding: 0 var(--zui-space-lg);
-        border-radius: var(--zui-radius-md);
-        font-family: var(--zui-type-family-sans);
-        font-size: var(--zui-type-size-md);
-        line-height: var(--zui-type-leading-md);
-        transition: background-color var(--zui-motion-duration-fast)
-                    var(--zui-motion-ease-standard);
-    }"
-    ":scope[data-variant=\"default\"] {
-        background-color: var(--zui-color-primary);
-        color: var(--zui-color-primary-foreground);
-    }"
-    ":scope:focus-visible { outline: 2px solid var(--zui-color-ring); outline-offset: 2px; }"
-}
-```
-
-The declarations that supply those names come from one sheet, installed by `ThemeProvider`.
-
-| Prop | Type | Default |
-|---|---|---|
-| `light` | `Option<Theme>`, `into` | `Theme::light()` |
-| `dark` | `Option<Theme>`, `into` | `Theme::dark()` |
-| `scheme` | `Signal<ColorScheme, LocalStorage>`, `into` | `ColorScheme::System` |
-| `children` | `Children` | required |
-
-Which selector the sheet declares on depends on how many providers the window already has.
-
-| Provider | Selector it declares on | Sheet name |
-|---|---|---|
-| the first in a window | `:root` | `zgui-ui-theme` |
-| a nested one, ordinal N | `.zui-theme-N` | `zgui-ui-theme-N` |
-
-Three consequences, each deliberate:
-
-- **The sheet is at the author origin, not inline on an element.** Inline properties beat every
-  ordinary rule, and the library would be un-themeable except by rebuilding it.
-- **The outermost provider owns `:root`.** A surface sent to an overlay band with `Portal` is not a
-  descendant of the provider, so a provider that declared on its own element would leave every menu
-  and dialog untokened.
-- **A nested provider themes its subtree.** It declares on `.zui-theme-N` and leaves the root sheet
-  alone. That is how a differently themed panel is expressible at all.
-
-The provider itself renders one element and takes no part in layout.
-
-```rust
-box(class = "zui-theme-0", style:display = "contents") { … }
-```
-
-`display: contents` because a theme is not a box. The element exists so that a nested provider has
-something to declare on, and so a style sheet can find a themed region.
-
-Reading a token in Rust is a separate thing and is rarely needed.
-
-```rust
-use zgui_ui_tokens::prelude::*;
-
-// `None` outside a provider is an ordinary answer, not an error.
-let theme = use_theme();
-```
-
-`ThemeContext` gives three things: `themes()`, a `Store` of the two token sets addressed field by
-field; `scheme()`, the signal the provider was given; and `selector()`, `":root"` or
-`".zui-theme-N"`. Only something that must have a token as a Rust value needs any of it — a chart
-picking a series colour, a transition that has to know a duration. Every styled component works with
-no provider anywhere and falls back to whatever the cascade already had.
-
-## Light, dark and the desktop
-
-A `Theme` carries **both** token sets. Which one is in force is not a property of the theme; it is a
-property of the surface. `ColorScheme` decides what is written out.
-
-| `ColorScheme` | What the sheet contains |
-|---|---|
-| `Light` | one rule, the light tokens |
-| `Dark` | one rule, the dark tokens |
-| `System` (the default) | the light tokens, then the dark ones inside `@media (prefers-color-scheme: dark)` |
-
-```rust
-use zgui_ui_tokens::{ColorScheme, Theme, theme_sheet};
-
-let css = theme_sheet(":root", &Theme::light(), &Theme::dark(), ColorScheme::System);
-assert!(css.starts_with(":root {"));
-assert!(css.contains("@media (prefers-color-scheme: dark)"));
-
-// Pinned to one scheme, the query is not written at all, so nothing in the sheet can change
-// under the interface when the desktop's setting does.
-let pinned = theme_sheet(":root", &Theme::light(), &Theme::dark(), ColorScheme::Dark);
-assert!(!pinned.contains("@media"));
-```
-
-`System` is **not resolved in Rust**. There is no signal that tracks the desktop, no sheet rewrite
-when the setting moves, and nothing to keep in step. The style engine already matches
-`prefers-color-scheme` against the window, so the query answers it. `ThemeContext::scheme()` reports
-`System` rather than resolving it, because a second answer computed in Rust would eventually be the
-wrong one.
-
-`crates/zgui-runtime/tests/theme_flip.rs` drives that route end to end. It changes the desktop's
-setting, reads the colour off **every** glyph sprite in the display list ordered down the window, and
-asserts all of them moved — then repeats the check after a repaint that reshapes nothing, after a
-resize, and on the first frame of a window opened on a dark desktop.
-
-## Switching a theme at run time
-
-Three ways, in the order you should reach for them.
-
-| Route | What moves | What the document sees |
-|---|---|---|
-| move the `scheme` signal | which of the two sets is written | one sheet replaced in place |
-| `patch` the store | the token values themselves | one sheet replaced in place |
-| a rule in your own sheet | nothing in the crate | your rule, if it wins the cascade |
-
-### Move the scheme
-
-`ThemeProvider` takes `scheme` as a signal, so a flip is a signal write and nothing else.
-
-```rust
-use zgui::prelude::*;
-use zgui::reactive::RwSignal;
-use zgui::{component, view};
-use zgui_ui_tokens::prelude::*;
-
-#[component]
-fn Page() -> impl IntoView {
-    let scheme = RwSignal::new_local(ColorScheme::Light);
-
-    view! {
-        ThemeProvider(scheme = scheme) {
-            column(class = "page") {
-                control(on:click = move |_| {
-                    scheme.set(match scheme.get_untracked() {
-                        ColorScheme::Dark => ColorScheme::Light,
-                        _ => ColorScheme::Dark,
-                    })
-                }) {
-                    "Change the scheme"
-                }
-            }
-        }
-    }
-}
-```
-
-Nothing below branches on the scheme in Rust. The repository's gallery
-(`crates/zgui-ui/examples/gallery/shell.rs`) drives the same signal from the library's own switch
-component instead of a `control`, and its sheet is written entirely in tokens so the page follows
-the theme the way the components do.
-
-A test asserts what this costs the document:
-`changing_the_scheme_replaces_the_one_sheet_rather_than_adding_another` in
-`crates/zgui-ui-tokens/tests/theme.rs` checks that the window still holds exactly one sheet
-afterwards and that exactly one replacement happened.
-
-### Patch the store
-
-The two sets live in a `Store`, so a whole new theme goes in as one patch and wakes only the groups
-that moved.
-
-```rust
-use zgui::reactive::Patch;
-use zgui_ui_tokens::prelude::*;
-
-// From any component below the provider.
-let theme = use_theme().expect("a provider above this");
-
-let mut brighter = Themes::defaults();
-brighter.light.scale.accent_9 = "rebeccapurple".to_owned();
-theme.themes().patch(brighter);
-```
-
-Two more tests state the edges. `patching_a_theme_onto_itself_never_reaches_the_document`: an
-identical patch installs nothing at all. `reading_one_token_group_does_not_wake_a_reader_of_another`:
-a reader of the motion tokens does not re-run when a colour changes.
-
-### Write a rule
-
-The route with no machinery behind it. A tint is five declarations, because a semantic colour holds
-a measured value rather than a ramp step.
-
-```css
-:root {
-    --zui-color-primary: oklch(0.55 0.22 264);
-    --zui-color-primary-foreground: oklch(0.985 0 0);
-    --zui-color-accent: oklch(0.95 0.03 264);
-    --zui-color-accent-foreground: oklch(0.4 0.16 264);
-    --zui-color-ring: oklch(0.55 0.22 264);
-}
-```
-
-A dark scheme overrides the same five inside `@media (prefers-color-scheme: dark)`, or under
-whatever selector `ColorScheme` put the dark set behind.
-
-<Callout type="warn">
-An override has to **win the cascade** against the theme's own rule. Both are at the author origin,
-and the theme sheet is installed when the provider mounts — which is after `App::with_stylesheet`
-has installed the application's sheet. At equal specificity the later sheet wins, so a rule written
-on `:root` in an application sheet ties on specificity and loses on order.
-
-Two ways to win: give `ThemeProvider` its own `light` and `dark` themes, or declare the override on
-a selector of higher specificity than `:root`. Declaring it on a container of your own also works,
-because custom properties inherit — but a surface sent to an overlay band is not below that
-container and keeps the root's value.
-</Callout>
-
-## Tokens of your own
-
-The Rust schema is closed: the macro that declares a group is private to the crate, so a `Theme`
-carries exactly those seven groups and no eighth. Extension happens in CSS, which is the same place
-the tokens land anyway.
-
-```css
-:root {
-    --app-sidebar-width: 260px;
-    --app-code-background: var(--zui-scale-neutral-3);
-}
-
-.sidebar {
-    width: var(--app-sidebar-width);
-    background-color: var(--zui-color-card);
-}
-```
-
-A token of your own written in terms of a semantic colour follows both schemes for free, because the
-theme sheet writes a light set and a dark set for every one of them.
-
-Four families are **read** by the library and **declared** by neither the token crate nor the
-provider. An interface that wants to move one declares it itself.
-
-| Property | Read by | Value when nothing declares it |
-|---|---|---|
-| `--zui-icon-size` | every icon's width and height | `var(--zui-icon-md, 16px)` |
-| `--zui-icon-sm`, `-md`, `-lg`, `-xl` | the icon sheet, per size | `12px`, `16px`, `20px`, `24px` |
-| `--zui-overlay-depth` | the `z-index` of an overlay surface | `0`, and the overlay machinery writes it per layer |
-| `--zui-surface-place`, `--zui-surface-motion` | the transform of an overlay surface | no offset, no scale |
-
-So an application that wants every icon one step larger writes `:root { --zui-icon-md: 18px }` and
-nothing else. These four need no cascade fight, because the theme sheet declares none of them and
-there is no rule to beat. [Icons](/docs/component-library/icons) covers the rest of that family.
-
-<Callout type="info">
-`Declarations::push` refuses a value containing `;`, `}`, `{` or `/*`. It fails a debug assertion and
-drops that one declaration in release. A theme's values may come from an application at run time,
-and a dropped token falls back through the cascade — the alternative is a sheet that stops parsing
-halfway down.
-</Callout>
-
-## What a theme switch costs
-
-A theme switch is **one sheet replacement**, and a sheet replacement is a whole-document event. Read
-this beside [The cost model](/docs/performance/cost-model), which states what each kind of change
-costs in general.
-
-| What you change | What it reaches | Proportional to |
-|---|---|---|
-| the `scheme` signal, or a patch that moves a colour | restyle, repaint, draw | the document, then its ink |
-| `--zui-radius-*`, `--zui-shadow-*` | restyle, refragment, rehit, repaint. Layout does not move | the document, then its ink |
-| `--zui-space-*` | restyle, layout, paint, draw | the document |
-| `--zui-type-size-*`, `--zui-type-family-*` | restyle, **reshape**, layout, paint, draw | every paragraph |
-| a patch that moves no token | nothing at all | — |
-| the desktop's setting, under `System` | the viewport is rebuilt in the new scheme; every origin whose media queries mention it is dirtied; the document restyles | the document |
-| the desktop re-stating the setting it already had | nothing | — |
-
-Four mechanisms decide those rows.
-
-- **Replacement keeps the sheet's place in the cascade.** Removing and re-adding would move the
-  sheet to the end of the author origin, where it would begin beating rules it used to lose to. A
-  theme change that also, invisibly, changed what wins is the defect this avoids.
-- **The frame that changes the installed sheets turns the style filters off.** Normally a mutation is
-  tested against an index of what the sheets mention, and most mutations never reach the engine. For
-  this one frame every mutation takes the full path, and the tail of the same frame rebuilds the
-  index. This is why the guide says to prefer a class toggle or a custom property to swapping a
-  sheet.
-- **The tokens are inherited custom properties declared on `:root`.** Every element below gets a new
-  inherited map, and the paint key holds that map's identity, so the whole document repaints.
-- **No paragraph is shaped again for a colour.** A shaped paragraph stores an index into a paint
-  table, and a text colour that moved is reported as a paint update rather than as text work
-  (`crates/zgui-style/src/engine/restyle.rs`). Shaping costs more than line breaking, so this is the
-  difference between a colour theme and a type theme.
-
-<Callout type="warn">
-No scenario in the generated `docs/performance.md` switches a theme, so this page quotes no number
-for one. What is stated above is mechanism, not measurement. Treat a theme switch as a
-once-per-session event and keep it off anything that runs per frame.
-</Callout>
-
-## The same thing, without the crate
-
-Everything above is a style sheet installed under a name and replaced when a signal moves. You can
-write it, and [Theming](/docs/building/theming) builds it out from the framework's own API. The
-whole mechanism is one guard and one effect.
-
-```rust
-use zgui::prelude::*;
-use zgui::reactive::{RenderEffect, RwSignal};
-use zgui::{component, css, view};
-
-const LIGHT: &str = css!(":root { --surface: #fcfcfd; --on-surface: #1c2024 }");
-const DARK: &str = css!(":root { --surface: #111113; --on-surface: #edeef0 }");
-
-#[component]
-fn Themed(children: Children) -> impl IntoView {
-    let dark = RwSignal::new_local(false);
-
-    // A guard, because the sheet's content is state: it stops being true when this view goes away.
-    let sheet = Stylesheet::install("app-theme", LIGHT);
-    let installed = RenderEffect::new(move |previous: Option<()>| {
-        let css = if dark.get() { DARK } else { LIGHT };
-        // The first run is the install above; running it again would be a second identical write.
-        if previous.is_some()
-            && let Some(sheet) = sheet.as_ref()
-        {
-            sheet.replace(css);
-        }
-    });
-    on_cleanup_local(move || drop(installed));
-
-    view! {
-        column {
-            control(on:click = move |_| dark.set(!dark.get_untracked())) {"Dark"}
-            {children.into_view_once()}
-        }
-    }
-}
-```
-
-That is the shape of `ThemeProvider`'s own body, without the ordinal, the store and the two token
-sets. What the crate adds over it:
-
-| What the crate adds | What it buys |
-|---|---|
-| 127 named decisions | a component names a decision instead of a colour |
-| an ordinal per provider | a nested provider themes a region and leaves `:root` alone |
-| a `Store` per group | a reader of the motion tokens is not woken by a colour change |
-| `System` as a media query | the desktop decides, with no signal and nothing to keep in step |
-| `Declarations::push` | a value from an application cannot end the rule early |
-| one base behind every gap and every radius | one declaration re-spaces or re-rounds the interface |
-
-None of it is privileged. An application that wants a theme of its own writes the sheet above and
-loses nothing.
+| `--zui-motion-ease-linear` | `linear`, for repeating animations |
 
 ## Next
 
@@ -593,16 +433,16 @@ loses nothing.
   <Card
     title="Components"
     href="/docs/component-library/components"
-    description="The inventory, and three components taken apart into the primitives they are made of."
+    description="Every component, its props and its variants."
   />
   <Card
-    title="Primitives"
-    href="/docs/component-library/primitives"
-    description="The headless behaviours under the styled layer, and how to use them alone."
+    title="Icons"
+    href="/docs/component-library/icons"
+    description="The icon set, and the --zui-icon-* sizes."
   />
   <Card
     title="Theming"
     href="/docs/building/theming"
-    description="Building the same mechanism from custom properties and style sheet guards."
+    description="Theming with the framework alone: custom properties, sheets and window themes."
   />
 </Cards>

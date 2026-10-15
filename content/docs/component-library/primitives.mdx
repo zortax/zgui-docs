@@ -1,146 +1,81 @@
 ---
-title: The primitives
-description: What a headless primitive is, the eight in zgui-ui-primitives, and how to style one with your own CSS and no component library.
+title: Primitives
+description: Reference for zgui-ui-primitives, the headless behaviours behind the component library — placement, focus trapping, roving focus, exit animations, dismissal, item order and value ownership — and how to style them with your own CSS.
 ---
 
-`zgui-ui-primitives` is the headless half of the bundled component library: eight interaction
-behaviours with no appearance at all. It assumes [the guide](/docs/learn/views) and the
-[library overview](/docs/component-library). Everything on this page is optional; an application
-that writes its own behaviours loses nothing.
+`zgui-ui-primitives` holds the behaviour of the component library without its appearance:
+placement, focus trapping, roving focus, exit animations, dismissal, item order and value
+ownership. Each primitive renders at most one unstyled element and writes `data-` attributes for
+your style sheet. `zgui-ui` is built from these primitives, and you can use them directly with your
+own CSS. The crate uses only zgui's public API.
 
-## What a primitive is
-
-A component library has two halves.
-
-One half is **appearance**: colour, spacing, corner radius, the shadow under a menu, the fade as a
-dialog closes. That half is CSS, and a [style sheet](/docs/learn/styling) is where it belongs.
-
-The other half is **behaviour**: where a floating panel goes when the button that opens it sits at
-the bottom of the window; which key moves what inside a toolbar; which of three stacked surfaces a
-press outside closes; when content whose exit animation is still running may finally be removed.
-That half is Rust, and it is the same behaviour for a menu, a select and a date picker.
-
-A **primitive** is the second half with none of the first. Nothing in this crate draws anything you
-can see. Each behaviour renders one unstyled element or no element at all, writes `data-` attributes
-for a style sheet to select on, and decides nothing about how anything looks. The usual word for
-that is **headless**.
-
-The crate's own statement of why it exists:
-
-> A component library's hard parts are not its looks. They are collision-aware positioning, focus
-> trapping, exit animations that actually finish, dismissal that knows which surface a press belongs
-> to, item order in a tree that reorders itself, and state that works whether the caller owns it or
-> the component does. Written once, every visible component is thin. Written per component, forty
-> components get them forty subtly different ways.
->
-> — `crates/zgui-ui-primitives/src/lib.rs`
-
-### It is an ordinary consumer
-
-The crate has exactly one dependency, and it is `zgui`
-(`crates/zgui-ui-primitives/Cargo.toml`). It uses `NodeRef` and its geometry observations, the typed
-events, the focus traversal, the overlay bands and the timer heap — the public API this
-documentation has already described. A test asserts the constraint rather than a comment claiming
-it: `the_sources_name_no_crate_below_the_public_api` in
-`crates/zgui-ui-primitives/tests/downstream.rs` fails the build if any source names a crate below
-the public API.
-
-So there is no privileged access to reproduce. Anything a primitive does, your own code can do.
-
-## The eight
-
-| Behaviour | The question it answers | Kind |
-|---|---|---|
-| `Popper` | where does this floating surface go, and does it still fit? | component |
-| `FocusScope` | may focus leave, and where does it go back to? | component |
-| `RovingFocus` | what does the next arrow key do? | component |
-| `Presence` | has the exit animation finished yet? | component |
-| `DismissableLayer` | does this press belong to me, or to something above me? | component |
-| `Collection` | what are my items, in the order a reader meets them? | value |
-| `Controllable` | who owns this value — me, or my caller? | value |
-| `Binding` | what did the caller tie it to, and what does a click therefore do? | value |
-
-What each one puts in the document:
-
-| Primitive | The element it renders |
-|---|---|
-| `Popper` | one `box`, `position: fixed`, with inline `left`, `top`, `visibility`, plus `data-side` and `data-align` |
-| `FocusScope` | one `box`, with `data-focus-scope` set to the empty string |
-| `RovingFocus` | one `box`, with `data-orientation`, listening for the arrow keys |
-| `DismissableLayer` | one `box`, with `data-layer` |
-| `Presence` | nothing of its own — it mounts and unmounts its children |
-| `Collection`, `Binding`, `Controllable` | nothing; they are plain Rust values |
-
-<Callout type="warn">
-The four boxes are real boxes. Each takes part in [layout](/docs/learn/layout) as a block container
-unless you say otherwise. Where a wrapper must not affect the layout, give it a class whose rule is
-`display: contents`: no box is generated and the children are laid out by the grandparent instead.
-`zgui-ui` does exactly that to its `FocusScope` and `DismissableLayer` wrappers, in one rule
-(`crates/zgui-ui/src/overlay/style.rs`). It does **not** do it to the `Popper` positioner, which
-carries the solved position and therefore has to be a box.
-</Callout>
-
-### What a style sheet selects on
-
-This is the whole appearance contract.
-
-| Attribute | Written by | Values |
-|---|---|---|
-| `data-side` | `Popper`, on its positioner | `top`, `right`, `bottom`, `left` |
-| `data-align` | `Popper`, on its positioner | `start`, `center`, `end` |
-| `data-orientation` | `RovingFocus` | `horizontal`, `vertical`, `both` |
-| `data-layer` | `DismissableLayer` | `content`, `popover`, `modal`, `toast` |
-| `data-focus-scope` | `FocusScope` | the empty string |
-| `data-state` | **you**, from `use_presence()` | `open`, `closed` |
-
-The last row is deliberate. `Presence` publishes its state as a context and writes no attribute,
-because the animation belongs on your surface rather than on a wrapper around it. You bind it. The
-worked example below shows the one line.
-
-`data-side` and `data-align` report where the surface **actually** went, which may not be where it
-was asked to go. An arrow that points at the trigger and an entry animation that slides from the
-right direction both come from those two attributes, with no Rust involved.
-
-## Adding the crate
+## Install
 
 ```toml title="Cargo.toml"
 [dependencies]
-zgui = { path = "../zgui/crates/zgui" }
-zgui-ui-primitives = { path = "../zgui/crates/zgui-ui-primitives" }
+zgui = "0.1"
+zgui-ui-primitives = "0.1"
 ```
 
 ```rust
 use zgui_ui_primitives::prelude::*;
 ```
 
-The prelude exports every behaviour together with the props type each `#[component]` generated,
-because `view!` names the second to build the first. It is the crate root minus one name,
-`Listening`. Every name is also reachable at its own path: `zgui_ui_primitives::popper`, `::focus`,
-`::presence`, `::dismiss`, `::collection`, `::state`.
+The prelude has every primitive and its props type. Everything is also available by module:
+`popper`, `focus`, `presence`, `dismiss`, `collection` and `state`. `Listening` and
+`popper::anchor_point` are not in the prelude.
+
+## All primitives
+
+| Primitive | Does | Kind | Renders |
+|---|---|---|---|
+| [`Popper`](#popper) | places a floating surface next to an anchor | component | one `box`, `position: fixed` |
+| [`FocusScope`](#focusscope) | keeps focus inside a subtree and restores it afterwards | component | one `box`, `data-focus-scope` |
+| [`RovingFocus`](#rovingfocus) | makes a group one tab stop, with arrow-key navigation | component | one `box`, `data-orientation` |
+| [`Presence`](#presence) | keeps content mounted until its exit animation ends | component | nothing of its own |
+| [`DismissableLayer`](#dismissablelayer) | closes a surface on Escape or a press outside | component | one `box`, `data-layer` |
+| [`Collection`](#collection) | lists a control's items in document order | value | — |
+| [`Controllable`](#binding-and-controllable) | holds a value whoever owns it | value | — |
+| [`Binding`](#binding-and-controllable) | says who owns a value prop | value | — |
+
+<Callout type="warn">
+The wrapper boxes are block containers and take part in layout. If a wrapper must not affect
+layout, give it a class with `display: contents`. `zgui-ui` does this for `FocusScope` and
+`DismissableLayer`, but never for the `Popper` positioner: it carries the position, so it must
+generate a box.
+</Callout>
+
+### Attributes for your style sheet
+
+| Name | Written by | Values |
+|---|---|---|
+| `data-side` | `Popper` positioner | `top`, `right`, `bottom`, `left`: the side the surface was actually placed on |
+| `data-align` | `Popper` positioner | `start`, `center`, `end` |
+| `--zui-popper-anchor-width` | `Popper` positioner | the anchor's width, in CSS pixels |
+| `--zui-popper-anchor-x`, `--zui-popper-anchor-y` | `Popper` positioner | the anchor's centre, from the surface's corner, kept inside the surface |
+| `data-orientation` | `RovingFocus` | `horizontal`, `vertical`, `both` |
+| `data-layer` | `DismissableLayer` | `content`, `popover`, `modal`, `toast` |
+| `data-focus-scope` | `FocusScope` | empty string |
+| `data-state` | **you**, from `use_presence()` | `open`, `closed` |
+
+`Presence` writes no attribute: you bind its state on your own surface element (see the
+[example](#build-a-popover-with-your-own-css)).
 
 ## `Popper`
 
-A **floating surface** is one drawn over the rest of the interface rather than in the flow of it: a
-menu, a tooltip, a select's list. It is placed against an **anchor**, which is usually the control
-that opened it. Placement cannot be decided without measuring, because it depends on how much room
-there is between the anchor and the edge of the window.
+Places a floating surface, such as a menu, tooltip or list, next to an anchor, usually the control
+that opened it.
 
 ```rust
 #[component]
 pub fn Popper(
-    /// What the surface is placed against.
     anchor: NodeRef,
     #[prop(into, default = Signal::stored_local(Placement::BOTTOM))]
     placement: Signal<Placement, LocalStorage>,
-    /// Cross to the other side of the anchor when there is not enough room.
-    #[prop(default = true)] flip: bool,
-    /// Slide along the anchor's edge to stay inside the window.
-    #[prop(default = true)] shift: bool,
-    /// How far off the anchor the surface sits, in CSS pixels.
-    #[prop(default = 4.0)] offset: f32,
-    /// How close to the window's edge the surface may come, in CSS pixels.
-    #[prop(default = 8.0)] padding: f32,
-    /// Whether the surface is on screen and therefore worth placing.
+    #[prop(default = true)] flip: bool,       // cross to the other side when there is no room
+    #[prop(default = true)] shift: bool,      // slide along the edge to stay in the window
+    #[prop(default = 4.0)] offset: f32,       // gap to the anchor, CSS pixels
+    #[prop(default = 8.0)] padding: f32,      // closest approach to the window edge, CSS pixels
     #[prop(into, default = Signal::stored_local(true))] active: Signal<bool, LocalStorage>,
     #[prop(optional)] element_ref: Option<NodeRef>,
     #[prop(into, optional)] class: Classes,
@@ -148,80 +83,54 @@ pub fn Popper(
 ) -> impl IntoView
 ```
 
-| Rule | Detail |
-|---|---|
-| It renders its own positioner | A view may only write on nodes it made, so a component handed somebody else's handle could not move it. |
-| It is placed in the frame it opens | The positioner mounts with `visibility: hidden`; the measurements arrive in the same frame; the offset is written and the visibility cleared before anything is painted. |
-| Three live measurements | The anchor's border box, the positioner's content size, and the window root's border box — each observed with the `_while` form and gated on `active`. |
-| A closed surface watches nothing | While `active` reads false, nothing is measured and nothing is solved. Unmounting the surface instead — which `Presence` does — has the same effect. |
-| Two pixel spaces | It solves in device pixels and divides by the surface's density before writing `left` and `top`, because an inline length is read as CSS pixels. |
+- It wraps the children in a positioner element of its own, because a view can only write to nodes
+  it created.
+- The positioner mounts hidden, is measured and placed in the same frame, and is shown before the
+  first paint, so the surface never appears in the wrong place.
+- It observes the anchor, its own size and the window, so it follows scrolling and resizing. While
+  `active` is false it observes nothing. A surface unmounted by `Presence` also stops observing.
+- Use `width: var(--zui-popper-anchor-width)` to match the anchor's width, and
+  `--zui-popper-anchor-x`/`-y` to point an arrow at the anchor's centre.
 
-Put it inside a [`Portal`](/docs/learn/control-flow) so the surface escapes any clipped or
-transformed ancestor the trigger lives in. The positioner is placed in the window's own pixels, so
-it works wherever it is mounted.
+Put it inside a [`Portal`](/docs/building/overlays-and-portals) so the surface is not clipped or
+transformed by the trigger's ancestors.
 
 ### The placement types
 
 ```rust
-pub enum Side { Top, Right, Bottom, Left }            // Default: Bottom
-pub enum Align { Start, Center, End }                 // Default: Center
+pub enum Side { Top, Right, Bottom, Left }            // default Bottom
+pub enum Align { Start, Center, End }                 // default Center
 pub struct Placement { pub side: Side, pub align: Align }
 
-impl Side {
-    pub const ALL: &'static [Self];
-    pub const fn opposite(self) -> Self;
-    pub const fn is_vertical(self) -> bool;
-    pub const fn name(self) -> &'static str;          // the data-side value
-}
-impl Align { pub const ALL: &'static [Self]; pub const fn name(self) -> &'static str; }
 impl Placement {
     pub const BOTTOM: Self;                            // Bottom, Center
     pub const TOP: Self;                               // Top, Center
     pub const fn new(side: Side, align: Align) -> Self;
     pub const fn flipped(self) -> Self;                // opposite side, same alignment
 }
+// Side: ALL, opposite(), is_vertical(), name(). Align: ALL, name().
 ```
 
-### The solver on its own
+### The `solve` function
 
-The arithmetic is a public function, so you can place something without using the component.
+The placement calculation is a public pure function, for placing something without the component:
 
 ```rust
-pub type WindowRect = Rect<DevicePx, Device>;
-
-pub struct PopperOptions {
-    pub placement: Placement,
-    pub flip: bool,
-    pub shift: bool,
-    pub offset: f32,   // device pixels here, not CSS pixels
-    pub padding: f32,
-}
-
-pub struct Solution {
-    pub origin: Point<DevicePx, Device>,
-    pub placement: Placement,   // where it actually went
-    pub overflow: f32,          // how far it still hangs outside; zero when it fits
-}
-
 pub fn solve(
-    anchor: WindowRect,
+    anchor: WindowRect,                 // Rect<DevicePx, Device>
     floating: Size<DevicePx, Device>,
     viewport: WindowRect,
-    options: &PopperOptions,
-) -> Solution;
+    options: &PopperOptions,            // placement, flip, shift, offset, padding (device pixels)
+) -> Solution;                          // origin, placement actually used, overflow
 ```
 
-Three steps, in this order: **place**, then **flip**, then **shift**.
-
-Flip crosses to the opposite side only when the asked side is too short **and the opposite side is
-long enough**. A surface that fits nowhere therefore stays where it was asked, instead of flapping
-between two equally bad choices on every frame.
+It places, then flips, then shifts. It flips only when the opposite side has enough room, so a
+surface that fits on neither side stays on the requested side instead of flipping every frame.
 
 ## `FocusScope`
 
-Focus is which element the keyboard is talking to (see [Elements](/docs/learn/elements)). A **focus
-trap** confines the traversal order to one subtree, so `Tab` cannot leave it. A modal surface
-without one is a surface a keyboard user tabs straight out of, into controls they cannot see.
+Traps focus in a subtree so <kbd>Tab</kbd> cannot leave it. This is what makes a dialog modal for
+keyboard users.
 
 ```rust
 #[component]
@@ -234,28 +143,26 @@ pub fn FocusScope(
 ) -> impl IntoView
 ```
 
-It holds the `FocusTrap` guard that `NodeRef::trap_focus` returns. Dropping the guard releases the
-trap and, when the trap asked for it, puts focus back.
-
-| Option | `MODAL` | `CONFINE_ONLY` | What it does |
+| Option | `MODAL` | `CONFINE_ONLY` | Effect |
 |---|---|---|---|
-| `wrap` | true | true | tabbing past the last control returns to the first |
-| `auto_focus` | true | false | focus moves inside as the trap goes up |
-| `restore` | true | false | focus returns to whatever held it when the trap went up |
+| `wrap` | yes | yes | tabbing past the last control returns to the first |
+| `auto_focus` | yes | no | focus moves inside when the trap starts |
+| `restore` | yes | no | focus returns to where it was when the trap ends |
 
-`MODAL` is the default and is what a dialog wants. `CONFINE_ONLY` is what a menu opened from a
-toolbar wants: it confines the arrow keys without taking the toolbar's focus away.
+- Use `MODAL` for a dialog. Use `CONFINE_ONLY` for a menu opened from a toolbar: it confines
+  <kbd>Tab</kbd> without taking focus away from the toolbar.
+- Traps stack, and the innermost one is active. Closing an inner dialog returns navigation to the
+  outer one.
+- `restore` does not pull focus back if it has already moved somewhere else outside the trap, for
+  example to a control the closing action focused.
+- Setting `trapped` to false releases the trap without unmounting anything.
 
-Traps stack and the innermost wins. Closing an inner dialog hands navigation back to the outer one
-rather than to the document. Turning `trapped` off releases the trap without unmounting anything.
+It wraps the guard returned by `NodeRef::trap_focus`; dropping the guard ends the trap.
 
 ## `RovingFocus`
 
-A **tab stop** is an element that `Tab` reaches. A toolbar of twelve buttons should be one tab stop,
-not twelve. A **roving tabindex** is the pattern that achieves it: exactly one item of the group is
-sequentially focusable at a time, every other item is focusable only when something focuses it
-deliberately, and the arrow keys move which is which. It is the behaviour behind toolbars, tab bars,
-menus, radio groups and listboxes.
+Makes a group of items one tab stop, with the arrow keys moving between them. Toolbars, tab lists,
+menus, radio groups and listboxes all use this pattern.
 
 ```rust
 #[component]
@@ -269,70 +176,41 @@ pub fn RovingFocus(
 ) -> impl IntoView
 ```
 
-The `#[prop(attrs)]` bundle exists because a roving group is always *something* — a radio group, a
-toolbar, a tab list — and what it is belongs on the element that carries the keys. Without it the
-role and the key handling would sit on two elements, and a reader would meet an anonymous container
-wrapping the thing it was looking for.
-
 | Key | Effect |
 |---|---|
-| `ArrowRight` / `ArrowLeft` | one step, in a `Horizontal` or `Both` group |
-| `ArrowDown` / `ArrowUp` | one step, in a `Vertical` or `Both` group |
-| `Home` / `End` | the first or last item the keyboard may land on |
+| <kbd>→</kbd> / <kbd>←</kbd> | one step, in a `Horizontal` or `Both` group |
+| <kbd>↓</kbd> / <kbd>↑</kbd> | one step, in a `Vertical` or `Both` group |
+| <kbd>Home</kbd> / <kbd>End</kbd> | first or last reachable item |
 
-The keys of the *other* axis are left alone rather than treated as the same move. A vertical menu
-that also answered the left and right arrows would swallow the keys a horizontal menubar above it
-needs, and the submenu would become impossible to leave.
+- Keys for the other axis are ignored, so a vertical menu does not consume the keys of a horizontal
+  menubar around it.
+- The key event is consumed only when focus actually moves. At the end of a non-wrapping group the
+  key propagates further.
+- Pass the group's role and label through `attrs`, so the keys and the semantics are on the same
+  element.
 
-The listener calls `prevent_default` and `stop_propagation` **only when something moved**. An arrow
-key at the end of a group that does not wrap belongs to whatever is outside the group.
-
-### The group and the item
+### Group items
 
 ```rust
-pub enum Orientation { Horizontal, Vertical, Both }   // Default: Horizontal
-impl Orientation { pub const fn name(self) -> &'static str; }
+pub fn use_roving_item(node: NodeRef) -> Option<RovingItem>;
+pub fn use_roving_item_when(node: NodeRef, reachable: Signal<bool, LocalStorage>) -> Option<RovingItem>;
 
-pub struct RovingContext;   // Copy
-impl RovingContext {
-    pub fn collection(&self) -> Collection;
-    pub fn active(&self) -> Option<ItemId>;
-    pub fn set_active(&self, id: ItemId);
-    pub fn orientation(&self) -> Orientation;
-    pub fn step(&self, steps: isize) -> bool;         // true when something moved
-    pub fn go_to_end(&self, last: bool) -> bool;
-    pub fn current() -> Option<Self>;
-}
-
-pub struct RovingItem;      // Copy
-impl RovingItem {
-    pub fn tabindex(&self) -> Signal<Focus, LocalStorage>;
+impl RovingItem {   // Copy
+    pub fn tabindex(&self) -> Signal<Focus, LocalStorage>;  // Sequential for the active item
     pub fn is_active(&self) -> bool;
     pub fn activate(&self);
     pub fn id(&self) -> ItemId;
     pub fn group(&self) -> RovingContext;
 }
-
-pub fn use_roving_item(node: NodeRef) -> Option<RovingItem>;
-pub fn use_roving_item_when(
-    node: NodeRef,
-    reachable: Signal<bool, LocalStorage>,
-) -> Option<RovingItem>;
+// RovingContext: collection(), active(), set_active(id), orientation(),
+//                step(n) -> bool, go_to_end(last) -> bool, current()
 ```
 
-An item binds `tabindex` to `RovingItem::tabindex`, which reads `Focus::Sequential` for the active
-item and `Focus::Programmatic` for the rest. It calls `activate` when it is focused or pressed, so
-tabbing away and back returns to the item the user was last on.
-
-`None` outside a group is an ordinary answer, not a mistake: the same component is usually usable on
-its own, where it is an ordinary tab stop. The caller falls back to `Focus::Sequential`.
-
-Until anything has been chosen the tab stop is the **first** item in tree order, so a group is
-reachable from the keyboard from the moment it has anything in it.
-
-`use_roving_item_when(node, reachable)` is *disabled but present*: the item keeps its place and a
-reader still meets it, and the arrow keys pass over it. That is the difference between a control
-that is disabled and one that is not there.
+An item binds `tabindex` and calls `activate` when it receives focus, so tabbing away and back
+returns to the last active item. Until an item is activated, the first item is the tab stop.
+Outside a group the hook returns `None`; fall back to `Focus::Sequential` so the item still works on
+its own. `use_roving_item_when` keeps a disabled item in place (and announced) while the arrow keys
+skip it.
 
 ```rust
 #[component]
@@ -353,168 +231,88 @@ fn ToolbarButton(children: Children) -> impl IntoView {
 
 ## `Presence`
 
-An **exit animation** is the animation content plays on its way out. It creates a problem that has
-nothing to do with animation: content that is unmounted the moment it closes has no chance to play
-one, and content unmounted after a duration written in Rust needs that number to agree with a number
-in CSS. The two drift the first time anyone edits the sheet.
-
-`Presence` guesses nothing. The state goes to `closed`, the cascade starts whatever the sheet says
-happens at `[data-state="closed"]`, and the content is unmounted **when that animation ends** — or
-in the same frame, when there is no animation to wait for.
+Keeps content mounted until its exit animation has finished, so you do not have to repeat a CSS
+duration in Rust.
 
 ```rust
 #[component]
 pub fn Presence(
     #[prop(into)] present: Signal<bool, LocalStorage>,
-    /// The caller's element, whose exit animation decides when the content leaves.
-    surface: NodeRef,
-    children: ChildrenFn,
+    surface: NodeRef,          // your element, whose animation decides when the content leaves
+    children: ChildrenFn,      // built again each time the content comes back
 ) -> impl IntoView
 
-pub enum PresenceState { Open, Closed }
-impl PresenceState {
-    pub const fn name(self) -> &'static str;      // "open" | "closed"
-    pub const fn is_leaving(self) -> bool;
-}
-
-pub struct PresenceContext;   // Copy
-impl PresenceContext {
-    pub fn new(state: Signal<PresenceState, LocalStorage>) -> Self;
-    pub fn state(&self) -> PresenceState;
-    pub fn state_name(&self) -> &'static str;
-    pub fn current() -> Option<Self>;
-}
-
-pub fn use_presence() -> Option<PresenceContext>;
+pub enum PresenceState { Open, Closed }   // name(): "open" | "closed"; is_leaving()
+pub fn use_presence() -> Option<PresenceContext>;  // state(), state_name()
 ```
 
-The `surface` handle is the **caller's** element, not one this component made. A wrapper of its own
-would put a box in the layout that the component author never wrote, and the animation belongs on
-the surface itself.
+When `present` becomes false, the state becomes `closed`, your sheet's `[data-state="closed"]`
+rules start an animation or transition, and the content unmounts when it ends. If nothing is
+animating, the content unmounts in the same frame.
 
-`children` is `ChildrenFn` because the content is built again every time it comes back.
-
-Four facts worth knowing before you rely on it:
-
-1. **It listens on whichever element the handle names now.** Content that goes away and comes back
-   is a *new* element bound to the same handle. Listeners attached on the first open would stay on
-   the departed node and hear nothing from the second open onwards. `Listening::named` re-attaches
-   them on every rebind. `Listening` is public, at `zgui_ui_primitives::presence::Listening`.
-2. **It waits for both ends of both kinds**: `ANIMATION_END`, `ANIMATION_CANCEL`, `TRANSITION_END`
-   and `TRANSITION_CANCEL`. A cancelled animation produces no end, and content waiting for one would
-   stay mounted for ever.
-3. **It asks again rather than counting.** The unmount happens when the state is leaving *and*
-   `surface.running_animations()` is zero, so a second animation started during the first is not cut
-   off.
-4. **An exit that has not finished within one second finishes anyway.** The constant is
-   `EXIT_DEADLINE` in `crates/zgui-ui-primitives/src/presence/deadline.rs`. A modal surface that
-   stays mounted keeps its scrim over the window and its focus trap around a subtree nobody can see,
-   so the window answers nothing for the rest of the session. That is out of all proportion to one
-   dropped animation end.
+- It waits for every running animation and transition on `surface` to end or be cancelled, so a
+  second animation started mid-exit is not cut off.
+- It re-attaches its listeners whenever `surface` binds to a new element, so every opening
+  animates, not just the first (`Listening` does this).
+- An exit that has not finished after one second is completed anyway, so a lost animation event
+  cannot leave a scrim and focus trap over the window.
 
 <Callout type="info">
-The one thing the content has to do is bind the state to an attribute. `use_presence()` reaches the
-context only from **below** the `Presence`, so the surface is its own component. Writing it inline
-in the parent is the mistake that makes the exit animation vanish.
+`use_presence()` only works **below** the `Presence`, so the surface that binds `data-state` must be
+its own component. If you write it inline in the parent, there is no exit animation.
 </Callout>
 
 ## `DismissableLayer`
 
-**Dismissal** is closing an open surface because the user pressed `Escape` or pressed something
-outside it. Every floating surface needs it, and none of them should write it: hearing about a press
-elsewhere in the window means listening on the window's root, deciding whether the press was inside
-means asking the engine, and deciding whether the press was *yours* means knowing what else is open.
+Closes a surface on <kbd>Escape</kbd> or on a press outside it. When several surfaces are open, it
+decides which one a press or key belongs to.
 
 ```rust
 #[component]
 pub fn DismissableLayer(
-    /// Told why the layer should close. It closes nothing itself.
-    on_dismiss: UnsyncCallback<DismissReason>,
+    on_dismiss: UnsyncCallback<DismissReason>,   // OutsidePress or EscapeKey
     #[prop(default = OverlayLayer::default())] layer: OverlayLayer,
     #[prop(into, default = Signal::stored_local(true))]
     dismiss_on_outside_press: Signal<bool, LocalStorage>,
     #[prop(into, default = Signal::stored_local(true))]
     dismiss_on_escape: Signal<bool, LocalStorage>,
-    /// One element outside the layer that a press on nonetheless belongs to it.
-    #[prop(optional)] exclude: Option<NodeRef>,
+    #[prop(optional)] exclude: Option<NodeRef>,  // an outside element that counts as inside
     #[prop(optional)] element_ref: Option<NodeRef>,
     #[prop(into, optional)] class: Classes,
     children: Children,
 ) -> impl IntoView
-
-#[non_exhaustive]
-pub enum DismissReason { OutsidePress, EscapeKey }
-impl DismissReason { pub const fn name(self) -> &'static str; }
 ```
 
-**It closes nothing.** It reports through `on_dismiss` and the caller decides, which is what makes a
-confirmation dialog that refuses to close expressible without a second component.
+- **It does not close anything itself.** It reports through `on_dismiss`, and you decide whether
+  to close. This is how you build a confirmation that refuses to close.
+- Pass the trigger as `exclude`. Otherwise a press on the trigger counts as outside: the layer
+  dismisses, the press becomes a click, and the trigger reopens the surface.
+- Both listeners are capture listeners on the window root, so the layer decides before anything on
+  the event's path runs. When the layer handles an Escape, it calls `stop_immediate_propagation`,
+  so your own Escape listeners on the root do not run either. (With nothing focused, the root is the
+  key's target.)
 
-`exclude` is what a trigger is. A surface anchored to a button sits nowhere near that button in the
-tree, so a press on the button is a press *outside* the surface: the layer dismisses, the press goes
-on to become a click, and the trigger reopens the surface it closed. Naming the trigger in
-`exclude` is what stops that.
-
-Both listeners go on the window root, on the **capture** leg, so the decision is taken before
-anything in the press's own path runs. A layer that dismissed on the bubble leg would be dismissed
-by its own trigger's click.
-
-### The stack
-
-```rust
-pub struct LayerId(u64);
-impl LayerId { pub const fn new(value: u64) -> Self; pub const fn get(self) -> u64; }
-
-pub struct LayerStack;
-impl LayerStack {
-    pub fn new() -> Self;
-    pub fn current() -> Self;
-    pub fn push(&self, band: OverlayLayer, surface: NodeRef) -> LayerId;
-    pub fn pop(&self, id: LayerId);
-    pub fn set_leaving(&self, id: LayerId, leaving: bool);
-    pub fn topmost(&self) -> Option<LayerId>;
-    pub fn is_topmost(&self, id: LayerId) -> bool;
-    pub fn answering_escape(&self) -> Option<LayerId>;
-    pub fn answers_escape(&self, id: LayerId) -> bool;
-    pub fn len(&self) -> usize;
-    pub fn is_empty(&self) -> bool;
-}
-```
-
-Exactly one layer answers, and which one is decided by the [overlay
-band](/docs/learn/control-flow) first and by the order they opened second. The band comes first
-because a toast raised before a dialog is still above it.
-
-The subtle rule is the one that makes nesting work:
-
-| Event | A layer that has been told to close, and is still playing its exit |
-|---|---|
-| a press | still answers it — it is still on the screen, and a press has a place |
-| `Escape` | stops answering it at once — `Escape` has no place, and belongs to whatever is open |
-
-Without that distinction, a dialog opened from a dialog cannot be closed by two presses of `Escape`,
-because the inner one eats the second while it fades. `DismissableLayer` keeps the stack informed by
-reading the enclosing `Presence` and calling `set_leaving`.
+Only one layer responds at a time: the one on the highest
+[overlay band](/docs/building/overlays-and-portals), then the most recently opened. A layer that is
+closing (playing its exit animation) still responds to presses, because it is still on screen, but
+stops responding to <kbd>Escape</kbd> immediately. So two presses of Escape close two nested
+dialogs. `LayerStack` (`push`, `pop`, `set_leaving`, `topmost`,
+`answering_escape`, …) is public if you need the same bookkeeping.
 
 ## `Collection`
 
-A composite control needs the set of its own items, in the order they appear, so that `ArrowDown`
-means *the next one*. Nothing else in a retained tree answers that: a parent does not enumerate its
-children, and the items may be behind a conditional, inside a list, or three components down. So the
-items announce themselves.
+Gives a composite control its items in document order, so <kbd>↓</kbd> moves to the next item even
+when items are inside conditionals, lists, or nested components.
 
 ```rust
-pub struct Collection;   // Copy
-impl Collection {
+impl Collection {  // Copy
     pub fn new() -> Self;
     pub fn provide() -> Self;
     pub fn current() -> Option<Self>;
     pub fn register(&self, node: NodeRef) -> ItemId;
-    pub fn register_reachable_when(
-        &self, node: NodeRef, reachable: Signal<bool, LocalStorage>,
-    ) -> ItemId;
+    pub fn register_reachable_when(&self, node: NodeRef, reachable: Signal<bool, LocalStorage>) -> ItemId;
     pub fn deregister(&self, id: ItemId);
-    pub fn items(&self) -> Vec<CollectionItem>;            // tree order, subscribes
+    pub fn items(&self) -> Vec<CollectionItem>;          // document order, subscribes
     pub fn items_untracked(&self) -> Vec<CollectionItem>;
     pub fn len(&self) -> usize;
     pub fn is_empty(&self) -> bool;
@@ -523,85 +321,54 @@ impl Collection {
     pub fn step(&self, from: Option<ItemId>, steps: isize, wrap: bool) -> Option<CollectionItem>;
     pub fn end(&self, last: bool) -> Option<CollectionItem>;
 }
-
-pub struct ItemId(u64);
-impl ItemId { pub const fn new(value: u64) -> Self; pub const fn get(self) -> u64; }
-
-pub struct CollectionItem;   // Copy
-impl CollectionItem {
-    pub fn new(id: ItemId, node: NodeRef) -> Self;
-    pub fn reachable_when(
-        id: ItemId, node: NodeRef, reachable: Signal<bool, LocalStorage>,
-    ) -> Self;
-    pub fn id(&self) -> ItemId;
-    pub fn node(&self) -> NodeRef;
-    pub fn is_reachable(&self) -> bool;
-    pub fn focus(&self);
-}
+// CollectionItem: id(), node(), is_reachable(), focus()
 ```
 
-| Rule | Why |
-|---|---|
-| The order is **tree order**, not registration order | A keyed list rebuilds only the rows whose keys moved, so registration order would answer `ArrowDown` with whichever row was rebuilt last. The sort asks the engine where each node sits. |
-| Registration is opt-in, per component | A decorative separator is not an item, and nothing here has to guess. |
-| Deregistration is automatic | `register` installs an `on_cleanup_local`, so an item that unmounts leaves the group without anything being told. |
-| An `ItemId` is not an index | An index addresses a different item as soon as anything before it leaves. |
-| `step` passes over unreachable items | One arrow key is always one *usable* move. `step` returns `None` when nothing is reachable, and it terminates: it makes at most one pass over the set. |
-| An item whose node is gone is dropped from the order | A comparison against a node that no longer exists has no answer. |
+- Items are ordered by position in the document, not by registration order: a keyed list rebuilds
+  only the rows that moved, so registration order would be wrong.
+- Items register themselves; a decorative separator does not register.
+- An item deregisters automatically when it unmounts.
+- `step` skips unreachable items and returns `None` when none is reachable.
+- Store an `ItemId`, not an index: an index points at a different item once an earlier one is
+  removed.
 
 ## `Binding` and `Controllable`
 
-A control with a value has to answer *who owns it*, and the answer decides what a click does. A
-checkbox used on its own owns its checked state; the same checkbox inside a form owns nothing and
-reflects what the form says. Writing the two separately is how a library ends up with a `Checkbox`
-and a `ControlledCheckbox` that drift apart.
+One protocol for who owns a value, so the same component works both on its own and bound to your
+state.
 
 ```rust
 pub enum Binding<T: Clone + PartialEq + 'static> {
-    Unbound,                                          // Default
-    TwoWay(RwSignal<T, LocalStorage>),
+    Unbound,                                            // default
+    TwoWay(RwSignal<T, LocalStorage>),                  // From<RwSignal<T, LocalStorage>>
     Controlled { read: Signal<T, LocalStorage>, write: UnsyncCallback<T> },
 }
-
-impl<T: Clone + PartialEq + 'static> Binding<T> {
-    pub fn controlled(
-        read: impl Into<Signal<T, LocalStorage>>,
-        write: impl Fn(T) + 'static,
-    ) -> Self;
+impl<T> Binding<T> {
+    pub fn controlled(read: impl Into<Signal<T, LocalStorage>>, write: impl Fn(T) + 'static) -> Self;
     pub fn is_bound(&self) -> bool;
     pub fn is_controlled(&self) -> bool;
     pub fn get(&self) -> Option<T>;
     pub fn get_untracked(&self) -> Option<T>;
     pub fn write(&self, next: T);
 }
-
-impl<T> From<RwSignal<T, LocalStorage>> for Binding<T> { /* … */ }
 ```
 
-| What the caller writes | Which variant | What a click does |
+| You pass | Variant | A click |
 |---|---|---|
 | nothing | `Unbound` | moves the component's own value |
-| `checked = signal`, an `RwSignal` | `TwoWay` | writes the caller's signal, which moves the control |
-| `checked = Binding::controlled(read, write)` | `Controlled` | calls `write`; the control moves only if `write` moves `read` |
-
-Which variant a caller gets is decided by the **type** of what they pass, not by a second prop that
-could disagree with the first.
+| an `RwSignal` | `TwoWay` | writes your signal |
+| `Binding::controlled(read, write)` | `Controlled` | calls `write`; the control moves only if `write` changes `read` |
 
 <Callout type="error">
-There is no `From<Signal<…>>` for `Binding`, so passing a read-only signal is a compile error at the
-prop rather than a control that never moves. A `compile_fail` doctest asserts it in
-`crates/zgui-ui-primitives/src/state/binding.rs`. A control that genuinely must not move is a
-`disabled` one, and says so.
+There is no `From<Signal<…>>` for `Binding`, so passing a read-only signal is a compile error
+rather than a control that silently never moves. If a control must not move, disable it.
 </Callout>
 
-`Controllable` is the value as the component reads and writes it, whoever owns it:
+`Controllable<T>` is the value as the component sees it, whoever owns it:
 
 ```rust
-pub struct Controllable<T: Clone + PartialEq + 'static>;   // Copy
-impl<T: Clone + PartialEq + 'static> Controllable<T> {
-    pub fn new(
-        binding: Binding<T>, default_value: T, on_change: Option<UnsyncCallback<T>>,
-    ) -> Self;
+impl<T: Clone + PartialEq + 'static> Controllable<T> {  // Copy
+    pub fn new(binding: Binding<T>, default_value: T, on_change: Option<UnsyncCallback<T>>) -> Self;
     pub fn uncontrolled(default_value: T, on_change: Option<UnsyncCallback<T>>) -> Self;
     pub fn binding(&self) -> Binding<T>;
     pub fn get(&self) -> T;
@@ -615,108 +382,55 @@ impl<T: Clone + PartialEq + 'static> Controllable<T> {
 impl Controllable<bool> { pub fn toggle(&self); }
 ```
 
-`default_value` is what the value starts at when the binding is `Unbound`, and is unused otherwise.
-`on_change` is told in all three cases, **after** the binding has been asked; it is an observer, not
-the thing that makes a bound control work.
+- `default_value` is used only when the binding is `Unbound`.
+- `on_change` is called in all three cases, after the binding is written. It only observes the
+  change; a bound control works without it.
+- Calling `set` with the current value does nothing and calls no callbacks, so a caller that echoes
+  changes back cannot cause a loop.
+- **After the owning scope is disposed**, a `Binding` reads as unbound (`get` returns `None`) and
+  `set`, `update` and `toggle` do nothing. An event can reach a component's listener in the same
+  frame that removes the component; this keeps that late write away from disposed state.
 
-`set` returns without doing anything when the value is already `next`. A callback that fires when
-nothing changed is a loop with any caller that echoes it back
-(`writing_the_value_it_already_holds_tells_nobody`, in the same file).
+## How zgui-ui uses the primitives
 
-## A primitive and the component built on it
-
-A styled component in `zgui-ui` is a primitive composition, plus a `variants!` table, plus a
-`style!` sheet, plus one `install_stylesheet` call, plus its accessibility bindings. `RadioGroup` is
-the shortest case: it is `RovingFocus` and nothing else.
+`RadioGroup` in `zgui-ui` is a `RovingFocus` plus a `Controllable`, a context and a sheet:
 
 ```rust
 // crates/zgui-ui/src/radio_group/mod.rs, abridged
-#[component]
-pub fn RadioGroup(
-    #[prop(into, optional)] value: Binding<String>,
-    #[prop(into, optional)] default_value: Option<String>,
-    #[prop(optional)] on_change: Option<UnsyncCallback<String>>,
-    #[prop(into, default = Signal::stored_local(false))] disabled: Signal<bool, LocalStorage>,
-    #[prop(default = Orientation::Vertical)] orientation: Orientation,
-    #[prop(into, optional)] label: Option<String>,
-    #[prop(into, optional)] class: Classes,
-    #[prop(attrs)] attrs: Attrs,
-    children: Children,
-) -> impl IntoView {
-    install_stylesheet(SHEET, RadioGroupStyle::CSS);
-    let group = NodeRef::new();
-    provide_local_context(RadioContext {
-        value: Controllable::new(value, default_value.unwrap_or_default(), on_change),
-        disabled,
-        group,
-    });
-
-    // `own` is built here: Role::RadioGroup, the orientation and the label for a reader,
-    // plus the two class names. Elided.
-
-    view! {
-        RovingFocus(
-            orientation = orientation, element_ref = group,
-            class = class, {..own}, {..attrs}
-        ) {
-            {children.into_view_once()}
-        }
-    }
-}
-```
-
-Read the parts off:
-
-| Line | What it is |
-|---|---|
-| `Controllable::new(value, …)` | the ownership protocol, so the group works bound and unbound |
-| `provide_local_context(RadioContext { … })` | how an item three components down learns which value is chosen |
-| `RovingFocus(orientation = …)` | the whole keyboard behaviour. There is no key handler in this file |
-| `install_stylesheet` + `RadioGroupStyle::CLASS` | the appearance, which is the half the primitive refused |
-| `{..own}, {..attrs}` | the component's own attributes, then the caller's, so the caller wins |
-
-The item side is `use_roving_item` and one `control`:
-
-```rust
-// crates/zgui-ui/src/radio_group/item.rs, abridged
-let node = NodeRef::new();
-let item = use_roving_item(node);
-let group = RadioContext::current();
-
+install_stylesheet(SHEET, RadioGroupStyle::CSS);
+let group = NodeRef::new();
+provide_local_context(RadioContext {
+    value: Controllable::new(value, default_value.unwrap_or_default(), on_change),
+    disabled,
+    group,
+});
 view! {
-    control(
-        node_ref = node,
-        tabindex = move || item.map_or(Focus::Sequential, |item| item.tabindex().get()),
-        on:click = move |_| on_click(),
-        // Arrowing through a radio group chooses as it goes; that is the pattern's own rule.
-        on:focus_in = move |_| choose(),
-        {..own}, {..attrs}, class = class
-    ) {
-        Icon(icon = DISC)
+    RovingFocus(orientation = orientation, element_ref = group, class = class, {..own}, {..attrs}) {
+        {children.into_view_once()}
     }
 }
 ```
 
-`RadioGroup` writes no `data-orientation` of its own, because `RovingFocus` already writes it from
-the same value. Two writers of one attribute is one of them being wrong at some point.
+Each item calls `use_roving_item` on its own `control` and selects its value on focus, because
+moving through a radio group with the arrow keys selects as it goes. The radio group itself has no
+key handler.
 
-## A worked example: a popover with your own CSS
+## Build a popover with your own CSS
 
-This uses the primitives and no other part of the library. It is a complete component.
+This example uses only the primitives, nothing else from the library. The nesting order matters:
 
-The composition order is fixed and each position has a reason: **`Portal` outermost**, so the
-surface escapes clipping and stacking; **`Presence`** next, so the exit runs before the unmount;
-**`DismissableLayer`** next, so it is registered for exactly as long as it is on screen; **`Popper`
-innermost**, because it must measure something that already exists.
+1. `Portal` outermost, so the surface is not clipped.
+2. `Presence`, so the exit animation finishes before unmounting.
+3. `DismissableLayer`, registered while the surface is on screen.
+4. `Popper` innermost, because it measures what is already there.
 
 ```rust
 use zgui::prelude::*;
-use zgui::reactive::{RwSignal, UnsyncCallback};
 use zgui::{component, css, view};
 use zgui_ui_primitives::prelude::*;
 
 #[component]
-fn Popover() -> impl IntoView {
+fn Details() -> impl IntoView {
     let open = RwSignal::new_local(false);
     let trigger = NodeRef::new();
     let surface = NodeRef::new();
@@ -738,13 +452,8 @@ fn Popover() -> impl IntoView {
                         exclude = trigger,
                         on_dismiss = UnsyncCallback::new(move |_: DismissReason| open.set(false))
                     ) {
-                        Popper(
-                            anchor = trigger,
-                            placement = Placement::BOTTOM,
-                            offset = 6.0,
-                            class = "pop-at"
-                        ) {
-                            PopoverPanel(element_ref = surface)
+                        Popper(anchor = trigger, offset = 6.0, class = "pop-at") {
+                            Panel(element_ref = surface)
                         }
                     }
                 }
@@ -755,7 +464,7 @@ fn Popover() -> impl IntoView {
 
 /// Its own component, because `use_presence` reads a context published above it.
 #[component]
-fn PopoverPanel(element_ref: NodeRef) -> impl IntoView {
+fn Panel(element_ref: NodeRef) -> impl IntoView {
     let presence = use_presence();
     view! {
         box(
@@ -767,152 +476,61 @@ fn PopoverPanel(element_ref: NodeRef) -> impl IntoView {
         }
     }
 }
-```
 
-The sheet is ordinary CSS. Nothing in it comes from the library.
-
-```rust
 const SHEET: &str = css!(
-    ".pop-trigger {
-        padding: 6px 12px;
-        border: 1px solid #cdced6;
-        border-radius: 6px;
-        background-color: #ffffff;
-    }
-    .pop-panel {
+    ".pop-trigger { padding: 6px 12px; border: 1px solid #cdced6; border-radius: 6px; }
+     .pop-panel {
         padding: 12px 14px;
         border: 1px solid #d9d9e0;
         border-radius: 8px;
         background-color: #ffffff;
         box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
-        opacity: 1;
-        transform: translateY(0px);
         transition: opacity 140ms ease-out, transform 140ms ease-out;
-    }
-    .pop-panel[data-state=\"closed\"] {
-        opacity: 0;
-        transform: translateY(-4px);
-    }
-    .pop-at[data-side=\"top\"] > .pop-panel[data-state=\"closed\"] {
-        transform: translateY(4px);
-    }"
+     }
+     .pop-panel[data-state=\"closed\"] { opacity: 0; transform: translateY(-4px); }
+     .pop-at[data-side=\"top\"] > .pop-panel[data-state=\"closed\"] { transform: translateY(4px); }"
 );
 
 fn main() -> Result<(), zgui::Error> {
-    app().with_stylesheet(SHEET).run(|| view! { Popover() })
+    app().with_stylesheet(SHEET).run(|| view! { Details() })
 }
 ```
 
-Four lines carry all the coupling between the Rust and the CSS:
+The panel opens below the trigger, flips above it near the bottom of the window, stays on screen,
+closes on <kbd>Escape</kbd> or a press outside, is not closed by a press on its own trigger, and
+fades out before it unmounts. Rust and CSS are connected in four places:
 
-| Line | What it does |
+| In the code | Why |
 |---|---|
-| `attr:data-state = …` | publishes the presence state, so `[data-state="closed"]` matches |
-| `transition: opacity …, transform …` | is what `Presence` waits for. Remove it and the panel goes in the same frame |
-| `.pop-at[data-side="top"] > …` | reads where `Popper` actually put the surface, and slides from the other direction |
-| `class = "pop-at"` on the `Popper` | is what gives the selector above something to match. The positioner has no class of its own |
+| `attr:data-state = …` | lets `[data-state="closed"]` match |
+| the `transition` | is what `Presence` waits for; without it the panel unmounts immediately |
+| `class = "pop-at"` on `Popper` | gives the positioner a class to select on |
+| `.pop-at[data-side="top"]` | slides from the side the panel actually opened on |
 
-Do not give the positioner `display: contents`. It carries the inline `position: fixed` and the
-solved offset, and an element that generates no box cannot be positioned.
-
-What you get for those two components: the panel opens under the trigger, moves above it near the
-bottom edge of the window, slides along the edge to stay on screen, closes on `Escape`, closes on a
-press anywhere outside it, does **not** close on a press on its own trigger, and fades out before it
-leaves.
-
-Add `FocusScope` around the panel and it becomes modal. Add `RovingFocus` inside it and the arrow
-keys walk its contents.
-
-## The hard parts, and why they are worth not writing twice
-
-Each row is a fault the primitive exists to prevent. Each is a fault that reappears per component
-when every component writes its own.
-
-| Hard part | What goes wrong without it | Where |
-|---|---|---|
-| Placement in the frame it opens | The surface appears in the wrong corner for one frame. A later correction does not take that frame back. | `Popper`: mounts hidden, measures, writes the offset before paint |
-| Flip that does not oscillate | A surface too large for the window flips every frame. | `Popper`: flip only when the opposite side actually fits |
-| Two pixel spaces | On a display of two device pixels per CSS pixel, the surface lands at twice its intended offset. | `Popper`: solve in device pixels, divide by density before writing `left` and `top` |
-| The window's box is live | The first menu is placed correctly and every later one is placed against a window that has changed size. | `Popper`: the window root is observed, not read once |
-| Focus containment | A keyboard user tabs out of a dialog into controls they cannot see. | `FocusScope`, over `NodeRef::trap_focus` |
-| Focus restoration | Closing a dialog drops focus onto the document, and the next `Tab` starts from the top. | `FocusTrapOptions::restore` |
-| One tab stop per group | A toolbar of twelve buttons is twelve things to tab past. | `RovingFocus` |
-| Disabled but present | An arrow key strands the keyboard on an item that refuses to be chosen. | `use_roving_item_when`, `Collection::step` |
-| Item order under a keyed list | `ArrowDown` goes to whichever row was rebuilt last. | `Collection`: tree order, asked of the engine |
-| Exit animations that finish | The fade is deleted with the content, or a duration in Rust drifts from a duration in CSS. | `Presence`: unmount on the animation end |
-| Listeners after a remount | The first open animates correctly and every later one is deaf. | `Listening`: re-attach on every rebind |
-| An exit that never ends | A scrim and a focus trap sit over a dead window for the rest of the session. | `Presence`: the one-second deadline |
-| Which surface a press belongs to | A press past a popover inside a dialog closes the dialog too. | `LayerStack`: topmost only, band before order |
-| Two presses of `Escape` | The surface that is fading eats the second press. | `LayerStack`: a leaving layer stops answering `Escape` and keeps answering presses |
-| The trigger paradox | The surface never closes from its own trigger, which is the first place everybody presses. | `DismissableLayer`: `exclude` |
-| Dismiss on capture, not bubble | The menu closes in the same frame it opens. | `DismissableLayer`: `ListenerOptions::CAPTURE` |
-| Controlled and uncontrolled | The library grows a `Checkbox` and a `ControlledCheckbox` that drift apart. | `Controllable` |
-| Change callbacks that loop | `on_change` fires for a value that did not change, and a caller that echoes it back never settles. | `Controllable::set` returns early on an equal value |
-
-## What you would write to replace one
-
-Nothing here is unreachable. `Presence` is the smallest one worth replacing by hand, and the
-honest first attempt is short:
-
-```rust
-// A first attempt. It is wrong in four ways.
-#[component]
-fn Presence(present: Signal<bool, LocalStorage>, children: ChildrenFn) -> impl IntoView {
-    let mounted = RwSignal::new_local(present.get_untracked());
-    let watching = RenderEffect::new(move |_| {
-        if present.get() {
-            mounted.set(true);
-        } else {
-            set_timeout(Duration::from_millis(180), move || mounted.set(false));
-        }
-    });
-    on_cleanup_local(move || drop(watching));
-
-    view! {
-        if move || mounted.get() { {children.view()} } else {}
-    }
-}
-```
-
-| What it gets wrong | What the real one does |
-|---|---|
-| `180` is a number in Rust that has to agree with a number in CSS. | Waits for the animation and transition ends on the surface, so the sheet is the only authority on the duration. |
-| A re-open during the exit meets a timer armed for the exit before it, which then unmounts content that has come back. | Takes both pending timers on every open. |
-| `set_timeout` returns a handle, and dropping a handle cancels the timer. Ignoring the return value here schedules nothing. | Holds both handles for the life of the exit. |
-| The content is unmounted while a second animation is still running. | Re-asks `surface.running_animations()` at every end and unmounts only at zero. |
-
-Add the two cancel events, the deadline, and the re-attachment of listeners after a remount, and
-you have written
-`crates/zgui-ui-primitives/src/presence/mod.rs`. It is about 260 lines with its comments. That is
-the trade: write it once yourself, or take the one that already has a test for each of the four
-rows above (`crates/zgui-ui-primitives/tests/presence.rs`).
-
-The same arithmetic applies to the others. `Popper` without `solve` is the four-rectangle placement
-problem; with it, `solve` is a public pure function you can call from your own component and skip
-only the measuring. `DismissableLayer` without `LayerStack` is fine for exactly one open surface and
-wrong for two.
+To make it modal, wrap the panel's content in `FocusScope`. To add arrow-key navigation, use
+`RovingFocus`.
 
 ## Next
 
 <Cards>
   <Card
-    title="The components"
+    title="Components"
     href="/docs/component-library/components"
-    description="The styled inventory, and three components taken apart into the primitives above."
+    description="The styled components built from these primitives."
   />
   <Card
     title="Tokens and theming"
     href="/docs/component-library/tokens-and-theming"
-    description="The other half: the design tokens the styled layer draws itself with."
+    description="The design tokens the styled layer reads."
   />
   <Card
     title="Overlays and portals"
     href="/docs/building/overlays-and-portals"
-    description="The framework side of bands, positioning, dismissal and focus containment."
+    description="Overlay bands, positioning, dismissal and focus containment in the framework."
   />
   <Card
     title="Keyboard and focus"
     href="/docs/building/keyboard-and-focus"
-    description="Traversal order, focus traps and the key vocabulary the primitives are written against."
+    description="Traversal order, focus traps and the key vocabulary the primitives use."
   />
 </Cards>

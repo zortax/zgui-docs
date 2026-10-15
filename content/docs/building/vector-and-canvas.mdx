@@ -1,14 +1,15 @@
 ---
 title: Vector and canvas
-description: Draw declarative vector documents or mutate an imperative retained shape scene.
+description: Draw icons and SVG documents with vector, draw shapes from Rust with canvas, pan and zoom with a view transform, plot data series, and keep drawings fast.
 ---
 
-`vector` and `canvas` both produce paths for the vector renderer. Use `vector` for a drawing that
-the view declares. Use `canvas` for a drawing that Rust code generates or mutates.
+`vector` and `canvas` draw paths with the vector renderer. Use `vector` for drawings the view
+declares, such as icons and SVG documents. Use `canvas` for drawings Rust code builds or changes,
+such as charts, plots and editors.
 
-## Declarative drawing with `vector`
+## Draw a vector
 
-A vector element accepts path notation or a complete SVG document:
+A `vector` element takes path notation or a complete SVG document:
 
 ```rust
 use zgui::prelude::*;
@@ -25,49 +26,59 @@ view! {
 .icon:hover { color: #ffb648; }
 ```
 
-The content properties are:
-
 | Property | Value |
 |---|---|
-| `d` | One path per line |
+| `d` | Path notation, one path per line |
 | `viewBox` | Minimum x, minimum y, width, and height |
-| `svg` | A complete SVG source string |
+| `svg` | A complete SVG source string. It wins over `d`. |
 
-When a view box exists, zgui scales the drawing uniformly to fit the content box and centers the
-unused axis. Without a view box, coordinates are CSS pixels from the content box's top-left
-corner. The drawing does not give the element an intrinsic size. Set its width and height in CSS.
+A drawing has no intrinsic size, so set the element's width and height in CSS. With a view box,
+zgui scales the drawing uniformly to fit the content box and centers it on the other axis. Without
+one, coordinates are CSS pixels from the content box's top-left corner.
 
-`currentColor` resolves to the vector element's computed `color`. Three inherited custom
-properties can override paint:
+### Colour a vector
+
+A path without its own paint is filled with the element's computed `color`, and `currentColor` in
+an SVG document resolves to the same value. Colours written in the document stay as written. Three
+inherited custom properties override the defaults:
 
 | Property | Default |
 |---|---|
 | `--zgui-fill` | The computed `color` |
 | `--zgui-stroke` | No stroke |
-| `--zgui-stroke-width` | `1` CSS pixel |
+| `--zgui-stroke-width` | `1px` |
 
-Use these custom properties. CSS declarations such as `fill: red` do not reach the vector
-pipeline.
+CSS `fill` and `stroke` declarations have no effect. Use the custom properties.
 
-The SVG reader supports paths, shapes, fills, strokes, fill and clip rules, transforms, opacity,
-clip paths, gradients, `use`, symbols, and markers. It does not render SVG text, embedded images,
-filters, masks, patterns, or blend modes. A document that cannot be parsed draws nothing. If both
-`svg` and `d` exist, `svg` wins.
+### SVG support
 
-For typed geometry, use `zgui::elements::vector()` with `paths`, `document`, `view_box`, `fill`,
-`stroke`, `stroke_width`, or `hit_shape`. `paths`, `document`, `view_box`, and `hit_shape` take
-plain values. Use a reactive `prop:d` or `prop:svg` closure when the source must change.
+The SVG reader supports paths, basic shapes, fills, strokes, fill and clip rules, transforms,
+opacity, clip paths, gradients, `use`, symbols, and markers. It ignores text, embedded images,
+filters, masks, patterns, and blend modes. A document that does not parse draws nothing.
 
-## Imperative drawing with `canvas`
+Elements in one window with the same source string share one parsed drawing, so a page of
+identical icons parses the SVG once.
 
-A canvas holds a retained `Vec<Shape>`. Shapes use the same path, fill, stroke, gradient, and clip
-types as vector documents. They paint in list order.
+### Build a vector from Rust
 
-The closure form is the shortest option for a chart or generated drawing:
+`zgui::elements::vector()` has typed methods: `paths`, `document`, `view_box`, `hit_shape`, `fill`,
+`stroke`, and `stroke_width`. `paths`, `document`, `view_box`, and `hit_shape` take plain values;
+use a reactive `prop:d` or `prop:svg` closure when the source must change. Without `hit_shape`,
+the whole box is the hit area.
+
+## Draw on a canvas
+
+A canvas holds a retained scene of shapes and [series](#plot-data-with-series). A shape is a path
+with its own fill, stroke, and clips, built with `ShapeBuilder`. Items paint in the order you push
+them.
+
+### Draw from a closure
+
+The closure form suits drawings that follow signals:
 
 ```rust
-use zgui::canvas::{Brush, ShapeBuilder};
 use zgui::canvas::zgui_color::Color;
+use zgui::canvas::{Brush, ShapeBuilder};
 use zgui::elements::{canvas, kurbo};
 use zgui::elements::kurbo::Shape as _;
 use zgui::prelude::*;
@@ -86,56 +97,275 @@ let view = canvas().class("meter").draw(move |cx| {
 });
 ```
 
-The closure reruns when a signal that it reads changes and when the content-box size changes. Each
-run starts with an empty scene. `DrawCx::size` is in CSS pixels. `DrawCx::scale` gives device pixels
-per CSS pixel. The first run has a zero size because layout has not run. A size-dependent drawing
-settles after the first layout frame.
+The closure reruns when a signal it reads changes and when the content box changes size. Each run
+starts with an empty scene. `cx.size` is the content-box size in CSS pixels; `cx.scale` is the
+window's current device pixels per CSS pixel. The first run happens before layout with a zero
+size, so a size-dependent drawing settles one frame after it appears.
 
-The retained form is useful when event handlers update the scene:
+### Edit a retained scene
+
+Use a `CanvasHandle` when event handlers edit the scene, as in a drawing tool or a simulation:
 
 ```rust
 let drawing = CanvasHandle::new();
-let view = zgui::elements::canvas().scene(&drawing);
+let view = zgui::elements::canvas().class("pad").scene(&drawing);
 
 drawing.draw(|scene| {
-    scene.clear();
     scene.push(shape);
 });
 ```
 
-`CanvasScene` provides `clear`, `push`, `replace`, and `shapes`. Always mutate through
-`CanvasHandle::draw` on the UI thread. It increments the scene revision and wakes each bound
-element.
+`CanvasScene` has `push`, `replace`, `clear`, `shapes`, `push_series`, `push_series_lod`, and
+`set_transform`. Edit it through `CanvasHandle::draw` on the UI thread; that marks every bound
+element for repaint.
 
-For a background producer, clone the thread-safe `SceneHandle` from `CanvasHandle::scene()` and
-edit it off the UI thread. That edit increments the revision but does not wake the UI loop. Pair it
-with a signal update or a UI-side `CanvasHandle::draw` call.
+To produce shapes on another thread, clone the `SceneHandle` from `CanvasHandle::scene()` and call
+`SceneHandle::edit`. That edit does not wake the UI loop. Follow it with a UI-side signal update or
+a `CanvasHandle::draw` call, or the change appears only on the next unrelated repaint.
 
-A canvas without a view box uses CSS-pixel coordinates. `.view_box(x, y, width, height)` uses the
-same uniform fit as `vector`. The user-agent sheet gives an unstyled canvas a 300 by 150 CSS-pixel
-box; application CSS can override it.
+### Fill, stroke and clip shapes
 
-Reuse an `Arc<BezPath>` with `ShapeBuilder::shared` when geometry stays the same. Stable allocation
-identity lets the rasterizer reuse its encoded geometry.
+`Brush` has four forms: `Solid(color)`, `Inherited { alpha }` (the element's `color`, like
+`currentColor`), `Linear { .. }`, and `Radial { .. }`. Gradient coordinates are in canvas units.
 
-## Rendering and caching
+| `ShapeBuilder` method | Effect |
+|---|---|
+| `new(path)` / `shared(arc)` | Start from a path, or from an `Arc<BezPath>` you keep |
+| `fill(brush)` / `fill_even_odd(brush)` | Fill with the non-zero or even-odd rule |
+| `stroke(brush, width)` | Stroke with round caps and joins |
+| `stroke_styled(brush, kurbo::Stroke)` | Stroke with your own caps, joins, and dashes |
+| `clipped(path)` | Clip the shape to a path; repeat to intersect clips |
 
-Small solid shapes use a fast path when all these conditions are true:
+### Coordinates and clipping
 
-- The shape has no local clip.
-- The shape has one solid fill or one solid stroke.
-- The mask uses at most 64 KiB of texels, is no wider than 1024 texels, and is no taller than 256.
-- A non-uniform transform is not applied to a stroke.
+Canvas coordinates are CSS pixels from the content box's top-left corner. `.view_box(x, y, width,
+height)` makes them view-box units with the same uniform fit as `vector`. Stroke widths are canvas
+units, so they scale with a view box.
 
-zgui rasterizes the shape to a monochrome coverage mask and stores it in the shared atlas. The
-cache key includes the geometry, fill or stroke style, raster density, and mask size. It excludes
-colour, translation, mirrors, and quarter turns. You can recolour, move, mirror, or quarter-turn an
-icon without rasterizing its outline again. Scaling reuses the tile while the required density is
-unchanged. The same rule applies to eligible `canvas` shapes.
+An unstyled canvas is 300 by 150 CSS pixels. A canvas does not clip its own drawing: put it inside
+a box with `overflow: hidden` to keep a plot inside its frame.
 
-Gradients, local clips, larger masks, arbitrary rotations or shears, non-uniformly scaled strokes,
-and shapes with both fill and stroke use the general vector rasterizer. An unchanged general-vector
-item replays from its paint record. Movement re-encodes it because its curves are already in device
-coordinates. The renderer
-packs disjoint pass regions into compact scratch space. GPU scratch size therefore follows the
-drawn regions, not the empty distance between them.
+## Pan and zoom
+
+`set_transform(affine)` sets one view matrix that moves every shape and series. It applies before
+the view-box fit and is available on `CanvasHandle`, `SceneHandle`, and the scene in a draw closure.
+Draw the scene once, then move the view from event handlers:
+
+```rust
+use zgui::elements::kurbo::Affine;
+use zgui::prelude::*;
+
+let plot = CanvasHandle::new();
+// ... plot.draw(|scene| { /* push shapes and series once */ });
+
+let grab = RwSignal::new(None::<(f32, f64)>);
+let offset = RwSignal::new(0.0_f64);
+
+let press = move |cx: &mut EventCx<'_, events::PointerDown>| {
+    grab.set(Some((cx.position.x.0, offset.get_untracked())));
+    cx.capture_pointer();
+};
+let drag = {
+    let plot = plot.clone();
+    move |cx: &mut EventCx<'_, events::PointerMove>| {
+        if let Some((start_x, start_offset)) = grab.get_untracked() {
+            let dx = start_offset + f64::from(cx.position.x.0 - start_x);
+            offset.set(dx);
+            plot.set_transform(Affine::translate((dx, 0.0)));
+        }
+    }
+};
+let release = move |cx: &mut EventCx<'_, events::PointerUp>| {
+    grab.set(None);
+    cx.release_pointer();
+};
+
+let view = zgui::elements::canvas()
+    .class("plot")
+    .scene(&plot)
+    .on(events::POINTER_DOWN, press)
+    .on(events::POINTER_MOVE, drag)
+    .on(events::POINTER_UP, release);
+```
+
+A view change does not count as a scene edit, so zgui reuses most of what it built for the shapes
+and series. [What a change costs](#what-a-change-costs) lists what is reused.
+
+The transform survives `clear`, so a draw closure keeps it between runs. Setting it from inside a
+draw closure, though, reruns the closure and rebuilds the scene. For interactive pan and zoom, keep
+the scene in a `CanvasHandle` and call `set_transform` from the event handler.
+
+## Plot data with series
+
+A `Series` holds plot data in data space as an `Arc<[[f32; 2]]>`, plus a `to_canvas` matrix that
+maps data to canvas units. Marker sizes and line widths are CSS pixels: `to_canvas`, the view
+transform, and the view box do not scale them. A CSS transform on the element does.
+
+```rust
+use std::sync::Arc;
+
+use zgui::canvas::zgui_color::Color;
+use zgui::canvas::{Brush, Lod, Marker, Series};
+use zgui::elements::kurbo::{self, Affine};
+
+let samples: Arc<[[f32; 2]]> = (0..100_000)
+    .map(|i| {
+        let x = i as f32 / 100.0;
+        [x, x.sin()]
+    })
+    .collect();
+let peaks: Arc<[[f32; 2]]> = Arc::from([[15.7, 1.0], [78.5, 1.0], [141.4, 1.0]]);
+// x: one CSS pixel per data unit. y: -1..1 maps to 180..20.
+let to_canvas = Affine::new([1.0, 0.0, 0.0, -80.0, 0.0, 100.0]);
+
+// `plot` is the `CanvasHandle` from the pan example.
+plot.draw(|scene| {
+    scene.push_series_lod(
+        Series::Line {
+            data: samples.clone(),
+            to_canvas,
+            stroke: kurbo::Stroke::new(1.5),
+            brush: Brush::Inherited { alpha: 1.0 },
+        },
+        Lod::Columns,
+    );
+    scene.push_series(Series::Points {
+        data: peaks.clone(),
+        to_canvas,
+        marker: Marker::Circle { radius: 3.0 },
+        fill: Some(Brush::Solid(Color::srgb(1.0, 0.7, 0.3, 1.0))),
+        stroke: None,
+    });
+});
+```
+
+| Series | Draws |
+|---|---|
+| `Series::Line { data, to_canvas, stroke, brush }` | One polyline with round joins. The stroke's caps apply; dashes are ignored. |
+| `Series::Points { data, to_canvas, marker, fill, stroke }` | One marker per point. `stroke` is `Option<(Brush, f64)>`. |
+
+| Marker | Shape |
+|---|---|
+| `Marker::Circle { radius }` | A circle |
+| `Marker::Square { half }` | An axis-aligned square, `half` being half the side |
+| `Marker::Path(Arc<BezPath>)` | Any outline in CSS pixels, with its origin on the point |
+
+A NaN point ends a line run; a points series skips it. `push_series` paints the series above the
+shapes pushed so far. `replace` and `clear` remove all series. Series do not take part in hit
+testing.
+
+zgui builds a series' geometry once per data allocation. Keep the data in one `Arc` and move it
+with the view transform instead of rebuilding the array. Data far from the origin keeps its
+precision.
+
+### Reduce dense lines
+
+`push_series_lod(series, Lod::Columns)` reduces a `Series::Line` whose x values increase, when it
+has more than about eight points per device pixel column. zgui keeps the first, lowest, highest,
+and last point of each half-pixel column. Panning builds nothing new; zooming rebuilds the
+reduction only after the scale doubles or halves. Set `--zgui-vector-lod: columns` on the element
+to apply this to all of its line series.
+
+Antialiasing makes the reduced line slightly lighter where the data is denser than a pixel, so the
+reduction is opt-in. Points series and shapes are always drawn exactly.
+
+## Keep drawings fast
+
+Most drawings need no tuning. When a drawing is large, holds thousands of items, or changes every
+frame, how you build it decides how much work each frame does.
+
+### Rules
+
+- Build circles and rectangles with `kurbo::Circle`, `kurbo::Rect`, and `kurbo::RoundedRect` so
+  zgui recognises them and draws them as quads or marks.
+- Put many similar shapes in one path (one shape with many subpaths) instead of many shapes. One
+  part becomes one mark or path-glyph item.
+- Keep unchanged geometry in an `Arc<BezPath>` and pass it with `ShapeBuilder::shared`. zgui caches
+  its work per allocation, so a draw closure that rebuilds its paths on every run misses every
+  cache.
+- Plot data as series, keep the data `Arc` stable, and pan or zoom with `set_transform`.
+- Use `Lod::Columns` for long time-series lines.
+- Prefer an axis-aligned element transform. Rotation and skew move shapes off the quad, mask,
+  path-glyph, and CPU-layer routes.
+- Recolour through `color` or `--zgui-fill`. A colour change re-rasterises nothing on the cheap
+  routes.
+
+### Drawing routes
+
+zgui picks a drawing route per shape. You do not choose it, but the shapes you build decide which
+routes are available. The cheaper routes come first:
+
+| Route | Takes | Cost |
+|---|---|---|
+| Quads | Shapes made only of rectangles, rounded rectangles, circles, axis-aligned ellipses, and axis-aligned strokes, a few hundred at most and at least two device pixels apart | Same as a CSS background |
+| Marks | The same primitives in larger numbers, overlapping, or stroked lines in any direction | One instanced item per fill or stroke |
+| Path glyphs | Many copies (at least 8) of a few small outlines, such as a scatter of triangles, with a solid colour and no clip or dash | Each outline rasterised once per scale, like a glyph |
+| Masks | A small solid shape (at most 64 KiB of coverage, 1024×256 texels) that does not change every frame | Rasterised once into the glyph atlas; recolouring and moving reuse it |
+| CPU layer | A whole drawing that needs a gradient or clip the routes above cannot draw, and has no series | Rasterised once into an image tile, then drawn like an image |
+| General | Everything else | The GPU vector rasteriser; its encoding is kept while the path `Arc` lives |
+
+Quads, masks, path glyphs, and CPU layers need an element transform that keeps the axes: a scale,
+a mirror, or a quarter turn (CPU layers: a positive scale only). Marks and series work under any 2D
+transform. Shapes with a gradient still use quads or marks when their geometry qualifies. Series
+always use marks, or path glyphs for `Marker::Path`.
+
+A `Marker::Path` is drawn from outline tiles rasterised once per scale, so pans and zooms rasterise
+nothing new. A marker wider than 64 device pixels, a filled marker that crosses itself, or one
+under a rotating or skewing element transform falls back to the general route.
+
+### What a change costs
+
+| Change | Cost |
+|---|---|
+| Element moves or scrolls by whole device pixels | Nothing is rasterised or encoded again |
+| `color` or `--zgui-fill` changes | Quads, marks, masks, and path glyphs only change colour. General-route shapes encode again, and a CPU layer that uses the inherited colour is rasterised again. |
+| View transform pans or zooms | See the table below |
+| A scene edit (`draw`) | Each shape is routed again; unchanged path `Arc`s keep their cached geometry |
+| A shape changes in most frames | It leaves the mask route; a CPU layer that changes often is drawn shape by shape for a while |
+
+A view change from `set_transform` reuses work depending on each item's route:
+
+| Item | Pan or uniform zoom | Rotation or non-uniform stretch |
+|---|---|---|
+| Series | Reused | Reused |
+| Shapes drawn as quads or marks | Reused | Rebuilt |
+| Shapes drawn as path glyphs | Reused on pan; rasterised again on zoom | Rebuilt |
+| Shapes on the general route | Encoding reused | Encoding reused |
+| Drawings on a CPU layer | Reused for whole-pixel pans; otherwise rasterised again (after a zoom settles) | Rasterised again; a rotation draws shape by shape |
+| Shapes on the mask route | Rasterised again | Leave the route |
+
+### Large series and drawings
+
+- Very large series are built on a worker thread. Until that finishes, zgui draws the closest
+  geometry it already has and redraws when the build is ready. On very long series, zgui draws only
+  the chunks near the visible area.
+- A CPU layer is exact for one scale. During a zoom, zgui stretches the nearest tile and rasterises
+  again about three frames after the zoom stops.
+- Drawings larger than 2048 pixels on a side are cut into 512-pixel tiles, and an edit rasterises
+  only the tiles it touches.
+- New CPU layers are budgeted per frame, so a newly shown drawing can appear a frame or two later
+  than the rest of the page.
+
+[Writing fast interfaces](/docs/performance/writing-fast-interfaces#drawing)
+has the exact thresholds and the counters that show which route a shape took. The
+[renderer architecture](/docs/architecture/renderer) explains how each route is rasterised.
+
+## Next
+
+<Cards>
+  <Card
+    title="Custom elements"
+    href="/docs/advanced/custom-elements"
+    description="A retained widget that measures its children and paints its own quads, paths and glyph runs."
+  />
+  <Card
+    title="Surfaces"
+    href="/docs/advanced/surfaces"
+    description="Show a wgpu texture from another renderer, such as a game or a video decoder."
+  />
+  <Card
+    title="Accessibility"
+    href="/docs/building/accessibility"
+    description="Roles, names, keyboard access and testing what screen readers see."
+  />
+</Cards>

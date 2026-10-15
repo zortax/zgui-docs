@@ -1,45 +1,36 @@
 ---
 title: Installation
-description: The pinned toolchain, the system libraries a window needs, and how to add zgui to a project.
+description: Add zgui to a Cargo project, install the system libraries a window needs, and open your first window.
 ---
 
-zgui builds on a pinned nightly toolchain and draws through the GPU. This page covers both
-requirements and gets a window on the screen.
+zgui is published on crates.io and builds on stable Rust 1.90 or later. Getting a window on screen
+takes three steps: add the crate, install the system libraries (Linux only), and run a small
+program.
 
-## The toolchain
-
-<Callout type="warn">
-There is no stable-Rust build. The repository pins a nightly in `rust-toolchain.toml`, and rustup
-installs it for you the first time you build.
-</Callout>
-
-```toml title="rust-toolchain.toml"
-[toolchain]
-channel = "nightly-2026-04-16"
-components = ["rustfmt", "clippy", "rust-src", "miri"]
-profile = "minimal"
-```
-
-Nightly is required for edition 2024 together with the trait-solver behaviour the style engine
-depends on. The pin moves deliberately, in its own commit.
-
-If you build zgui from a checkout, rustup honours that file and nothing else is needed. If you use
-zgui from another project, copy the same `rust-toolchain.toml` into your project root so that both
-build with the same compiler.
-
-Check what you have:
+## Create a project
 
 ```bash
-rustc --version --verbose
+cargo new my-app
+cd my-app
+cargo add zgui
 ```
 
-## System libraries
+Your `Cargo.toml` now depends on zgui:
 
-The desktop uses the native Wayland backend when a Wayland display is available. It uses winit on
-X11, Windows, and macOS. Both paths draw through wgpu.
+```toml title="Cargo.toml"
+[dependencies]
+zgui = "0.1"
+```
 
-The packages below are Linux development headers. Windows and macOS do not compile the Linux
-windowing backends and need none of them. Use the normal Rust toolchain and platform SDK there.
+`zgui` is the only crate most applications need. It re-exports the document, styling, layout, text,
+rendering, and platform layers. [Optional crates and features](#optional-crates-and-features) lists
+the extras.
+
+## Install system libraries
+
+### Linux
+
+Install the development headers for Wayland, X11, xkbcommon, and fontconfig:
 
 <Tabs items={['Debian / Ubuntu', 'Arch', 'Fedora']}>
 <Tab value="Debian / Ubuntu">
@@ -47,7 +38,8 @@ windowing backends and need none of them. Use the normal Rust toolchain and plat
 ```bash
 sudo apt-get install -y --no-install-recommends \
   pkg-config libx11-dev libxkbcommon-dev libxkbcommon-x11-dev \
-  libwayland-dev libxcb1-dev libxcursor-dev libxi-dev libxrandr-dev
+  libwayland-dev libxcb1-dev libxcursor-dev libxi-dev libxrandr-dev \
+  libfontconfig1-dev
 ```
 
 </Tab>
@@ -55,7 +47,7 @@ sudo apt-get install -y --no-install-recommends \
 
 ```bash
 sudo pacman -S --needed pkgconf libx11 libxkbcommon libxkbcommon-x11 \
-  wayland libxcb libxcursor libxi libxrandr
+  wayland libxcb libxcursor libxi libxrandr fontconfig
 ```
 
 </Tab>
@@ -64,73 +56,22 @@ sudo pacman -S --needed pkgconf libx11 libxkbcommon libxkbcommon-x11 \
 ```bash
 sudo dnf install pkgconf-pkg-config libX11-devel libxkbcommon-devel \
   libxkbcommon-x11-devel wayland-devel libxcb-devel libXcursor-devel \
-  libXi-devel libXrandr-devel
+  libXi-devel libXrandr-devel fontconfig-devel
 ```
 
 </Tab>
 </Tabs>
 
-You also need a working graphics driver. Any adapter wgpu accepts will do. Continuous integration
-runs the whole suite on Mesa's software rasteriser, so a machine with no discrete GPU still works:
+You also need a working Vulkan or OpenGL driver. Mesa's software rasteriser works on machines
+without a GPU.
 
-```bash
-# restrict backend selection when diagnosing a driver
-ZGUI_BACKENDS=vulkan cargo run --example counter
-```
+### macOS and Windows
 
-The default is Metal on Apple platforms, Direct3D 12 with OpenGL fallback on Windows, and Vulkan
-with OpenGL fallback elsewhere. `ZGUI_BACKENDS` accepts `metal`, `dx12`, `vulkan`, `gl`, `all`, or
-`none`, with comma-separated values where more than one applies.
+No extra libraries. Use the standard Rust toolchain with Xcode's command line tools on macOS, or
+the MSVC build tools on Windows. zgui draws with Metal on macOS and Direct3D 12 (with OpenGL as a
+fallback) on Windows.
 
-On Linux and BSD, `App::run` selects the native Wayland backend when `WAYLAND_DISPLAY` identifies
-an available compositor. Otherwise it selects winit. Use `ZGUI_PLATFORM=winit` to force the
-portable backend, including winit's Wayland path. Use `ZGUI_PLATFORM=wayland` to require the native
-backend. A forced native connection failure is returned; zgui does not silently fall back.
-
-<Callout type="info">
-Nothing above is needed to run the framework **headless**. The headless backend draws into buffers
-with no display server and no graphics device, which is how most of zgui's own tests run. See
-[Testing](/docs/building/testing).
-</Callout>
-
-## Adding zgui to a project
-
-zgui is not published to crates.io yet. Depend on the repository directly.
-
-<Tabs items={['Git dependency', 'Path dependency']}>
-<Tab value="Git dependency">
-
-```toml title="Cargo.toml"
-[package]
-name = "my-app"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-zgui = { git = "https://github.com/zortax/zgui" }
-```
-
-</Tab>
-<Tab value="Path dependency">
-
-```toml title="Cargo.toml"
-[package]
-name = "my-app"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-zgui = { path = "../zgui/crates/zgui" }
-```
-
-</Tab>
-</Tabs>
-
-`zgui` is the only crate an application names. Everything below it — the document, the style engine,
-layout, text, painting, the renderer, the platform — is re-exported through it. You reach for
-another crate only when you replace a backend.
-
-## A window
+## Open a window
 
 ```rust title="src/main.rs"
 use zgui::prelude::*;
@@ -158,46 +99,104 @@ fn main() -> Result<(), zgui::Error> {
 cargo run
 ```
 
-A window opens with centred white text on a dark background. `app()` builds the application.
-`run` opens the primary window and drives the event loop until the selected exit policy stops the
-application. The closure builds that window's root view. A platform resume can build it again.
+A window opens with "Hello" in white on a dark background. `app()` starts the application
+builder, `run` opens the window and returns when the application exits, and the closure passed to
+`run` builds the window's content. [Your first application](/docs/getting-started/your-first-application)
+explains each part in detail.
 
-<Callout type="info">
-`css!` checks the structure of the sheet at compile time: unclosed blocks, unclosed strings and
-comments, a rule with no selector, a declaration with no colon. It does not check property names —
-the CSS parser handles those at run time, as in a browser.
-</Callout>
+## Optional crates and features
 
-## Running the repository's examples
+Add other crates only when you need them:
 
-If you have a checkout of zgui, twelve worked applications live in `examples/`:
+| Crate | When to add it |
+|---|---|
+| `zgui-ui`, `zgui-ui-tokens` | You want the [component library](/docs/component-library) and its themes. |
+| `zgui-ui-icons` | You want the library's icon set. |
+| `zgui-image` | You register encoded image bytes from memory. File paths need only `zgui`. |
+| `zgui-testkit-view`, `zgui-platform-headless` | Headless tests, as `[dev-dependencies]`. See [Testing](/docs/building/testing). |
 
-```bash
-cargo run -p zgui-examples --example counter
-cargo run -p zgui-examples --example todo
-cargo run -p zgui-examples --example styled
-cargo run -p zgui-examples --example tally
-cargo run -p zgui-examples --example resize
-cargo run -p zgui-examples --example vector
-cargo run -p zgui-examples --example canvas
-cargo run -p zgui-examples --example surface
-cargo run -p zgui-examples --example custom
-cargo run -p zgui-examples --example async
-cargo run -p zgui-examples --example windows
-cargo run -p zgui-examples --example csd
+The `zgui` crate has one feature an application is likely to want: `tokio`, which runs background
+work on a tokio runtime so tasks can await tokio timers and sockets.
+
+```toml
+zgui = { version = "0.1", features = ["tokio"] }
 ```
 
-`counter` and `todo` are the two this guide refers back to most. `windows` demonstrates shared state
-and lifecycle across several windows. `csd` demonstrates a window that draws its own decorations.
+## Speed up font lookup
+
+The zgui repository patches `fontique`, the font collection under the text engine, so that it
+reuses resolved font families between paragraphs. A crates.io build uses the released `fontique`:
+text looks the same, but font resolution is slower. This step is optional. To use the patched copy,
+add this to your application's `Cargo.toml`:
+
+```toml title="Cargo.toml"
+[patch.crates-io]
+fontique = { git = "https://github.com/zortax/zgui", tag = "v0.1.0" }
+```
+
+## Choose a platform or graphics backend
+
+zgui picks the platform and graphics backend automatically. You can override the choice with
+environment variables, which helps when you diagnose a driver or compositor problem.
+
+| Variable | Values | Effect |
+|---|---|---|
+| `ZGUI_PLATFORM` | `wayland`, `winit` | Linux and BSD only. By default zgui uses its native Wayland backend when a Wayland compositor is available, and winit otherwise (X11). `winit` forces the portable backend, including on Wayland. `wayland` requires the native backend and returns an error if it cannot connect. |
+| `ZGUI_BACKENDS` | `vulkan`, `metal`, `dx12`, `gl`, `all`, `none`; comma-separated | Restricts which graphics APIs are tried. Defaults: Metal on Apple platforms, Direct3D 12 then OpenGL on Windows, Vulkan then OpenGL elsewhere. |
+| `ZGUI_DEVICE_ID` | PCI device id, decimal or `0x` hex | Prefers one GPU over the others. |
+
+```bash
+ZGUI_BACKENDS=vulkan cargo run
+```
+
+[Shipping](/docs/building/shipping#the-graphics-device) describes device selection in full. Tests
+need neither a display server nor a GPU: the headless backend draws into memory. See
+[Testing](/docs/building/testing).
+
+## Run the examples
+
+The zgui repository has working examples in `examples/`. Clone it and run one with Cargo:
+
+```bash
+git clone https://github.com/zortax/zgui
+cd zgui
+cargo run -p zgui-examples --example counter
+```
+
+| Example | Shows |
+|---|---|
+| `counter` | Signals, a reactive text node, click listeners |
+| `todo` | A keyed list, keyboard text input, per-row state |
+| `tally` | A small application written only against the prelude |
+| `styled` | What the style engine draws: borders, gradients, shadows, filters |
+| `resize` | Layout while the window is being resized |
+| `async` | Background work and cancellation |
+| `windows` | Several windows sharing state |
+| `csd` | A window that draws its own title bar and frame |
+| `images` | Images, `object-fit`, and sampling (set `ZGUI_IMAGES_DIR` to a folder with `photo.png` and `portrait.png`) |
+| `vector` | Vector outlines and SVG on `vector` elements |
+| `canvas` | Imperative drawing on a `canvas` element |
+| `custom` | A custom element implemented in Rust |
+| `shader` | An application shader written in WGSL |
+| `surface` | Embedding pixels from another wgpu renderer |
+
+Add `--release` for the graphics-heavy examples (`canvas`, `vector`, `custom`, `shader`,
+`surface`, `resize`). The component gallery is in the `zgui-ui` crate:
+
+```bash
+cargo run -p zgui-ui --example gallery
+```
+
+The repository pins a nightly toolchain in `rust-toolchain.toml`, and rustup installs it
+automatically inside the checkout. Only work on zgui itself needs nightly; your own projects use
+stable.
 
 ## Next
-
-Build the counter one line at a time and see what each part does.
 
 <Cards>
   <Card
     title="Your first application"
     href="/docs/getting-started/your-first-application"
-    description="A counter, taken apart: the component, the signal, the view, the sheet, the entry point."
+    description="A counter, taken apart: the component, the signal, the view, the style sheet, and the entry point."
   />
 </Cards>

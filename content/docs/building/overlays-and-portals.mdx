@@ -1,41 +1,25 @@
 ---
 title: Overlays and portals
-description: Escaping a clipping or stacking ancestor with Portal, placing a surface against its trigger, dismissing it, and holding focus inside a modal.
+description: Render a popover, menu or dialog above the page with Portal, place it next to its trigger, close it on an outside press or Escape, and keep focus inside a modal.
 ---
 
-An **overlay** is content that has to come out in front of everything: a tooltip, a menu, a dialog,
-a toast. This page assumes [Control flow](/docs/learn/control-flow), [Events](/docs/learn/events)
-and [Keyboard and focus](/docs/building/keyboard-and-focus), and it builds three complete overlays
-from the element vocabulary and signals alone.
+An overlay is content drawn in front of the rest of the window: a tooltip, a menu, a dialog, a
+toast. You render it with `Portal`, place it yourself from observed geometry, and close it with
+listeners on the window root. Read [Events](/docs/learn/events) and
+[Keyboard and focus](/docs/building/keyboard-and-focus) first.
 
-## Why a surface cannot stay where it is written
+<Callout type="info">
+The component library's primitives already do all of this:
+[`Popper`](/docs/component-library/primitives#popper) places a surface,
+[`DismissableLayer`](/docs/component-library/primitives#dismissablelayer) closes it,
+[`FocusScope`](/docs/component-library/primitives#focusscope) traps focus and
+[`Presence`](/docs/component-library/primitives#presence) keeps it mounted for an exit animation.
+Use this page to build an overlay without `zgui-ui`, or to understand what they do.
+</Callout>
 
-A menu written inside the row that opens it is a child of that row, and two things a parent does to
-its children then apply to it.
+## Render content above the page
 
-**Clipping.** A box whose `overflow` is not `visible` cuts its content off at its own edges.
-Anything a descendant draws outside that rectangle is not drawn at all. A menu inside a scrolling
-list is therefore cut off at the list's bottom edge, however tall the menu is.
-
-**Stacking.** The order boxes are painted in is not document order. A box that establishes a
-**stacking context** is painted as one unit, at one position in its parent's sequence, and
-everything inside it is painted inside that unit. So a menu carrying `z-index: 9999` inside a card
-whose ancestor has `opacity: 0.98` still paints behind the card's next sibling: the whole subtree
-moves together and `z-index` cannot lift one part of it out.
-[Layout](/docs/learn/layout) lists every property that establishes a context.
-
-Painting order is also hit order — the last thing painted is the first thing hit — so a surface
-that paints behind something is also unclickable through it.
-
-| Ancestor | What it does to a descendant | What a portal does about it |
-|---|---|---|
-| `overflow: hidden`, `auto` or `scroll` | clips it to the ancestor's box | the content is no longer a descendant |
-| `opacity`, `filter`, `transform`, `clip-path`, `isolation` | paints it as part of one atomic unit | the content is painted from a different band |
-| `position: relative` with a `z-index` | fixes where the whole subtree sits in paint order | the band decides the order instead |
-
-## `Portal` and the four bands
-
-`Portal` renders its children on a named **overlay band** instead of where it is written.
+`Portal` renders its children on an overlay layer above the page instead of where it is written:
 
 ```rust
 use zgui::prelude::*;
@@ -57,131 +41,84 @@ fn Toolbar() -> impl IntoView {
 }
 ```
 
-<TypeTable
-  type={{
-    layer: {
-      description: 'Which band the content goes on.',
-      type: 'OverlayLayer',
-      default: 'OverlayLayer::Popover',
-    },
-    children: {
-      description: 'What is rendered on the band. A portal with nothing in it is a compile error.',
-      type: 'impl Fn() -> impl IntoView',
-      required: true,
-    },
-  }}
-/>
+`layer` takes an `OverlayLayer` and defaults to `OverlayLayer::Popover`. The children are required.
+The portal leaves a marker where it was written, so opening and closing move only the content.
 
-Four bands exist. The declared order is the paint order, and a test asserts that the two agree
-(`crates/zgui-view/src/dom/overlay.rs`).
+There are four layers. Later layers paint above earlier ones.
 
-| Band | `z-index` | For |
+| Layer | `z-index` | Use for |
 |---|---|---|
-| `OverlayLayer::Content` | 10 | portalled content that belongs with the page: a sticky region, an inline surface |
-| `OverlayLayer::Popover` | 20 | popovers, menus, tooltips, dropdowns — the default |
-| `OverlayLayer::Modal` | 30 | dialogs, sheets and drawers, which take the interaction over |
-| `OverlayLayer::Toast` | 40 | toasts and notices, which sit above everything including a dialog |
+| `OverlayLayer::Content` | 10 | portalled content that belongs with the page |
+| `OverlayLayer::Popover` | 20 | popovers, menus, tooltips, dropdowns (the default) |
+| `OverlayLayer::Modal` | 30 | dialogs, sheets, drawers |
+| `OverlayLayer::Toast` | 40 | toasts and notices, above dialogs |
 
-**Naming the band beats relying on mount order.** One overlay root holding everything would order
-surfaces by the order they were mounted, so a toast raised before a dialog would paint beneath it.
-A band is an ordering a style sheet can see, which is also where an application can override it.
+Choose the layer by what the surface is, not by when it opens. A toast raised before a dialog still
+paints above it.
 
-## Where portalled content goes
+### Why a portal is needed
 
-The framework creates the same six nodes in every window before any view is built.
+A menu written inside the row that opens it is a descendant of that row, so the row's ancestors
+affect it:
 
-<TreeDiagram
-  label="The nodes that receive portalled content"
-  items={[
-    {
-      title: 'root',
-      description: "The window's root element.",
-      children: [
-        {
-          title: 'overlay_root',
-          description: 'Fixed, window-sized, and pointer-events: none.',
-          children: [
-            { title: 'Content layer', code: 'data-layer=content' },
-            { title: 'Popover layer', code: 'data-layer=popover' },
-            { title: 'Modal layer', code: 'data-layer=modal' },
-            { title: 'Toast layer', code: 'data-layer=toast' },
-          ],
-        },
-      ],
-    },
-  ]}
-/>
-
-Portalled content becomes a child of one **band node**, so it is always a grandchild of the overlay
-root. The framework's own sheet is written against exactly that shape:
-
-```css
-overlay_root                        { display: block; position: fixed; inset: 0;
-                                      pointer-events: none; }
-overlay_root > [data-layer]         { position: absolute; inset: 0; pointer-events: none; }
-overlay_root > [data-layer] > *     { pointer-events: auto; }
-overlay_root > [data-layer=content] { z-index: 10; }
-overlay_root > [data-layer=popover] { z-index: 20; }
-overlay_root > [data-layer=modal]   { z-index: 30; }
-overlay_root > [data-layer=toast]   { z-index: 40; }
-```
-
-Five consequences follow, and all five matter when you write an overlay.
-
-- **The band covers the window and refuses the pointer.** A press on the empty part of an open
-  popover's band reaches whatever is beneath it. Only the portal's own top-level elements take
-  pointer events back, through `overlay_root > [data-layer] > *`. `pointer-events` is inherited, so
-  their descendants take them too.
-- **A `position: fixed` child of a band is placed against the window.** That is the coordinate space
-  every measurement below is in, so a placement works wherever the trigger happens to live.
-- **The portal keeps a marker where it was written.** Its siblings keep their order, and the portal
-  can come and go without disturbing them.
-- **An event inside the surface does not reach the component that wrote it.** The dispatch path is
-  built by walking the document, and the surface's ancestors are the band, the overlay root and the
-  window root. Pass a signal or a callback prop; do not rely on an event bubbling back to the
-  trigger.
-- **Context and ownership do follow the writing site.** The children are built in the scope that
-  wrote the portal, so `use_context` answers what it would have answered in place, and unmounting
-  the component disposes of the surface.
-
-`overlay_root()` is callable from a view and must not be called: there is already one per window.
-See [Elements](/docs/learn/elements).
-
-## Placing a surface next to its trigger
-
-A portalled surface is placed in the window's own pixels, so nothing places it for you. The
-framework supplies the measurements; you write the arithmetic.
-
-| What you need | Where it comes from |
+| Ancestor | Effect on the menu |
 |---|---|
-| where the trigger is now | `anchor.observe_border_box()` |
-| how big the surface turned out | `positioner.observe_content_size()` |
-| where the window's edges are | `positioner.window_root()`, then observe its border box |
-| how many device pixels one CSS pixel is | `positioner.scale()` |
+| `overflow: hidden`, `auto` or `scroll` | clipped to the ancestor's box |
+| `opacity`, `filter`, `transform`, `clip-path`, `isolation` | painted as one unit with the ancestor's subtree, so its `z-index` cannot lift it above the ancestor's siblings |
+| `position: relative` with a `z-index` | the whole subtree has one place in paint order |
 
-Each observation is a signal, written during the frame that changes it and **before anything is
-painted**. A view that positions itself from what it observes is painted in its final place in that
-same frame. [Effects and lifecycle](/docs/learn/effects-and-lifecycle) covers observation itself.
+Paint order is also hit-test order, so a menu painted behind something cannot be clicked there
+either. [Layout](/docs/learn/layout) lists the properties that create a stacking context.
 
-Two rules decide the shape of the code:
+### What changes for portalled content
 
-- **Two kinds of pixel.** Every measurement arrives in **device** pixels. An inline `left` or `top`
-  is read as a **CSS** pixel. Divide by the scale as the last step, or the surface lands at its
-  position multiplied by the display's density.
-- **Mount hidden, not absent.** An element that is not in the document has no size to measure, and
-  the measurement is what decides where it goes. `visibility: hidden` keeps the box and its layout
-  and takes it out of the paint, which is exactly the state a surface being placed is in.
+- **Context and ownership follow the place it is written.** The children are built in the scope
+  that wrote the portal, so `use_context` works as it would in place, and unmounting that component
+  removes the surface.
+- **Events do not bubble to the component that wrote it.** The surface's ancestors are the overlay
+  layer, the overlay root and the window root. Pass a signal or a callback prop instead of relying on bubbling.
+- **Empty layer area does not take the pointer.** A press beside an open popover reaches whatever is
+  underneath. Only the portal's top-level elements and their descendants receive pointer events.
+- **Fixed positions are window coordinates.** The overlay root covers the whole window, including
+  any scrollbar gutter, so a `position: fixed` surface is placed relative to the window.
+
+[How the overlay layers work](#how-the-overlay-layers-work) shows the style rules behind this.
+
+## Place a popover next to its trigger
+
+zgui does not position portalled content for you. Observe the geometry you need and compute the
+position:
+
+| Need | Source |
+|---|---|
+| where the trigger is | `anchor.observe_border_box()` |
+| how big the surface is | `positioner.observe_content_size()` |
+| where the window edges are | `positioner.window_root()`, then `observe_border_box()` on it |
+| device pixels per CSS pixel | `positioner.scale()` |
+
+Observed values are signals. They are written during the frame that changes them, before painting,
+so a surface positioned from them is drawn in its final place in that same frame. See
+[Effects and lifecycle](/docs/learn/effects-and-lifecycle).
+
+Two rules:
+
+- **Convert to CSS pixels last.** Observations are in device pixels. Inline `left` and `top` are CSS
+  pixels. Divide by `scale()`, or the surface lands too far away on high-density displays.
+- **Mount hidden, not absent.** An element that is not in the document has no size to measure. Use
+  `visibility: hidden` until the first placement exists. The box keeps its layout but is not painted.
+
+This component places its children below the anchor, or above it when there is no room below:
 
 ```rust
 use zgui::geom::{Device, DevicePx, Rect};
 use zgui::reactive::RenderEffect;
 
-/// Places its children against `anchor`, and keeps them inside the window.
+/// Places its children below (or above) `anchor`, inside the window.
 #[component]
 fn Anchored(
     /// What the surface is placed against.
     anchor: NodeRef,
-    /// How far off the anchor the surface sits, in CSS pixels.
+    /// Distance from the anchor, in CSS pixels.
     #[prop(default = 4.0)]
     gap: f32,
     /// Classes on the positioner.
@@ -194,10 +131,7 @@ fn Anchored(
     let anchor_box = anchor.observe_border_box();
     let surface_size = positioner.observe_content_size();
 
-    // The window's own rectangle, observed rather than read once: a resize moves the edge the
-    // surface is being kept inside of. It is acquired from an effect because the root is only
-    // reachable through a handle that is bound, and this component's handle binds as its element
-    // is built.
+    // The window root is reachable only once `positioner` is bound, so acquire it from an effect.
     let window_box: RwSignal<
         Option<Signal<Option<Rect<DevicePx, Device>>, LocalStorage>>,
         LocalStorage,
@@ -215,8 +149,7 @@ fn Anchored(
     let origin = Signal::derive_local(move || {
         let anchor = anchor_box.get()?;
         let size = surface_size.get();
-        // Before the first measurement the surface has no size, and a placement made from nothing
-        // is the one frame in the wrong place this whole arrangement exists to remove.
+        // Not measured yet: stay hidden rather than flash at the wrong place.
         if size.width.0 <= 0.0 && size.height.0 <= 0.0 {
             return None;
         }
@@ -226,23 +159,14 @@ fn Anchored(
 
         let below = anchor.origin.y.0 + anchor.size.height.0 + gap;
         let above = anchor.origin.y.0 - size.height.0 - gap;
-        // Cross to the other side only when this side does not fit and the other one does. Crossing
-        // to a side that is merely less short is how a surface flips on every frame.
+        // Flip only when below does not fit and above does, so the surface does not oscillate.
         let fits_below = below + size.height.0 <= window.origin.y.0 + window.size.height.0;
-        let y = if fits_below || above < window.origin.y.0 {
-            below
-        } else {
-            above
-        };
+        let y = if fits_below || above < window.origin.y.0 { below } else { above };
 
-        // Slide along the anchor's edge until the surface is inside the window.
+        // Slide horizontally until the surface is inside the window.
         let furthest = window.origin.x.0 + window.size.width.0 - size.width.0;
-        let x = anchor.origin.x.0.clamp(
-            window.origin.x.0,
-            furthest.max(window.origin.x.0),
-        );
+        let x = anchor.origin.x.0.clamp(window.origin.x.0, furthest.max(window.origin.x.0));
 
-        // Device pixels in, CSS pixels out.
         Some((x / scale, y / scale))
     });
 
@@ -265,56 +189,65 @@ fn Anchored(
 }
 ```
 
-<Callout type="info">
-This surface is unmounted while it is closed, so it watches nothing while it is closed. A surface
-that stays mounted because something outside it names its element should observe with the `_while`
-forms — `observe_border_box_while(active)` — or it is re-placed on every frame in which anything
-scrolls.
-</Callout>
-
-## Dismissal
-
-Three things close a surface, and each is a different question.
-
-| Way out | The question | Answered with |
-|---|---|---|
-| a press outside | is this press mine? | a capture listener on the window root, plus `NodeRef::contains` |
-| Escape | is this key mine? | `on:key_down` on the surface, when focus is inside it |
-| focus leaving | is focus still inside me? | `focused_node()` plus `NodeRef::contains` |
-
-### A press outside
-
-A view can only attach a listener to a node it made, and a press somewhere else in the window
-happens on a node it did not. `NodeRef::window_root()` hands back a handle on the window's root
-element, and `NodeRef::listen` attaches a listener to it for as long as the guard is held.
+Use it inside a `Portal`, with a `NodeRef` on the trigger:
 
 ```rust
-/// Calls `close` when a press lands outside `surface` and outside `trigger`.
-///
-/// Called from a component body. The listener lives as long as that body's scope.
+let trigger = NodeRef::new();
+
+view! {
+    control(node_ref = trigger, on:click = move |_| open.update(|o| *o = !*o)) {"Options"}
+    if move || open.get() {
+        Portal {
+            Anchored(anchor = trigger, class = "popover") {
+                column { "…" }
+            }
+        }
+    }
+}
+```
+
+This surface is unmounted while closed, so it observes nothing while closed. A surface that stays
+mounted should use the `_while` forms, such as `observe_border_box_while(move || open.get())`, so it
+is not re-placed every time something scrolls.
+
+To make a surface as wide as its trigger, set its width from `anchor_box` in the same way. The
+component library's `Popper` publishes this as `--zui-popper-anchor-width` in CSS pixels, so a style
+sheet can write `width: var(--zui-popper-anchor-width)`.
+
+## Close an overlay
+
+| Close on | Listen with |
+|---|---|
+| a press outside | a capture listener on the window root, plus `NodeRef::contains` |
+| Escape | `on:key_down` on the surface, or a capture listener on the window root |
+| focus leaving | `focused_node()` plus `NodeRef::contains` |
+
+### Close on a press outside
+
+A press elsewhere in the window lands on a node your view did not create.
+`NodeRef::window_root()` returns a handle on the window's root element, and `NodeRef::listen`
+attaches a listener to it for as long as you hold the returned `ListenerGuard`:
+
+```rust
+/// Calls `close` when a press lands outside both `surface` and `trigger`.
+/// Call from a component body; the listener lives as long as that scope.
 fn close_on_outside_press(surface: NodeRef, trigger: NodeRef, close: UnsyncCallback<()>) {
     let guard: StoredValue<Option<ListenerGuard>, LocalStorage> = StoredValue::new_local(None);
 
     let attaching = RenderEffect::new(move |_| {
-        // A handle binds as its element is built, so the first run finds nothing. Reading it here
-        // is what brings the effect back when it does bind.
+        // Re-runs when `surface` binds.
         if surface.get().is_none() || guard.with_value(Option::is_some) {
             return;
         }
         let Some(window) = surface.window_root() else {
             return;
         };
-        // The capture leg, so the decision is taken before anything on the pressed element's own
-        // path runs. A surface that closed on the bubble would be closed by its own trigger's
-        // press, and then re-opened by the click that press becomes.
         guard.set_value(window.listen(
             events::POINTER_DOWN,
             ListenerOptions::CAPTURE,
             move |ev: &mut EventCx<'_, events::PointerDown>| {
-                // The guard outlives the surface, which is unmounted while it is closed. There is
-                // then nothing to close.
                 if surface.get_untracked().is_none() {
-                    return;
+                    return; // closed and unmounted
                 }
                 if !surface.contains(ev.target) && !trigger.contains(ev.target) {
                     close.run(());
@@ -330,35 +263,37 @@ fn close_on_outside_press(surface: NodeRef, trigger: NodeRef, close: UnsyncCallb
 }
 ```
 
-**The trigger has to be excluded.** A surface anchored to a button sits nowhere near that button in
-the document, so a press on the button is a press outside the surface. Without the exclusion the
-surface closes, the press goes on to become a click, and the trigger opens the surface it has just
-closed — so the menu never closes from the control every person tries first.
+- **Listen in the capture phase** so the decision is made before the pressed element's own handlers
+  run.
+- **Exclude the trigger.** Otherwise a press on the trigger closes the surface, and the click that
+  follows opens it again.
 
-A surface with a **backdrop** needs none of this. A backdrop is a box that covers the window and is
-part of the overlay, so a press outside the surface is an ordinary press on the backdrop. The dialog
-below is written that way.
+A surface with a backdrop does not need this. The backdrop covers the window, so a press outside
+the surface is a press on the backdrop. The [modal dialog](#build-a-modal-dialog) below works that
+way.
 
-### Escape
+### Close on Escape
 
-Escape is aimed at the focused element and bubbles, so a listener on the surface hears it whenever
-focus is inside the surface. Stop it there:
+Key events target the focused element and bubble. When focus is inside the surface, a listener on
+the surface sees Escape:
 
 ```rust
 on:key_down = move |ev| {
     if ev.key == Key::Named(NamedKey::Escape) {
-        // Escape belongs to exactly one surface. Swallowing it here is what stops one press
-        // closing a menu and the dialog behind it in the same breath.
-        ev.stop_propagation();
+        ev.stop_propagation(); // one Escape closes one surface
         open.set(false);
     }
 }
 ```
 
-When focus is **not** inside the surface — a tooltip, which never takes focus — put the same
-listener on the trigger instead, and act only when the surface is actually showing.
+When focus may be elsewhere (a tooltip never takes focus), listen for `events::KEY_DOWN` on the
+window root in the capture phase, as for an outside press. When nothing is focused, the key's target
+is the window root itself. All listeners on the target run even after `stop_propagation()`, so call
+`ev.stop_immediate_propagation()` to keep the application's own root-level Escape handler from also
+firing. The component library's `DismissableLayer` does this, and only the innermost open layer
+responds.
 
-### Focus leaving
+### Close when focus leaves
 
 ```rust
 let focused = focused_node();
@@ -373,51 +308,24 @@ let watching = RenderEffect::new(move |_| {
 on_cleanup_local(move || drop(watching));
 ```
 
-`focused_node()` is a signal over the node that holds focus in this window. Nothing focused reads
-`None`, which is not the same as focus having moved away, so the `if let` is the whole rule.
+`focused_node()` reads `None` when nothing is focused, for example after the focused element was
+removed. That is not focus moving elsewhere, so it does not close the surface.
 
-## Focus containment in a modal
+## Keep focus inside a modal
 
-A modal surface that does not trap focus is one a keyboard user tabs straight out of, into controls
-they cannot see and which are announced as though nothing had opened. `NodeRef::trap_focus` confines
-sequential navigation to one subtree and hands back a guard. Dropping the guard releases the trap.
-
-<TypeTable
-  type={{
-    wrap: {
-      description: 'Tabbing past the last control goes back to the first, so there is no way out.',
-      type: 'bool',
-    },
-    auto_focus: {
-      description: 'Focus moves inside as the trap goes up, so the first key press lands in the surface.',
-      type: 'bool',
-    },
-    restore: {
-      description: 'Focus returns to whatever held it when the trap went up.',
-      type: 'bool',
-    },
-  }}
-/>
-
-`FocusTrapOptions::MODAL` is all three and is the default. `FocusTrapOptions::CONFINE_ONLY` is
-`wrap` alone: what a menu opened from a toolbar wants, which confines the arrow keys without taking
-the toolbar's focus away.
+Without a focus trap, Tab moves out of a modal into controls behind it. `NodeRef::trap_focus`
+confines Tab to a subtree and returns a `FocusTrap` guard; dropping the guard releases the trap.
+This helper holds a trap while the surface is open:
 
 ```rust
-/// Confines sequential focus navigation to `surface` while `active` answers true.
-fn trap_focus_while(
-    surface: NodeRef,
-    options: FocusTrapOptions,
-    active: impl Fn() -> bool + 'static,
-) {
+/// Holds a focus trap on `surface` while `active` is true.
+fn trap_focus_while(surface: NodeRef, options: FocusTrapOptions, active: impl Fn() -> bool + 'static) {
     let held: StoredValue<Option<FocusTrap>, LocalStorage> = StoredValue::new_local(None);
 
     let installing = RenderEffect::new(move |_| {
         if active() && surface.get().is_some() {
-            // Held across runs rather than made afresh on each: installing a second trap over the
-            // first is a stack two deep for one dialog.
             if held.with_value(Option::is_none) {
-                held.set_value(surface.trap_focus(options));
+                held.set_value(surface.trap_focus(options)); // install once
             }
         } else {
             held.set_value(None);
@@ -428,245 +336,24 @@ fn trap_focus_while(
 }
 ```
 
-Traps stack and the innermost wins, so a dialog opened from a dialog behaves, and closing the inner
-one hands navigation back to the outer one. A trap that asks to auto-focus is entered **after
-layout**, in a stage of its own: a surface that has no boxes yet has nothing to focus.
+Use `FocusTrapOptions::MODAL` for a dialog: Tab wraps inside it, focus moves in when it opens, and
+focus returns to the opener when it closes. `FocusTrapOptions::CONFINE_ONLY` only wraps Tab, for a
+menu that should not take focus from its toolbar. Traps stack, so a dialog opened from a dialog
+works. [Trap focus in a dialog](/docs/building/keyboard-and-focus#trap-focus-in-a-dialog) has the
+full rules for options, nesting and restoring focus.
 
-## A tooltip
+## Build a modal dialog
 
-Delayed on hover, immediate on focus, gone on Escape, and never in the way of the pointer.
-
-```rust
-use core::time::Duration;
-use zgui::view::TimeoutHandle;
-
-/// Shows `tip` beside whatever it wraps.
-#[component]
-fn Tooltip(
-    /// What the tooltip says.
-    #[prop(into)]
-    tip: String,
-    /// What the tooltip is about.
-    children: Children,
-) -> impl IntoView {
-    let open = RwSignal::new(false);
-    let trigger = NodeRef::new();
-    // Taken in the body, where the scope knows which window this is, and carried into the
-    // listeners, which run in a scope that does not.
-    let clock = Timers::current().expect("a component body is inside a window");
-    let pending = StoredValue::new_local(None::<TimeoutHandle>);
-    let described = tip.clone();
-
-    view! {
-        box(
-            class = "tip__trigger",
-            node_ref = trigger,
-            // A tooltip is a description, and the description belongs to the trigger. Written here
-            // it reaches a screen reader whether or not the surface is ever shown.
-            a11y:description = described,
-            on:pointer_enter = move |_| {
-                let handle = clock.set_timeout(Duration::from_millis(500), move || open.set(true));
-                pending.set_value(Some(handle));
-            },
-            on:pointer_leave = move |_| {
-                pending.set_value(None);
-                open.set(false);
-            },
-            // Focus is not a pointer that might not have meant it. A keyboard user arrived on
-            // purpose, so there is no delay to wait out.
-            on:focus_in = move |_| {
-                pending.set_value(None);
-                open.set(true);
-            },
-            on:focus_out = move |_| {
-                pending.set_value(None);
-                open.set(false);
-            },
-            on:key_down = move |ev| {
-                // Only when something is showing: a trigger that swallowed every Escape would stop
-                // the dialog around it from ever closing.
-                if ev.key == Key::Named(NamedKey::Escape) && open.get_untracked() {
-                    ev.stop_propagation();
-                    open.set(false);
-                }
-            }
-        ) {
-            {children.into_view_once()}
-            if move || open.get() {
-                Portal {
-                    Anchored(anchor = trigger, class = "tip") {
-                        box(class = "tip__body", a11y:role = Role::Tooltip) {{tip.clone()}}
-                    }
-                }
-            }
-        }
-    }
-}
-
-const TOOLTIP: &str = css!(
-    ".tip__trigger { display: inline-block; }
-
-    /* The surface must never answer the pointer: a tooltip under the cursor would take the
-       pointer-leave that closes it. pointer-events is inherited, so one rule covers the
-       whole subtree. */
-    .tip { pointer-events: none; }
-
-    .tip__body {
-        padding: 4px 8px;
-        border-radius: 6px;
-        background-color: #11151c;
-        color: #e6e9ef;
-        font-size: 12px;
-    }"
-);
-```
-
-Dropping the `TimeoutHandle` cancels the delay, which is why `pending.set_value(None)` is the first
-thing every closing path does. See [UI tasks and timers](/docs/learn/async-and-timers).
-
-## A dropdown menu
-
-Opened by a click, closed by Escape, by a press outside, or by choosing something. Arrow keys move
-between the items and Tab stays inside.
-
-```rust
-use zgui::vocab::HasPopup;
-
-#[component]
-fn ActionsMenu() -> impl IntoView {
-    let open = RwSignal::new(false);
-    let chosen = RwSignal::new(String::new());
-    let trigger = NodeRef::new();
-    let surface = NodeRef::new();
-
-    close_on_outside_press(surface, trigger, UnsyncCallback::new(move |()| open.set(false)));
-    // MODAL, not CONFINE_ONLY: a menu opened by a click should take focus, and should give it back
-    // to the trigger when it closes.
-    trap_focus_while(surface, FocusTrapOptions::MODAL, move || open.get());
-
-    let choose = move |label: &str| {
-        chosen.set(label.to_owned());
-        open.set(false);
-    };
-
-    view! {
-        column(class = "menu") {
-            control(
-                class = "menu__trigger",
-                node_ref = trigger,
-                a11y:has_popup = HasPopup::Menu,
-                a11y:expanded = move || open.get(),
-                on:click = move |_| open.update(|open| *open = !*open)
-            ) {
-                "Actions"
-            }
-            text(class = "menu__chosen") {{move || chosen.get()}}
-
-            if move || open.get() {
-                Portal {
-                    Anchored(anchor = trigger) {
-                        column(
-                            class = "menu__list",
-                            node_ref = surface,
-                            a11y:role = Role::Menu,
-                            on:key_down = move |ev| {
-                                match &ev.key {
-                                    Key::Named(NamedKey::ArrowDown) => {
-                                        surface.focus_move(FocusMove::Next);
-                                    }
-                                    Key::Named(NamedKey::ArrowUp) => {
-                                        surface.focus_move(FocusMove::Prev);
-                                    }
-                                    Key::Named(NamedKey::Home) => {
-                                        surface.focus_move(FocusMove::First);
-                                    }
-                                    Key::Named(NamedKey::End) => {
-                                        surface.focus_move(FocusMove::Last);
-                                    }
-                                    Key::Named(NamedKey::Escape) => open.set(false),
-                                    _ => return,
-                                }
-                                // These keys belong to the menu. Nothing above it acts on them too,
-                                // and the arrows do not also scroll whatever is behind it.
-                                ev.stop_propagation();
-                                ev.prevent_default();
-                            }
-                        ) {
-                            control(
-                                class = "menu__item",
-                                a11y:role = Role::MenuItem,
-                                on:click = move |_| choose("Rename")
-                            ) {"Rename"}
-                            control(
-                                class = "menu__item",
-                                a11y:role = Role::MenuItem,
-                                on:click = move |_| choose("Duplicate")
-                            ) {"Duplicate"}
-                            control(
-                                class = "menu__item",
-                                a11y:role = Role::MenuItem,
-                                on:click = move |_| choose("Delete")
-                            ) {"Delete"}
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-const MENU: &str = css!(
-    ".menu { gap: 8px; align-items: flex-start; }
-    .menu__chosen { color: #6b7689; font-size: 12px; }
-
-    .menu__trigger {
-        padding: 6px 14px;
-        border: 1px solid #2f3646;
-        border-radius: 8px;
-        background-color: #232936;
-    }
-
-    .menu__list {
-        min-width: 180px;
-        padding: 4px;
-        border: 1px solid #2f3646;
-        border-radius: 10px;
-        background-color: #191d26;
-        box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
-    }
-
-    .menu__item { padding: 6px 10px; border-radius: 6px; }
-    .menu__item:hover { background-color: #262b36; }
-    .menu__item:focus-visible { outline: 2px solid #7aa2ff; outline-offset: -2px; }"
-);
-```
-
-Four things carry weight here:
-
-- **`control` is focusable by nature**, so the items are in the focus sequence with no `tabindex`.
-  `focus_move` steps that sequence, and it wraps because the installed trap asked it to.
-- **Enter and Space on a focused item produce a real `click`**, so one `on:click` per item serves
-  the pointer, the keyboard and an assistive technology.
-- **`a11y:expanded` tracks `open`** because it is written as a closure, so the trigger announces the
-  menu's state without a second source of truth.
-- **The trap enters on the frame the menu becomes visible.** `Anchored` lays the surface out hidden
-  for one frame so it can be measured, and nothing hidden is focusable. The framework carries the
-  entry over to the next frame rather than dropping it.
-
-## A modal dialog with a backdrop
-
-The backdrop is the direct child of the modal band, so it is what the band's `pointer-events: auto`
-lands on. A press anywhere on it is a press outside the dialog, and no root listener is needed.
+The backdrop is the portal's top-level element, so it receives pointer events. A press on it outside
+the dialog closes the dialog.
 
 ```rust
 #[component]
 fn ConfirmDialog(
     /// Whether the dialog is showing. The caller owns it.
     open: RwSignal<bool>,
-    /// What is being confirmed.
     #[prop(into)]
     question: String,
-    /// Called when the person confirms. A callback prop, not a listener.
     on_confirm: UnsyncCallback<()>,
 ) -> impl IntoView {
     let surface = NodeRef::new();
@@ -696,19 +383,13 @@ fn ConfirmDialog(
                             }
                         }
                     ) {
-                        text(class = "dialog__question") {{question.clone()}}
+                        text {{question.clone()}}
                         row(class = "dialog__actions") {
-                            control(
-                                class = "dialog__button",
-                                on:click = move |_| open.set(false)
-                            ) {"Cancel"}
-                            control(
-                                class = "dialog__button dialog__button--danger",
-                                on:click = move |_| {
-                                    open.set(false);
-                                    on_confirm.run(());
-                                }
-                            ) {"Delete"}
+                            control(on:click = move |_| open.set(false)) {"Cancel"}
+                            control(on:click = move |_| {
+                                open.set(false);
+                                on_confirm.run(());
+                            }) {"Delete"}
                         }
                     }
                 }
@@ -718,68 +399,150 @@ fn ConfirmDialog(
 }
 
 const DIALOG: &str = css!(
-    ".dialog__backdrop {
-        position: fixed;
-        inset: 0;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        background-color: rgba(6, 8, 12, 0.6);
-    }
-
-    .dialog {
-        min-width: 320px;
-        gap: 16px;
-        padding: 20px;
-        border: 1px solid #2f3646;
-        border-radius: 12px;
-        background-color: #161a22;
-    }
-
-    .dialog__actions { gap: 8px; justify-content: flex-end; }
-
-    .dialog__button {
-        padding: 6px 14px;
-        border: 1px solid #2f3646;
-        border-radius: 8px;
-        background-color: #232936;
-    }
-
-    .dialog__button--danger { background-color: #b23b3b; border-color: #b23b3b; }
-    .dialog__button:focus-visible { outline: 2px solid #7aa2ff; outline-offset: 2px; }"
+    ".dialog__backdrop { position: fixed; inset: 0; display: flex; align-items: center;
+                         justify-content: center; background-color: rgba(6, 8, 12, 0.6); }
+    .dialog { min-width: 320px; gap: 16px; padding: 20px; border-radius: 12px;
+              background-color: #161a22; }
+    .dialog__actions { gap: 8px; justify-content: flex-end; }"
 );
 ```
 
-The trap does three jobs at once: Tab cycles inside the dialog, focus moves to the Cancel button as
-the dialog opens, and focus returns to whatever opened it when the dialog closes. `a11y:modal`
-tells an assistive technology the same thing the trap tells the keyboard.
+The trap cycles Tab inside the dialog, focuses Cancel on open, and returns focus to the opener on
+close. `a11y:modal` tells assistive technology the same thing. To stop the page behind the dialog
+from scrolling, see [Stop the page scrolling behind a
+modal](/docs/building/scrolling#stop-the-page-scrolling-behind-a-modal).
 
-## What it costs
+## Build a dropdown menu
 
-- **A portal is one marker plus its content.** The marker stays where the portal was written; the
-  content is mounted under one band node. Opening and closing move only the content.
-- **The band nodes exist whether or not anything is portalled.** Six nodes per window, created once
-  before any view is built.
-- **An observation is refcounted per node and per quantity.** However many readers share one, the
-  frame pays for one, and it is released when the last reader goes. A surface that is unmounted
-  while it is closed observes nothing at all.
-- **A placement is arithmetic over three rectangles**, run inside one derived signal. Each change
-  writes two inline lengths, which restyles one element.
-- **A dismissal listener is one registration on the window root**, on the capture leg. It resolves
-  as part of the path every press already walks.
+A menu combines the pieces above: `close_on_outside_press(surface, trigger, …)`,
+`trap_focus_while(surface, FocusTrapOptions::MODAL, move || open.get())`, and a key handler on the
+list that moves focus between items.
 
-## Failure modes
+```rust
+column(
+    class = "menu__list",
+    node_ref = surface,
+    a11y:role = Role::Menu,
+    on:key_down = move |ev| {
+        match &ev.key {
+            Key::Named(NamedKey::ArrowDown) => { surface.focus_move(FocusMove::Next); }
+            Key::Named(NamedKey::ArrowUp) => { surface.focus_move(FocusMove::Prev); }
+            Key::Named(NamedKey::Home) => { surface.focus_move(FocusMove::First); }
+            Key::Named(NamedKey::End) => { surface.focus_move(FocusMove::Last); }
+            Key::Named(NamedKey::Escape) => open.set(false),
+            _ => return,
+        }
+        // These keys belong to the menu: no parent acts on them, nothing scrolls.
+        ev.stop_propagation();
+        ev.prevent_default();
+    }
+) {
+    control(a11y:role = Role::MenuItem, on:click = move |_| choose("Rename")) {"Rename"}
+    control(a11y:role = Role::MenuItem, on:click = move |_| choose("Delete")) {"Delete"}
+}
+```
 
-| What you see | Why | What to do |
+- `control` is focusable by default, so items need no `tabindex`. `focus_move` wraps because the
+  trap has `wrap` set.
+- Enter and Space on a focused `control` produce a `click`, so one `on:click` serves pointer,
+  keyboard and assistive technology.
+- Give the trigger `a11y:has_popup = HasPopup::Menu` (from `zgui::vocab`) and
+  `a11y:expanded = move || open.get()` so it announces the menu and its state.
+
+## Build a tooltip
+
+A tooltip combines a hover delay, keyboard focus, and a surface that ignores the pointer:
+
+```rust
+use core::time::Duration;
+use zgui::view::TimeoutHandle;
+use zgui::vocab::FocusCause;
+
+// In the component body. Listeners run outside the component's scope, so take the clock here.
+let clock = Timers::current().expect("a component body is inside a window");
+let pending = StoredValue::new_local(None::<TimeoutHandle>);
+
+view! {
+    box(
+        node_ref = trigger,
+        a11y:description = tip.clone(), // the description belongs to the trigger
+        on:pointer_enter = move |_| {
+            pending.set_value(Some(clock.set_timeout(Duration::from_millis(500), move || open.set(true))));
+        },
+        on:pointer_leave = move |_| { pending.set_value(None); open.set(false); },
+        on:focus_in = move |ev: &mut EventCx<'_, events::FocusIn>| {
+            // Keyboard focus only: a trap's auto-focus or a programmatic focus shows nothing.
+            if ev.cause == FocusCause::Keyboard { open.set(true); }
+        },
+        on:focus_out = move |_| { pending.set_value(None); open.set(false); }
+    ) {
+        {children.into_view_once()}
+        if move || open.get() {
+            Portal {
+                Anchored(anchor = trigger, class = "tip") {
+                    box(a11y:role = Role::Tooltip) {{tip.clone()}}
+                }
+            }
+        }
+    }
+}
+```
+
+- Give the surface `pointer-events: none`. A tooltip under the cursor would otherwise receive the
+  pointer and cause the `pointer_leave` that closes it.
+- Dropping a `TimeoutHandle` cancels the timeout, so each closing path clears `pending`. See
+  [UI tasks and timers](/docs/learn/async-and-timers).
+- Close on Escape only while the tooltip is showing, or it swallows the Escape meant for a dialog
+  around it.
+
+## What the component library adds
+
+The `zgui-ui` overlays add a few behaviours on top of the patterns above:
+
+| Component | Behaviour |
+|---|---|
+| `Tooltip` | opens on hover after a delay; on focus, only when the keyboard moved focus there |
+| `Popper` | publishes `--zui-popper-anchor-width` (CSS pixels) on the positioner |
+| `DismissableLayer` | listens for Escape on the window root; the innermost open layer takes it and stops it immediately |
+| `ContextMenu` | inside a `ContextMenuTrigger`, `ContextMenuPlace::current()` then `open_at(point)` (window CSS pixels) opens the menu at that point, for example from the keyboard |
+| `MenuSubTrigger` | opens after a hover delay, or at once on a press |
+
+See [Components](/docs/component-library/components) and
+[Primitives](/docs/component-library/primitives).
+
+## Common problems
+
+| Symptom | Cause | Fix |
 |---|---|---|
-| The surface is cut off, or paints behind its neighbour | it is still a descendant of a clipping or stacking ancestor | wrap it in `Portal` |
-| The surface appears in the top-left corner for one frame | it was placed from a size that had not been measured yet | keep it `visibility: hidden` until the placement exists |
-| The surface closes the instant it opens | the dismissal ran on the bubble leg, or the trigger was not excluded | listen with `ListenerOptions::CAPTURE`, and exclude the trigger |
-| The surface lands far below and to the right on a high-density display | device pixels were written as an inline CSS length | divide by `NodeRef::scale()` |
-| Tab leaves an open dialog | no trap, or the guard was dropped | hold the `FocusTrap` for as long as the dialog is open |
-| Focus does not return to the trigger | the trap was installed without `restore` | use `FocusTrapOptions::MODAL` |
-| One Escape closes two surfaces | neither listener stopped the event | call `ev.stop_propagation()` in the innermost |
-| A listener on the trigger's parent never hears the surface's clicks | the portal moved the content, so the path goes up through the band | pass a signal or a callback prop |
+| surface is cut off or paints behind a neighbour | still inside a clipping or stacking ancestor | wrap it in `Portal` |
+| surface flashes in the top-left corner | placed before it was measured | keep it `visibility: hidden` until placed |
+| surface closes as soon as it opens | dismissal in the bubble phase, or trigger not excluded | use `ListenerOptions::CAPTURE` and exclude the trigger |
+| surface is far off on a high-density display | device pixels written as CSS pixels | divide by `NodeRef::scale()` |
+| Tab leaves an open dialog | no trap, or the guard was dropped | hold the `FocusTrap` while open |
+| focus does not return to the trigger | trap without `restore`, or focus had already left the surface | use `FocusTrapOptions::MODAL` |
+| one Escape closes two surfaces | nothing stopped the event | stop it in the innermost surface; use `stop_immediate_propagation` on the window root |
+| a listener on the trigger's parent never sees the surface's clicks | the portal moved the content | pass a signal or callback prop |
+
+## How the overlay layers work
+
+Every window has an `overlay_root` element under its root, with one child per layer
+(`data-layer=content`, `popover`, `modal`, `toast`). They are created before any view is built, and
+the framework's user-agent sheet styles them like this:
+
+```css
+overlay_root                        { display: block; position: fixed; left: 0; right: 0; top: 0;
+                                      width: 100vw; height: 100vh; pointer-events: none;
+                                      z-index: 1000; }
+overlay_root > [data-layer]         { position: absolute; inset: 0; pointer-events: none; }
+overlay_root > [data-layer] > *     { pointer-events: auto; }
+overlay_root > [data-layer=content] { z-index: 10; }
+overlay_root > [data-layer=popover] { z-index: 20; }
+overlay_root > [data-layer=modal]   { z-index: 30; }
+overlay_root > [data-layer=toast]   { z-index: 40; }
+```
+
+Because the overlay root has `z-index: 1000`, application chrome with a higher `z-index` paints
+above every overlay.
 
 ## Next
 

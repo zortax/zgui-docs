@@ -1,95 +1,114 @@
 ---
 title: Reactive internals
-description: The arena the reactive graph lives in, how a subscription is recorded, what the flush does, and how cross-thread work requests a frame.
+description: How zgui-reactive wraps reactive_graph — signal storage, subscriptions, marking and the flush, waking from other threads, owners, task cancellation, conditional branches, and Selector.
 ---
 
-This page is the inside of `zgui-reactive`: where the graph is stored, what a write actually
-touches, what the flush polls, and the edge that turns cross-thread work into a redraw request. It
-assumes [the guide](/docs/learn/signals) and
-[the frame](/docs/architecture/the-frame).
+`zgui-reactive` holds zgui's signals, memos, effects and owners, and the executor that runs effects.
+A signal write only marks the observers that depend on it. The marked effects run later, in the
+`f.flush` step of [the frame](/docs/architecture/the-frame), after input, timers and animations and
+before the restyle. Effects that run there change the document, and the later stages of the same
+frame style, lay out and paint the result.
 
-## The facade and the engine
+The sections below follow a value through the system: where it is stored, how a read subscribes,
+what a write marks, what the flush runs, and how owners free it all again. The user-facing model is
+in [Signals](/docs/learn/signals).
 
-zgui does not implement a reactive engine. It pins one and wraps it.
+## Engine and facade
 
-| Layer | Crate | What it is |
+zgui does not implement its own reactive engine. It pins one and wraps it.
+
+| Layer | Crate | Role |
 |---|---|---|
-| engine | `reactive_graph` `=0.2.14`, features `["effects"]` | The graph, the arena, the ownership tree |
-| engine | `reactive_stores` `=0.4.3` | Per-field reactivity over a struct |
-| facade | `zgui-reactive` | The whole reactive surface of the framework |
-| view | `zgui-view` | Re-exports a subset through its prelude |
+| engine | `reactive_graph` `=0.2.14`, feature `effects` | the graph, the arena, owners |
+| engine | `reactive_stores` `=0.4.3` | per-field reactivity for structs |
+| facade | `zgui-reactive` | the framework's whole reactive API |
+| view | `zgui-view` | re-exports a subset in its prelude |
 | umbrella | `zgui` | `pub use zgui_reactive as reactive;` |
 
-`zgui-reactive` is the only crate in the workspace permitted to name `reactive_graph`,
-`reactive_stores`, `any_spawner` or `send_wrapper`. The rule is written in
-`crates/zgui-reactive/Cargo.toml` and the versions are pinned in the workspace manifest. One crate
-names the engine, so the engine's version, its feature set and the handful of its APIs that are
-wrong for a user interface are decided once.
+`zgui-reactive` is the only crate allowed to name `reactive_graph`, `reactive_stores`,
+`any_spawner` or `send_wrapper` (stated in its `Cargo.toml`). The versions are pinned in the
+workspace manifest.
 
-Two engine features matter by their absence. `nightly` is off, so a signal is read as `count.get()`
-and never as `count()`; turning it on deletes the conversions that let a component property accept
-a closure, and `crates/zgui-reactive/src/canary.rs` has a test that fails first when that happens.
-`sandboxed-arenas` is off, which is why the arena below is one map for the process rather than one
-per thread.
+Two engine features are off:
 
-## What a signal handle is
+- **`nightly`.** Signals are read with `count.get()`, never `count()`. Enabling it would remove the
+  conversions that let a component property accept a closure; a canary test in
+  `crates/zgui-reactive/src/canary.rs` fails first if that happens.
+- **`sandboxed-arenas`.** With it off, there is one arena for the whole process, not one per thread.
+
+## Signal storage
 
 <FlowDiagram
   label="What an RwSignal handle resolves to"
   items={[
     {
       title: 'RwSignal<T, S>',
-      description: 'A Copy slotmap key, plus a Location in debug builds.',
+      description: 'A Copy slotmap key (plus a Location in debug builds).',
       next: 'Wraps',
     },
     {
       title: 'ArenaItem<ArcRwSignal<T>, S>',
-      next: 'Carries a NodeId: an index and generation counter',
+      next: 'Holds a NodeId: index and generation',
     },
     {
       title: 'SlotMap<NodeId, Box<dyn Any + Send + Sync>>',
-      description: 'One process-wide map resolves the NodeId.',
-      next: 'Downcast to ArcRwSignal<T>, or SendWrapper<ArcRwSignal<T>>',
+      description: 'One process-wide map.',
+      next: 'Downcast to ArcRwSignal<T> or SendWrapper<ArcRwSignal<T>>',
     },
     {
       title: 'ArcRwSignal<T>',
       details: [
-        'value: Arc<RwLock<T>> — the value',
-        'inner: Arc<RwLock<SubscriberSet>> — who reads it',
+        'value: Arc<RwLock<T>>',
+        'inner: Arc<RwLock<SubscriberSet>>',
       ],
     },
   ]}
 />
 
-The arena, in full:
-
 ```rust
 // reactive_graph/src/owner/arena.rs
-new_key_type! { pub struct NodeId; }
 pub type ArenaMap = SlotMap<NodeId, Box<dyn Any + Send + Sync>>;
 static MAP: OnceLock<RwLock<ArenaMap>> = OnceLock::new();
 ```
 
-A slotmap key carries an index and a generation counter. A key whose slot was freed and then reused
-does not resolve, so `ArenaItem::is_disposed` is exactly `!arena.contains_key(self.node)`, and a
-handle to a disposed value fails a lookup rather than reading somebody else's value. Every
-arena-backed read takes a read lock on that one map; every creation and every disposal takes a
-write lock.
+A slotmap key includes a generation counter, so a key whose slot was freed and reused no longer
+resolves. A handle to a disposed value fails its lookup instead of reading another value. Reads take
+a read lock on the map; creation and disposal take a write lock.
 
-That is what makes the handles `Copy`. `RwSignal<T>` is a key, not a pointer, so it moves into as
-many closures as a view needs without a clone and without a lifetime.
+Because handles are keys, not pointers, they are `Copy` and can be moved into any number of closures
+without cloning.
 
-| Handle | Storage | Freed when |
+| Handles | Storage | Freed when |
 |---|---|---|
-| `RwSignal`, `ReadSignal`, `WriteSignal`, `Memo`, `Signal`, `Trigger`, `StoredValue`, `Callback`, `Store`, `Field` | arena | its owner is disposed of |
-| `ArcRwSignal`, `ArcReadSignal`, `ArcWriteSignal`, `ArcMemo`, `ArcSignal`, `ArcTrigger`, `ArcField` | reference counted | the last handle is dropped |
+| `RwSignal`, `ReadSignal`, `WriteSignal`, `Memo`, `Signal`, `Trigger`, `StoredValue`, `Callback`, `Store`, `Field` | arena | their owner is disposed |
+| `ArcRwSignal`, `ArcReadSignal`, `ArcWriteSignal`, `ArcMemo`, `ArcSignal`, `ArcTrigger`, `ArcField` | reference counted | the last clone is dropped |
 
-The `Arc` forms skip the arena entirely. That is not only a lifetime difference: it is up to four
-fewer lock acquisitions per read, as the cost table at the end shows.
+`Arc` handles bypass the arena, which saves up to four lock acquisitions per read (see
+[Costs](#costs)). They also live independently of any owner. zgui uses this for window state: the
+size, scale, focus, occlusion, maximized and fullscreen signals behind a `WindowHandle` are
+`ArcRwSignal`s, so they stay valid as long as the handle does, even after the component that opened
+the window unmounts.
 
-### Node identity inside the graph
+### `SyncStorage` and `LocalStorage`
 
-The graph itself does not use `NodeId`. It uses two type-erased handles:
+Arena slots are `Box<dyn Any + Send + Sync>`. The `Storage` type parameter is how a value that is
+not `Send`/`Sync` gets in:
+
+| | `SyncStorage` (default) | `LocalStorage` |
+|---|---|---|
+| Stored as | `T` | `SendWrapper<T>` |
+| Bound on `T` | `Send + Sync + 'static` | `'static` |
+| Readable from | any thread | the creating thread only |
+| Constructors | `new`, `signal`, `derive` | `new_local`, `signal_local`, `derive_local` |
+
+The thread check happens on each read, in `LocalStorage::try_with`: `SendWrapper` panics if it is
+dereferenced on a different thread than it was created on. `provide_local_context` uses the same
+mechanism and wraps its value in a private newtype so it cannot collide with `provide_context` of the
+same type. `Trigger` and `ArcTrigger` store no value and are not generic over storage.
+
+### Graph edges
+
+The graph uses type-erased handles, not `NodeId`:
 
 ```rust
 // reactive_graph/src/graph/source.rs, subscriber.rs
@@ -97,28 +116,26 @@ pub struct AnySource(pub(crate) usize, pub(crate) Weak<dyn Source + Send + Sync>
 pub struct AnySubscriber(pub usize, pub Weak<dyn Subscriber + Send + Sync>);
 ```
 
-The `usize` is the address of the reference-counted inner state, and it is what `Hash` and `Eq`
-use. Both directions are weak. Every graph operation is therefore an upgrade that may fail, and a
-node that has gone away leaves dead edges rather than dangling ones — nothing has to walk the graph
-to remove them.
+The `usize` is the address of the inner state and is used for `Hash` and `Eq`. Both directions are
+weak references, so a node that goes away leaves dead edges, not dangling ones, and nothing has to
+walk the graph to remove them.
 
-## Subscription
+## Tracking reads
 
-A *tracking context* is a run of some closure the reactive system performed itself: an effect body,
-a memo body, a reactive hole in a view. While that run is in progress, one thread-local names it.
+A **tracking context** is a run of a closure the reactive system started: an effect, a memo, or a
+reactive hole in a view. During that run, a thread-local holds the current observer:
 
 ```rust
 // reactive_graph/src/graph/subscriber.rs
 thread_local! {
     static OBSERVER: RefCell<Option<ObserverState>> = const { RefCell::new(None) };
 }
-struct ObserverState { subscriber: AnySubscriber, untracked: bool }
 ```
 
-`AnySubscriber::with_observer` replaces that slot for the length of a call and restores it on drop,
-including on unwind. Nesting is therefore free and correct.
+`AnySubscriber::with_observer` sets it for the duration of a call and restores the previous value
+on drop, including during unwinding, so nesting works.
 
-A read records the dependency:
+A tracked read adds two edges:
 
 ```rust
 // reactive_graph/src/traits.rs
@@ -128,129 +145,82 @@ impl<T: Source + ToAnySource + DefinedAt> Track for T {
         if let Some(subscriber) = Observer::get() {
             subscriber.add_source(self.to_any_source());   // forward edge
             self.add_subscriber(subscriber);               // back edge
-        } else {
-            // debug builds only: the "outside a reactive tracking context" diagnostic
         }
+        // else, debug builds only: "outside a reactive tracking context" diagnostic
     }
 }
 ```
 
-Two edges, one in each direction, and both are needed. The back edge is what a write walks to mark.
-The forward edge is what the flush walks to decide whether a marked observer really has to run, and
-what the next run walks to unsubscribe.
+| Edge | Direction | Used by |
+|---|---|---|
+| back edge | source → subscriber | a write, to mark observers |
+| forward edge | subscriber → source | the flush, to check whether a marked observer must run; the next run, to unsubscribe |
 
-`Read::try_read` reduces to `track()` followed by `try_read_untracked()`, and `Get`, `With` and
-`Read` all blanket down to it. So `get()` is one subscription and one read, and `get_untracked()`
-is the read alone. There is no third path.
+`get()` is `track()` plus an untracked read; `get_untracked()` is the read alone. `With` and `Read`
+reduce to the same two paths.
 
 <Callout type="info">
-When no observer is current, debug builds print a diagnostic to standard error naming the read site
-and the site the signal was defined at. It is an `eprintln!`, it is absent from release builds, and
-it is easy to lose in other output — which is why the guide treats a read outside a tracking
-context as a silent mistake. `enter_non_reactive_zone` suppresses that message and **nothing else**:
-`SpecialNonReactiveZone::is_inside` is read only in the branch above where there is no observer, so
-a read inside a zone with an observer current still subscribes. To not subscribe, use an
-`_untracked` method.
+A read with no current observer prints a diagnostic to stderr in debug builds only. Wrapping code in
+`enter_non_reactive_zone` suppresses that message **and nothing else**: a read inside the zone still
+subscribes if an observer is current. To avoid subscribing, use an `_untracked` method.
 </Callout>
 
-### The two sets
+Both edge sets (`SourceSet`, `SubscriberSet`) are insertion-ordered `IndexSet`s.
+`SubscriberSet::unsubscribe` uses `shift_remove` so that order is preserved: nested effects are
+created in order, and an inner effect may assume the outer one has already run in this pass.
 
-```rust
-// reactive_graph/src/graph/sets.rs
-type FxIndexSet<T> = IndexSet<T, BuildHasherDefault<FxHasher>>;
-pub struct SourceSet(FxIndexSet<AnySource>);       // what one subscriber reads
-pub struct SubscriberSet(FxIndexSet<AnySubscriber>); // who reads one source
-```
+### Re-running an effect
 
-Both preserve insertion order. `SubscriberSet::unsubscribe` uses `shift_remove` rather than
-`swap_remove`, and the engine says why: nested effects are created in order, and an inner effect may
-assume the outer one has already run this pass. Reordering the set breaks that.
-
-### Replacing the dependency set
-
-An effect's task body is the whole update protocol:
+An effect's task loop is the whole update protocol:
 
 ```rust
 // reactive_graph/src/effect/render_effect.rs
 while rx.next().await.is_some() {
-    if !owner.paused()
-        && subscriber.with_observer(|| subscriber.update_if_necessary())
-    {
+    if !owner.paused() && subscriber.with_observer(|| subscriber.update_if_necessary()) {
         subscriber.clear_sources(&subscriber);
         let old_value = mem::take(&mut *value.write().or_poisoned());
-        let new_value = owner.with_cleanup(|| {
-            subscriber.with_observer(|| fun(old_value))
-        });
+        let new_value = owner.with_cleanup(|| subscriber.with_observer(|| fun(old_value)));
         *value.write().or_poisoned() = Some(new_value);
     }
 }
 ```
 
-`clear_sources` takes the whole `SourceSet` and calls `remove_subscriber` on every source in it.
-The run that follows re-subscribes through `track`. The dependency set is **rebuilt, not diffed**:
-the cost of one run is one removal per old dependency plus one insertion per new one. A closure that
-read three signals on one run and one on the next ends holding exactly one.
+- `clear_sources` drops every old dependency, and the run re-subscribes through `track`.
+  Dependencies are **rebuilt, not diffed**: a closure that read three signals last time and one this
+  time ends with one.
+- `owner.with_cleanup` disposes the effect's owner before running. Cleanups registered in an effect
+  therefore run before its next run, and signals created inside the effect are freed then.
 
-`owner.with_cleanup` is `cleanup()` and then `with()`. The effect disposes of its own owner before
-every re-run, which is why a cleanup registered inside an effect runs before that effect's next run,
-and why a signal created inside an effect body is freed at the start of the next one.
+## Marking on write
 
-## Marking versus running
-
-A write does not run anything. It moves flags, and it puts one bit into a notification.
+A write runs nothing. It updates node states and sets one bit in each affected effect's notification
+channel.
 
 ```rust
 // reactive_graph/src/graph/node.rs
 pub enum ReactiveNodeState { Clean, Check, Dirty }
 ```
 
-| State | Meaning | Set by |
-|---|---|---|
-| `Clean` | No source changed, or one did and this value did not | the node itself, after it recomputes |
-| `Check` | A source may have changed; this node does not know yet | `mark_check` from a source that was itself marked |
-| `Dirty` | A source definitely changed | `mark_dirty` from a source's own write |
+| State | Meaning |
+|---|---|
+| `Clean` | Up to date. |
+| `Check` | A source may have changed. |
+| `Dirty` | A source definitely changed. |
 
-The propagation has two speeds:
+Propagation:
 
-<Steps>
-
-<Step>
-
-**The write.** `set` takes a write guard; dropping the guard calls `Notify::notify`, which is
-`mark_dirty`. For a signal that is `mark_subscribers_check`: clone the `SubscriberSet` and call
-`mark_dirty` on every direct subscriber. A signal holds no state of its own — it has no computed
-value that could be stale.
-
-</Step>
-
-<Step>
-
-**One edge of `Dirty`.** A memo marked dirty sets its own state to `Dirty` and then calls
-`mark_check` on *its* subscribers.
-
-</Step>
-
-<Step>
-
-**The rest of the way as `Check`.** `mark_check` sets a node to `Check` unless it is already
-`Dirty`, and propagates `mark_check` onward. So `Dirty` travels exactly one edge and `Check`
-travels the remainder of the observer sub-graph.
-
-</Step>
-
-<Step>
-
-**The task.** At the end of every chain is an effect. `EffectInner::mark_dirty` sets `dirty = true`
-and notifies its channel; `mark_check` only notifies. Notifying is where a write stops.
-
-</Step>
-
-</Steps>
+1. **The write.** Dropping the write guard calls `mark_dirty` on every direct subscriber of the
+   signal.
+2. **One `Dirty` edge.** A memo marked dirty sets itself to `Dirty` and calls `mark_check` on its
+   own subscribers.
+3. **`Check` for the rest.** `mark_check` sets `Check` (unless already `Dirty`) and continues. So
+   `Dirty` travels one edge and `Check` covers the rest of the observer graph.
+4. **The effect.** Each chain ends at an effect. `mark_dirty` sets its `dirty` flag and notifies its
+   channel; `mark_check` only notifies.
 
 ### The ready set
 
-There is no list of dirty nodes for the flush to scan. The ready set is the task pool's own queue,
-fed by one single-slot channel per effect:
+There is no list of dirty nodes. Each effect has a single-slot channel:
 
 ```rust
 // reactive_graph/src/channel.rs
@@ -261,34 +231,25 @@ impl Sender {
 }
 ```
 
-The slot is one bit. `Receiver::poll_next` swaps it back to `false` when the task runs. **A signal
-written a thousand times between two flushes therefore costs one re-run, not a thousand**, and no
-batching API is needed to get that.
+The slot is one bit, cleared when the task polls. **Writing a signal a thousand times between two
+flushes causes one re-run**, so no batching API is needed.
 
-Waking pushes the task into the thread's pool:
+Waking puts the task into the UI thread's `futures` `LocalPool`
+(`crates/zgui-reactive/src/executor/pool.rs`). Its internal `FuturesUnordered` keeps a queue of
+woken tasks; that queue is the ready set.
 
-```rust
-// futures::executor::LocalPool, held in crates/zgui-reactive/src/executor/pool.rs
-pool: FuturesUnordered<LocalFutureObj<'static, ()>>,
-incoming: Rc<RefCell<Vec<LocalFutureObj<'static, ()>>>>,
-```
+### Deciding whether an effect runs
 
-`FuturesUnordered` keeps an intrusive queue of the tasks whose wakers have fired. That queue is the
-ready set, and `flush` polls it and nothing else.
+A woken effect first calls `update_if_necessary()`. If it is `dirty`, it runs. Otherwise it asks
+each source the same question. A memo answers by recomputing (when `Dirty`, or when a source says
+it changed while the memo is `Check`) and returns whether its **new value differs** from the old
+one.
 
-### Deciding at the poll rather than at the write
+So a memo that recomputes to an equal value stops propagation, and an effect that was only `Check`
+does not run. `Memo::new` requires `T: PartialEq`; `Memo::new_with_compare` takes a custom
+comparison.
 
-The task's first act is `update_if_necessary()`. For an effect: if `dirty`, clear it and answer
-`true`; otherwise walk the `SourceSet` and ask each source the same question. A memo answers by
-recomputing when its own state is `Dirty`, or when one of its own sources answers `true` while it is
-`Check` — and it returns whether the **new value differs from the old one**.
-
-So a memo whose recomputed value compares equal answers `false`, and an effect that was only
-`Check` never runs its closure. `Memo::new` requires `T: PartialEq`;
-`Memo::new_with_compare` takes the comparison as a function pointer instead.
-
-Marking is pushed eagerly and cheaply; the decision to run is pulled at the poll. That split is why
-a write inside a listener costs a few flag stores rather than a cascade of work.
+Marking is eager and cheap; the decision to run is made lazily, when the task is polled.
 
 ## The flush
 
@@ -296,120 +257,74 @@ a write inside a listener costs a few flag stores rather than a cascade of work.
 // crates/zgui-reactive/src/executor/frame.rs
 pub fn flush() -> FlushOutcome;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FlushOutcome {
     pub needs_another_frame: bool,
     pub budget_exhausted: bool,
 }
 ```
 
-In order:
+Steps:
 
-<Steps>
+1. `assert_ui_thread("flush")` (debug builds).
+2. **Claim the flush.** A thread-local `running` flag guards re-entry. A flush called from inside
+   an effect returns `FlushOutcome::default()` and does nothing; flushes do not nest.
+3. Increment the flush **generation** (used by the iteration budget) and clear the outcome flags.
+4. **Drain posted closures** (those sent with `Ui::post` from other threads), so their writes are
+   settled in this frame. A closure that posts another schedules it for the next flush.
+5. **Poll the pool** inside the configured `PollContext` (the Tokio integration enters its runtime
+   here). The pool also polls tasks woken during the poll. A wake that lands after the pool
+   stalls is caught by polling again, up to three rounds (`MAX_ROUNDS = 3`). If wakes are still
+   arriving after the last round, `needs_another_frame` is set.
+6. **Re-wake deferred tasks** (see the budget below) and set `needs_another_frame` if there were
+   any.
 
-<Step>
-
-`assert_ui_thread("flush")` — a debug-build panic, compiled away in release.
-
-</Step>
-
-<Step>
-
-Claim the flush. `FlushState.running` is a thread-local flag. If it is already set, the call returns
-`FlushOutcome::default()` and does nothing else. A flush from inside an effect is **ignored, not
-nested**: the pool cannot be borrowed twice, and a nested executor is a panic one layer down.
-
-</Step>
-
-<Step>
-
-Increment `generation` and clear both outcome flags. The generation is what the iteration budget is
-charged against.
-
-</Step>
-
-<Step>
-
-Drain the closures queued through `Ui::post`. The queue is removed before a closure runs. A closure
-that posts another closure therefore schedules it for the next flush.
-
-</Step>
-
-<Step>
-
-Enter the configured `PollContext`, then call `pool::poll()`, which is
-`LocalPool::run_until_stalled()`. The Tokio integration uses this context to enter its runtime for
-the complete poll. A `Running` drop guard clears the re-entrancy flag if a task panics.
-
-</Step>
-
-<Step>
-
-Wake the tasks the budget set aside, and set `needs_another_frame` if there were any. Waking them
-re-queues them in the pool without asking the platform for anything.
-
-</Step>
-
-<Step>
-
-Return the outcome.
-
-</Step>
-
-</Steps>
-
-A task that panics propagates the panic to the caller of `flush` and leaves the executor usable: the
-next flush polls what is left.
+A drop guard clears `running` if a task panics. The panic propagates to the caller, and the next
+flush continues with the remaining tasks.
 
 ### The iteration budget
 
-Polling "until nothing is ready" does not terminate when two effects write each other's sources.
-Each write makes the other ready again, inside a single flush, with no frame presented and nothing
-logged.
+Two effects that write each other's sources would keep each other ready forever inside one flush.
+The budget caps that:
 
 ```rust
 // crates/zgui-reactive/src/executor/budget.rs
 pub(crate) const BUDGET: u32 = if cfg!(debug_assertions) { 32 } else { 8 };
 ```
 
-The cap is **per task, per flush**. It is charged in `WakeThrough::poll`
-(`crates/zgui-reactive/src/executor/through.rs`), which asks `TaskBudget::admit(frame::generation())`
-before touching the inner future. A generation that does not match resets the count, so the budget
-is fresh every flush.
+The cap is **per task, per flush**. `WakeThrough::poll` (`executor/through.rs`) checks
+`TaskBudget::admit(generation)` before polling. A new generation resets the count.
 
-| Admission | When | What happens |
+| Admission | When | Effect |
 |---|---|---|
-| `Run` | polls so far are within the cap | poll the inner future |
-| `Defer` | first poll over the cap this flush | report once at `error` level, hand the waker to `frame::defer`, return `Pending` |
-| `AlreadyDeferred` | later polls over the cap this flush | return `Pending` silently |
+| `Run` | within the cap | poll the task |
+| `Defer` | first poll over the cap in this flush | log once at `error` level, set the task aside, return `Pending` |
+| `AlreadyDeferred` | later polls over the cap | return `Pending` silently |
 
-The report names the file and line the task was spawned at when the task went through this crate's
-own `spawn` or `spawn_local`; effects spawned by the engine have no location and get the generic
-message. Debug builds allow more polls than release builds on purpose: a chatty dependency chain
-should be diagnosed rather than truncated while it is being investigated, and a shipped frame still
-has to present.
+The log names the spawn location for tasks spawned through `zgui-reactive`'s `spawn` or
+`spawn_local`. Debug builds allow more polls so that a long dependency chain can be diagnosed rather
+than cut short. Correct code is polled once or twice per flush and never reaches the cap.
 
-An ordinary task is polled once or twice per flush, so correct code never approaches the cap.
+### Where the runtime flushes
 
-### What the outcome reports, and who reads it
+Applications never call `install` or `flush` directly. `App::into_handler` installs the executor
+(`crates/zgui-runtime/src/app.rs`), and the runtime flushes:
 
-| Field | True when | Read by |
-|---|---|---|
-| `needs_another_frame` | a wake was raised while this flush was running, or the budget set a task aside | `crates/zgui-runtime/src/window/frame.rs:285`, combined with three other reasons into one redraw request; and `crates/zgui-runtime/src/window/input.rs:70` |
-| `budget_exhausted` | at least one task exceeded the cap | nothing in the runtime; it is the programmatic form of the logged error |
+- once per frame (`window/frame.rs`);
+- between queued input events (`window/input.rs`), so the second event sees the first one's
+  effects;
+- after delivering geometry observations (`window/observe.rs`);
+- inside the scroll animation (`window/scroll/mod.rs`);
+- once more when the runtime is dropped, after closing every window.
 
-An application calls neither `install` nor `flush`. `App::into_handler` installs
-(`crates/zgui-runtime/src/app.rs`), and the flush runs from four places: once per frame in
-`window/frame.rs`, between input events in `window/input.rs`, after an observation delivery in
-`window/observe.rs`, and inside the scroll animation in `window/scroll/mod.rs`.
+[The frame](/docs/architecture/the-frame) explains why each of these sites needs its own flush.
+`needs_another_frame` is folded into the frame's redraw request. `budget_exhausted` is not read by
+the runtime; it is the programmatic form of the logged error.
 
-## The wake edge
+## Waking from another thread
 
-The task pool's own waker unparks the thread it lives on. The UI thread instead waits in the
-platform event loop. Without a second wake edge, a task that becomes ready on another thread does
-not cause a frame.
-
-So every spawned task is polled through a composite waker:
+The pool's own waker only queues a task. The UI thread, however, sleeps in the platform event loop,
+so a task made ready by another thread also has to wake that loop. Every spawned task is therefore
+polled with a composite waker:
 
 ```rust
 // crates/zgui-reactive/src/executor/through.rs
@@ -423,38 +338,37 @@ impl ArcWake for Composite {
 }
 ```
 
-`frame::note_wake` answers whether a flush is running. If one is, it records
-`needs_another_frame` and the ping is suppressed: an effect writing a signal must not ask the
-platform for a redraw from inside the frame that is already running, once per write.
-
-The whole path:
+`frame::note_wake` returns true while a flush is running, and records the wake so the flush polls
+again. In that case no platform wake is sent: an effect that writes a signal must not request a
+redraw from inside the frame that is already running. It also returns true on a thread that is
+being torn down.
 
 <FlowDiagram
   label="How background work wakes the event loop"
   items={[
     {
-      title: 'Worker thread · background future completes',
+      title: 'Worker thread: background future completes',
       next: 'Send the result to the waiting UI task',
     },
     {
-      title: "The task's one-shot receiver",
-      description: 'Mark the task ready and wake it.',
+      title: "The UI task's receiver",
+      description: 'Marks the task ready and wakes it.',
       next: 'Composite::wake_by_ref',
     },
     {
       title: 'Composite::wake_by_ref',
       details: [
-        "pool.wake_by_ref() — queue the task on the UI thread's pool",
-        'target.ping() — only when no flush is running',
+        "pool.wake_by_ref(): queue the task on the UI thread's pool",
+        'target.ping(): only when no flush is running',
       ],
-      next: 'Follow the WakeTarget installed for this thread',
+      next: 'The FrameWaker installed for this thread',
     },
     {
       title: 'RuntimeWaker::wake',
       code: 'crates/zgui-runtime/src/wake.rs',
       details: [
-        'If a frame is in flight, record one owed frame and stop',
-        'Otherwise call platform.wake(ReactiveWork { surfaces })',
+        'If a frame is in progress, record one owed frame',
+        'Otherwise ask the platform to wake (ReactiveWork { surfaces })',
       ],
       next: 'Wake the event loop',
     },
@@ -465,7 +379,7 @@ The whole path:
   ]}
 />
 
-### The contract
+### The `FrameWaker` contract
 
 ```rust
 // crates/zgui-reactive/src/executor/wake.rs
@@ -475,39 +389,29 @@ pub trait FrameWaker: Send + Sync + 'static {
 pub fn set_frame_waker(waker: Arc<dyn FrameWaker>);
 ```
 
-| Guarantee | Why |
-|---|---|
-| Callable from any thread | The wake arrives from wherever the work finished |
-| Must not block | It runs on that thread, inside whatever finished |
-| Must not assume a current owner or the UI thread | Neither exists on a worker thread |
-| Idempotent | A hundred wakes between two frames must cost one frame |
+An implementation must be callable from any thread, must not block, must not assume an owner or
+the UI thread, and must be idempotent: many wakes between two frames should cost one frame.
 
-The target is a thread-local `Arc<WakeTarget>` created eagerly and shared by every composite waker
-built on that thread, so installing a waker *after* effects already exist still reaches them.
+The composite wakers on a thread share one `WakeTarget`, created eagerly, so a waker installed after
+effects already exist still reaches them.
 
-`RuntimeWaker` is the implementation the framework installs, in `crates/zgui-runtime/src/app.rs`.
-It holds the surfaces the wake concerns: an image decoding for one window is not a reason to redraw
-another. Its idempotence comes from `FrameGate`, two atomic booleans shared with the frame loop. A
-test asserts the shape directly: a thousand in-frame wakes produce zero platform requests and
-exactly one owed frame (`a_wake_inside_a_frame_is_owed_rather_than_sent`,
-`crates/zgui-runtime/src/wake.rs`).
+The runtime installs `RuntimeWaker`, which records which surfaces a wake concerns and coalesces wakes
+through its `FrameGate`; [the frame](/docs/architecture/the-frame) describes both. The test
+`a_wake_inside_a_frame_is_owed_rather_than_sent` asserts that a thousand wakes during a frame produce
+no platform requests and one owed frame.
 
-Note the two suppressions on that path, and that they are at different layers. `frame::note_wake`
-suppresses inside the reactive layer, for wakes raised while a flush is running. `FrameGate`
-suppresses inside the runtime, for anything raised anywhere in a frame — a mutation closing its
-batch, a timer's callback, an observation delivery. Each converts many requests into one.
+Two separate checks suppress wakes: `note_wake` in the reactive layer (wakes during a flush) and
+`FrameGate` in the runtime (wakes from anywhere during a frame, such as a timer or a mutation).
 
 <Callout type="warn">
-Until `set_frame_waker` is called, a task woken from another thread is queued and nothing asks for
-the frame that would poll it. A host that drives the pipeline itself, rather than through
-`zgui-runtime`, must install one or it updates only when something else already caused a frame.
-`TestWaker` is a counting implementation for tests and headless harnesses: `count()` reads it,
-`take()` reads and resets.
+Until `set_frame_waker` is called, a task woken from another thread is queued but nothing requests
+the frame that would poll it. A host that drives the pipeline itself must install a waker.
+`TestWaker` counts wakes for tests: `count()` reads, `take()` reads and resets.
 </Callout>
 
-## Owners and arenas
+## Owners
 
-An owner is the unit of "this went away".
+An owner is the unit of disposal.
 
 ```rust
 // reactive_graph/src/owner.rs
@@ -521,59 +425,25 @@ pub(crate) struct OwnerInner {
 }
 ```
 
-Creating an arena-backed handle inserts into the arena and then pushes the `NodeId` onto the current
-owner's `nodes`:
+Creating an arena-backed handle inserts it into the arena and registers its `NodeId` with the
+current owner. **With no current owner, the value is never freed**, and nothing reports it. Only four
+APIs assert that an owner exists: `provide_context`, `provide_local_context`, `on_cleanup_local` and
+`Selector::is_selected`. `RwSignal::new` does not.
 
-```rust
-// reactive_graph/src/owner/arena_item.rs
-let node = Arena::with_mut(|arena| arena.insert(Box::new(S::wrap(value)) as Box<dyn Any + Send + Sync>));
-OWNER.with(|o| {
-    if let Some(owner) = o.borrow().as_ref().and_then(|o| o.upgrade()) {
-        owner.register(node);
-    }
-});
-```
+Disposal always runs in this order:
 
-With no current owner the second half does nothing. The entry is in the arena, it works forever, and
-it is never removed. No panic and no log. Four published APIs guard against that case with
-`assert_owner`, and they are the complete list: `provide_context`, `provide_local_context`,
-`on_cleanup_local` and `Selector::is_selected`. `RwSignal::new` is **not** one of them.
+1. Take `cleanups`, `nodes` and `children` out under one write lock.
+2. Dispose every child, recursively.
+3. Run cleanups in registration order.
+4. Remove all the owner's `NodeId`s from the arena under one write lock.
 
-Disposal is one function and always the same order:
+Contexts are stored in the owner's map keyed by `TypeId`, and lookups walk toward the root. Because
+the key is only the type, provide a newtype rather than a bare `String` or `u32`.
 
-<Steps>
+Debug builds log an `error` (without panicking) when an owner chain exceeds `MAX_OWNER_DEPTH = 4096`
+or one owner exceeds `MAX_OWNER_CHILDREN = 1024` children.
 
-<Step>
-
-Take `cleanups`, `nodes` and `children` out of the owner under one write lock, so a cleanup that
-touches the owner finds it readable rather than already borrowed.
-
-</Step>
-
-<Step>
-
-Dispose of every child, recursively.
-
-</Step>
-
-<Step>
-
-Run every cleanup, in registration order.
-
-</Step>
-
-<Step>
-
-Remove every `NodeId` from the arena, under a single arena write lock for the whole batch.
-
-</Step>
-
-</Steps>
-
-### Why disposal is synchronous
-
-`Mounted` is the protocol: one owner per mounted node, and `unmount` disposes of everything before
-it returns.
+### Synchronous disposal with `Mounted`
 
 ```rust
 // crates/zgui-reactive/src/own/mounted.rs
@@ -588,265 +458,193 @@ impl Mounted {
 }
 ```
 
-Letting the effects behind a node's bindings drop their own scopes instead would defer every cleanup
-by one poll of the executor. That is one frame in which an unmounted node's cleanups have not run: a
-timer firing into a disposed scope, a row still holding its slot in a shared table, an observer
-reporting geometry for a node that is gone. Reading an arena-backed handle after its owner is
-disposed of panics, so the frame in between is not cosmetic.
+Each mounted node has one owner, and `unmount` disposes everything before returning. Deferring
+disposal to the executor would leave a frame in which an unmounted node's timers could still fire,
+its rows still occupy shared tables, and its observers report geometry for a node that is gone. Reading an arena handle after disposal
+panics, so that gap would be a crash.
 
-Two further rules the type carries:
+- `Drop` also disposes, so a scope dropped during a panic is still freed.
+- Cleanups run with **no current owner**. They can also run when the last owner handle is dropped,
+  from anywhere, so a cleanup must capture everything it needs when registered.
 
-- `Drop` disposes as well, so a scope dropped during a panic or by a container that owns it still
-  frees. `unmount` is the intended path; `Drop` is the safety net.
-- A cleanup runs with **no scope current**, deliberately. Cleanups also run when the last handle to
-  an owner is dropped, from anywhere, so a rule that held only on the `unmount` path would be a rule
-  nothing could rely on. Everything a cleanup needs must be captured when it is registered.
+When a window closes, the runtime unmounts its view tree in tree order while the application's scope
+is still alive, then unmounts the window's own scope. When the application ends,
+`zgui_reactive::shutdown()` polls the pool once (so tasks whose effects are gone can finish) and
+drops the remaining tasks, up to eight rounds, before the thread's destructors run. Otherwise
+cleanups in leftover tasks would run after the reactive runtime was gone.
 
-Contexts live in the owner's own `FxHashMap<TypeId, ...>` and a lookup walks towards the root. The
-key is the type and nothing else, which is why a newtype is the rule rather than a suggestion.
+### Bounded child lists with `Scope`
 
-Two debug-build growth alarms report, at `error` level through `tracing`, without panicking:
-`MAX_OWNER_DEPTH = 4096` for the owner chain, and `MAX_OWNER_CHILDREN = 1024` for one owner's child
-count. The second exists because of the next section.
+An owner keeps a weak reference to every child it ever had; dropping a child does not remove the
+entry. A long-lived parent with many short-lived children (a scrolling list, a changing route)
+accumulates one dead entry per child.
 
-## Scope and generation retirement
-
-An owner keeps a weak reference to every child it has ever had, and **dropping a child does not
-remove it**. `children` is a `Vec` that only grows. A long-lived parent with short-lived children —
-a list that scrolls, a table that filters, a route that changes — accumulates one dead entry per
-child ever created, and disposing of that parent eventually costs time proportional to everything it
-has ever held.
-
-`Scope` fixes that by handing members out of a *generation*, and retiring generations in place.
+`Scope` (`crates/zgui-reactive/src/own/scope.rs`) avoids this by creating members inside
+**generations** and dropping spent generations whole:
 
 ```rust
-// crates/zgui-reactive/src/own/scope.rs
 const RETIRE_AFTER: usize = 64;
 
 impl Scope {
-    #[must_use] pub fn new() -> Self;
-    #[track_caller] pub fn mount(&self) -> Mounted;
-    #[must_use] pub fn live(&self) -> usize;
-    #[must_use] pub fn generation_children(&self) -> usize;
-    #[must_use] pub fn generations_created(&self) -> usize;
+    pub fn new() -> Self;
+    pub fn mount(&self) -> Mounted;
+    pub fn live(&self) -> usize;
+    pub fn generation_children(&self) -> usize;
+    pub fn generations_created(&self) -> usize;
 }
 ```
 
-On each release, the newest generation is replaced when it holds more dead members than the whole
-scope holds live ones, with a floor of 64:
+When a member is released, a new generation starts if the newest one holds more dead members than
+the scope holds live ones (minimum 64). Generations that are neither the newest nor occupied are
+then dropped.
 
-```rust
-if current.created.saturating_sub(current.live) > self.live.get().max(RETIRE_AFTER) {
-    generations.push(Generation { id, owner: self.parent.child(), created: 0, live: 0 });
-}
-```
+- Generations are **siblings** under the scope's owner, so dropping one never disposes another.
+- Live members are **never moved**, so a virtualised list that always has rows on screen still
+  retires generations.
+- A generation's owner is dropped only after its last member is gone.
 
-Then every generation that is neither the newest nor still occupied is dropped whole.
-
-Three properties, each load-bearing:
-
-| Property | Consequence if broken |
-|---|---|
-| Generations are **siblings** under the scope's own owner, never nested | Dropping a spent generation would dispose of the one that replaced it, and every live member in it |
-| A live member never delays retirement and is **never moved** | The case that grows fastest — a virtualised list scrolling through a million rows — is also the case that always has rows on screen |
-| A retired generation's owner is dropped only when its last member has gone | It then finds only dead references and cleans nothing |
-
-What is left is one dead entry per *generation* rather than per member.
-`generation_children()` is the number that would have grown without bound;
-`generations_created()` is the residual that still grows, far more slowly. A test mounts and
-unmounts 10 000 members and asserts `generation_children() <= 65`.
+A test mounts and unmounts 10,000 members and asserts `generation_children() <= 65`.
 
 <Callout type="info">
-The `For` component does not use `Scope`. It implements the same policy directly over `Owner`, in
-`crates/zgui-view/src/flow/each/generation.rs`, retiring when a generation's dead count exceeds the
-list's live item count with no floor, and stating its own bound: dead references at most
-`2 × live + generations`. `Scope` is the general form of the idea, published for code that keeps a
-churning sibling set of its own.
+`For` implements the same policy directly over `Owner` in
+`crates/zgui-view/src/flow/each/generation.rs`, with no minimum, bounding dead references at
+`2 × live + generations`.
 </Callout>
 
-## What `Selector` does internally
+## Tasks and cancellation
 
-The problem is one shared piece of state that every row of a list compares against: "which one is
-selected?". Written the obvious way, every row reads the shared `selected` signal and compares it to
-its own key. Every row is therefore a subscriber of that signal, so changing the selection in a
-thousand-row list re-runs a thousand bindings to change two of them.
+Tasks spawned with `spawn` or `spawn_local` are cancelled when the scope that spawned them is
+disposed. Cancellation drops the future (and what it captured) during the unmount itself, not at the
+next flush.
 
-A memo per row is not enough. The memo does stop the row's closure from re-running when its own
-answer is unchanged, so only two closures run — but the shared signal still has a thousand
-subscribers. Every one of those memos is marked, every one of the thousand tasks behind them is
-polled, and every one recomputes its comparison. The work is O(rows) per selection change, and the
-saving is only the body of the binding.
+Each owner that should own tasks holds one `TaskSet` (`crates/zgui-reactive/src/task/set.rs`),
+provided as a local context with a single cleanup that cancels everything in it. Tasks leave the set
+when they finish. One cleanup per spawn would grow without bound: a listener runs in the owner where
+its `on:` binding was written, so a button that spawns on every click would add a cleanup to a
+long-lived component owner on every click.
 
-The engine's `Selector` inverts the graph instead:
+Task sets are installed at the boundaries that should own tasks:
+
+| Boundary | Where |
+|---|---|
+| each component | `Scoped::build` in `crates/zgui-view/src/view/scope.rs` |
+| each window | `crates/zgui-runtime/src/window/mod.rs` |
+| the application | `crates/zgui-runtime/src/app.rs` |
+
+Installing a set per component keeps a spawn from landing in a short-lived effect scope, where every
+later task of the component would be cancelled when that effect re-ran.
+
+When a component is **rebuilt**, its owner is cleaned first, which cancels the previous run's tasks
+and removes the task set with the other cleanups. The rebuild then provides a fresh set, so tasks
+spawned by the new run are cancelled at the next rebuild or at unmount, like the first run's.
+
+The handle `spawn` returns is for cancelling early; dropping it does **not** cancel the task (unlike
+`TimeoutHandle` and `IntervalHandle`). Use `spawn_detached` for work that must outlive its scope.
+
+## Conditional branches
+
+`Show` is built on a gated hole, `Branch` (`crates/zgui-view/src/flow/branch.rs`). It watches a
+small selector value (for `Show`, the boolean condition) and replaces its content only when that
+value changes. A condition that reads a list and checks whether it is empty swaps branches when the
+list becomes empty, and does nothing on ordinary inserts.
+
+Each branch is built in **its own child owner**, which is disposed when the branch is replaced. It
+is not built in the effect's owner, because that owner is cleaned every time the selector re-runs:
+a branch built there would lose what it created (a prop default, a stored value) on every unrelated
+write the selector reads, while its nodes stayed on screen.
+
+When the component around a `Show` is rebuilt, the component's owner is cleaned first, which takes
+the branch's state with it. The new effect starts from the previous selection, so no nodes move, but
+the current branch is **rebuilt in place** in a fresh branch owner so its reactive state exists
+again.
+
+## `Selector`
+
+When every row of a list checks "am I selected?" against a shared selection signal, every row
+subscribes to it, and changing the selection re-runs every row. A memo per row reduces the work to
+the comparison, but every memo is still marked and polled.
+
+The engine's `Selector` keeps one boolean signal per key instead:
 
 ```rust
 // reactive_graph/src/computed/selector.rs
 pub struct Selector<T> where T: PartialEq + Eq + Clone + Hash + 'static {
     subs: Arc<RwLock<FxHashMap<T, ArcRwSignal<bool>>>>,   // one signal per watched key
-    v: Arc<RwLock<Option<T>>>,                            // the last value of the source
+    v: Arc<RwLock<Option<T>>>,                            // last source value
     f: Arc<dyn Fn(&T, &T) -> bool + Send + Sync>,
-    effect: Arc<RenderEffect<T>>,                         // the one subscriber of the source
+    effect: Arc<RenderEffect<T>>,                         // the source's only subscriber
 }
 ```
 
-The source has exactly **one** subscriber: the selector's own internal effect. A row calling
-`selected(&key)` tracks the small `ArcRwSignal<bool>` for its own key and nothing else. When the
-source changes, that effect walks the map once and notifies only the key that matches the new value
-and the key that matched the previous one. Two rows re-run instead of a thousand.
+Each row tracks only the boolean signal for its own key. When the source changes, the selector's
+effect notifies the new and the previous key. Two rows re-run, not all of them.
 
-The walk is proportional to the number of watched keys, and the engine's selector **never removes an
-entry**. Left alone, every key a long-running list ever displayed stays in that map, and the walk
-grows with the history rather than with what is on screen.
+The engine never removes entries from `subs`, so the map grows with every key ever displayed.
+zgui's `Selector` (`crates/zgui-reactive/src/reexport/selector.rs`) adds eviction. `is_selected`
+registers the `(owner, key)` pair once, counts watchers per key, and registers an
+`on_cleanup_local` that decrements the count and removes the key from the engine selector when it
+reaches zero.
 
-So zgui's `Selector` wraps it and adds eviction:
-
-```rust
-// crates/zgui-reactive/src/reexport/selector.rs
-pub struct Selector<K> where K: Eq + Hash + Clone + Send + Sync + 'static {
-    inner: reactive_graph::computed::Selector<K>,
-    watchers: Rc<RefCell<Watchers<K>>>,
-}
-
-struct Watchers<K> {
-    counts: HashMap<K, usize>,               // how many scopes watch each key
-    registered: HashSet<(usize, K)>,         // which (scope, key) pairs are already registered
-}
-```
-
-`is_selected(&key)` calls `watch(key)` and then `inner.selected(key)`. `watch` takes the current
-owner's `debug_id()` as the scope's identity, inserts the `(scope, key)` pair, and returns early if
-the pair was already there — so reading the same key twice in one row registers one cleanup, not
-two. It then bumps the per-key count and registers an `on_cleanup_local` that removes the pair,
-decrements the count, and calls `inner.remove(&key)` when the count reaches zero. A key two rows
-watch survives the first row's unmount.
-
-| Constructor or method | Signature |
+| API | Notes |
 |---|---|
-| `Selector::new` | `pub fn new(source: impl Fn() -> K + Clone + Send + Sync + 'static) -> Self` |
-| `Selector::new_with_fn` | takes `matches: impl Fn(&K, &K) -> bool + Clone + Send + Sync + 'static`, for keys not compared by equality — a path selected when it is a prefix of the current one, a range containing it |
-| `Selector::is_selected` | `pub fn is_selected(&self, key: &K) -> bool` |
-| `Selector::watched_keys` | `pub fn watched_keys(&self) -> usize` — the diagnostic a long-running list's tests should assert on |
+| `Selector::new(source)` | `source: impl Fn() -> K + Clone + Send + Sync + 'static` |
+| `Selector::new_with_fn(source, matches)` | custom match, e.g. path-prefix or range containment |
+| `is_selected(&key) -> bool` | call from the row's own scope |
+| `watched_keys() -> usize` | diagnostic; assert on it in tests of long-running lists |
 
-Measured by the crate's own tests: eight rows, eight first runs, and after a selection change
-exactly two more (`only_the_two_affected_rows_re_run`). Ten thousand mount-and-unmount cycles leave
-`watched_keys() == 0` (`ten_thousand_rows_leave_nothing_behind`).
+Tests: `only_the_two_affected_rows_re_run` (eight rows, two re-runs after a selection change) and
+`ten_thousand_rows_leave_nothing_behind` (`watched_keys() == 0` afterwards).
 
 <Callout type="warn">
-With no current owner, `is_selected` calls `assert_owner("Selector::is_selected")`. That is a debug
-panic. In release builds the assertion compiles away, nothing can evict the entry, and it is kept
-for the life of the selector. Call it from the row's own scope.
-
-`Selector<K>` holds `Rc<RefCell<..>>` internally, so it is not `Send`, even though `K` is required
-to be — that bound comes from the engine.
+`is_selected` with no current owner fails `assert_owner` in debug builds. In release builds the key
+is never evicted. `Selector<K>` uses `Rc<RefCell<..>>` internally and is not `Send`.
 </Callout>
 
-## Storage
+## Engine APIs that are not exported
 
-Every slot in the arena is a `Box<dyn Any + Send + Sync>`, because the map is one map for the
-process. Storage is how a value that is neither `Send` nor `Sync` gets in.
+Compile-fail tests in `crates/zgui-reactive/tests/ui/` assert these engine APIs are unreachable:
 
-```rust
-// reactive_graph/src/owner/storage.rs
-pub trait Storage<T>: Send + Sync + 'static {
-    type Wrapped: StorageAccess<T> + Send + Sync + 'static;
-    fn wrap(value: T) -> Self::Wrapped;
-    fn try_with<U>(node: NodeId, fun: impl FnOnce(&T) -> U) -> Option<U>;
-    fn try_with_mut<U>(node: NodeId, fun: impl FnOnce(&mut T) -> U) -> Option<U>;
-    fn try_set(node: NodeId, value: T) -> Option<T>;
-    fn take(node: NodeId) -> Option<T>;
-}
-```
-
-| | `SyncStorage` | `LocalStorage` |
+| Not exported | Problem | Use instead |
 |---|---|---|
-| `Wrapped` | `T` | `SendWrapper<T>` |
-| Bound on `T` | `Send + Sync + 'static` | `'static` |
-| Downcast target in the arena | `T` | `SendWrapper<T>` |
-| Readable from | any thread | the creating thread only |
-| Constructors | `new`, `signal`, `derive` | `new_local`, `signal_local`, `derive_local` |
+| `Effect::new_sync` | can run off the UI thread, where the document must not be touched | `RenderEffect` |
+| `Effect::new_isomorphic` | for server and client rendering, which zgui does not have | `RenderEffect` |
+| `Owner::on_cleanup` | requires `Send + Sync` closures, which view code rarely has | `on_cleanup_local` |
+| unkeyed store indexing (`StoreFieldIterator`) | re-runs later siblings' observers and panics when the collection shrinks under an observer | `#[store(key: K = ...)]` and `at_key` |
 
-Every handle type is generic over storage and defaults to `SyncStorage`. `Trigger` and `ArcTrigger`
-are the exceptions: they carry no value, so they have nothing to store.
+Also not re-exported:
 
-**The run-time check is not in the handle and not in the arena.** It is in
-`LocalStorage::try_with`, which downcasts the slot to `SendWrapper<T>` and dereferences it.
-`SendWrapper` compares the current thread against the one it was constructed on and panics if they
-differ:
+- `untrack(...)`: use the `_untracked` methods at the read site.
+- `batch(...)`: unnecessary, since writes never run anything synchronously and the one-bit channel
+  coalesces writes.
 
-```text
-Dereferenced SendWrapper<T> variable from a thread different to the one it has been created with.
-```
-
-So the promise is checked per read, and it fires on the first read from the wrong thread rather than
-at creation. The same mechanism backs `provide_local_context`, which parks its value in a private
-`Local<T>(SendWrapper<T>)` newtype so that it cannot collide with a `provide_context` of the same
-type.
-
-## What is deliberately not published
-
-Four engine APIs are unreachable from `zgui-reactive`'s root, and the absence of each is asserted by
-a compile-fail test in `crates/zgui-reactive/tests/ui/`.
-
-| Not published | What it would have done | Use instead |
-|---|---|---|
-| `Effect::new_sync` | Schedules an effect that can run off the UI thread, where it may not touch the document | `RenderEffect` |
-| `Effect::new_isomorphic` | Exists to run on a server as well as a client, which this framework has no notion of | `RenderEffect` |
-| `Owner::on_cleanup` | Requires `impl FnOnce() + Send + Sync`, so the first cleanup capturing anything from a view fails to compile | `on_cleanup_local` |
-| `StoreFieldIterator` (unkeyed store indexing) | Re-runs every later sibling's observers, and panics with `index out of bounds` when the collection shrinks under a live observer | `#[store(key: K = ...)]` and `at_key` |
-
-Two more are never re-exported at all, and the reason is the same each time: the substitute is
-better.
-
-- `untrack(...)` — the `_untracked` method family says the same thing at the read site, where the
-  decision belongs. `enter_non_reactive_zone` is not a substitute; it suppresses a diagnostic.
-- `batch(...)` — unnecessary. A write never runs anything synchronously, and the one-bit
-  notification slot coalesces every write between two flushes into at most one re-run per observer.
-
-The engine crate itself is not re-exported from the root either, so neither is reachable through
-`zgui`. The exception is `zgui_reactive::store::reactive_stores`, which is published at its module
-path because `#[derive(Store)]` expands to `reactive_stores::` paths in the deriving crate.
+The engine crates are not re-exported either, except `zgui_reactive::store::reactive_stores`, which
+`#[derive(Store)]` expands to.
 
 ## Costs
 
-| Operation | What it touches | Proportional to |
+| Operation | Work | Scales with |
 |---|---|---|
-| `get()` on an arena signal, no observer | 2 arena read locks (disposal check, value clone), 1 value read lock, 1 clone of `T` | constant |
-| `get()` on an arena signal, tracked | 4 arena read locks (disposal check, build `AnySource`, add subscriber, value clone), 1 value read lock, 2 set insertions | constant |
-| `get()` on an `ArcRwSignal` | no arena at all: 1 value read lock, plus the same 2 set insertions when tracked | constant |
+| `get()` on an arena signal, untracked context | 2 arena read locks, 1 value read lock, clone of `T` | constant |
+| `get()` on an arena signal, tracked | 4 arena read locks, 1 value read lock, 2 set insertions | constant |
+| `get()` on an `Arc` signal | 1 value read lock (+2 set insertions if tracked) | constant |
 | `get_untracked()` | 1 arena read lock, 1 value read lock | constant |
-| `set()` / `update()` | 2 arena read locks, 1 value write lock, then clone the subscriber set and mark each entry | number of direct subscribers |
-| marking beyond the first edge | one `mark_check` per graph edge reached | size of the observer sub-graph |
-| `flush()` with nothing marked | one thread-local claim, one `run_until_stalled` over an empty queue | nothing |
-| `flush()` with work | one poll per ready task, one `update_if_necessary` walk per task | ready tasks and their dependency sets |
-| one effect re-run | dispose its own owner, unsubscribe every old dependency, run, re-subscribe | old dependencies + new dependencies + what the owner held |
-| disposing an owner | children, then cleanups, then one arena write lock for all its nodes | everything ever registered under it |
+| `set()` / `update()` | 2 arena read locks, 1 value write lock, mark each subscriber | direct subscribers |
+| further marking | one `mark_check` per edge | observer subgraph |
+| `flush()`, nothing ready | one flag check, one poll of an empty queue | constant |
+| `flush()` with work | one poll and one `update_if_necessary` per ready task | ready tasks and their dependencies |
+| one effect re-run | dispose its owner, drop old edges, run, add new edges | old + new dependencies + owned values |
+| disposing an owner | children, cleanups, one arena write lock | everything registered under it |
 
-Three consequences worth stating outright:
+What follows from the table:
 
-- **The `Arc` handle types are the fast read.** Four arena lock acquisitions per tracked read is the
-  price of `Copy`. It is the right trade for a view, where handles are copied into closures
-  constantly and read once per change; it is not the right trade for a hot inner loop.
-- **`maybe_update` is the write that can decline to mark.** Returning `false` calls `untrack` on the
-  guard, so dropping it notifies nobody.
-- **A memo is the only thing that stops propagation.** Everything between a signal and an effect is
-  marked; only a memo can answer "unchanged" and end the walk.
+- `Arc` handles are the faster read. The arena handles' extra locks are the price of `Copy`, which
+  is the right trade in view code but not in a hot loop.
+- `maybe_update` can decline to notify: returning `false` drops the guard without notifying.
+- Only a memo stops propagation, by recomputing to an equal value.
 
-Measured on the framework's own workloads, all from `docs/performance.md`, which is generated by
-`cargo xtask perf`:
-
-| Measurement | Value | What it is |
-|---|---:|---|
-| `kitchen.click` | 11.34 µs | One class toggled on one element, whole frame, 1 851 boxes (band 15.12) |
-| `kitchen.keystroke` | 301.39 µs | One edit: one paragraph reshaped, one box repainted (band 407.40) |
-| `idle.turn` | 0.07 µs | One turn of the loop over a still document, which draws nothing |
-| `idle.frames` | 0.00 | A still document runs no frame at all, so it runs no flush |
-
-The flush is not where a frame's time goes. The profile in `docs/perf/pipeline.md` put "the event
-loop, dispatch, the reactive flush, the cascade, timers, animation, accessibility and
-re-hit-testing together" at **under 4 %** of a click frame. Read that number as history: the click
-frame it was measured against cost 38 ms, and three defects it names have since been fixed. What
-survives is the shape — the reactive layer is a small, bounded phase of a frame, and there is no
-scan of the graph anywhere in it.
+A still document runs no frames at all, so it runs no flushes (`idle.frames` is 0 in
+`docs/performance.md`). Within a frame the reactive phase is small and never scans the whole graph.
+See the [cost model](/docs/performance/cost-model) for whole-frame numbers.
 
 ## Next
 
@@ -854,21 +652,21 @@ scan of the graph anywhere in it.
   <Card
     title="The style engine"
     href="/docs/architecture/style-engine"
-    description="What the elements an effect touched owe next: selector matching, the cascade, and the damage a changed declaration implies."
+    description="What happens to the elements an effect changed: selector matching, the cascade, and damage."
   />
   <Card
     title="The frame"
     href="/docs/architecture/the-frame"
-    description="Where the flush sits in the loop, and the exact four things that wake it."
+    description="Where the flush sits in the loop, and what wakes it."
   />
   <Card
     title="Invalidation"
     href="/docs/architecture/invalidation"
-    description="The obligations a document mutation raises, and how they propagate and retire."
+    description="The dirty bits a document mutation sets, and how they propagate and clear."
   />
   <Card
     title="Cost model"
     href="/docs/performance/cost-model"
-    description="What each kind of change costs across the whole pipeline, measured."
+    description="What each kind of change costs across the whole pipeline."
   />
 </Cards>

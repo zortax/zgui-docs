@@ -1,15 +1,13 @@
 ---
 title: Scrolling
-description: Scroll containers, the offset model, scrollbars, wheel and touch input, programmatic scrolling, and virtualising a long list by hand.
+description: Make an element scroll, scroll to an element from code, react to scrolling, build long virtualised lists, and how wheel, trackpad and touch input scroll.
 ---
 
-A scroll container shows part of content that is larger than the space given to it, and lets the
-user move through the rest. This page covers what makes one, where the offset lives, how input
-reaches it, how to move it from code, and how to build a list of a hundred thousand rows that costs
-the same as a list of thirty. It assumes the [Learn](/docs/learn/views) guide, in particular
-[Layout](/docs/learn/layout) and [Events](/docs/learn/events).
+Content taller or wider than its box can scroll. zgui handles wheel, trackpad, touch and scrollbar
+input for you; your code decides which elements scroll, moves them from code when needed, and keeps
+long lists cheap.
 
-## What makes a scroll container
+## Make an element scroll
 
 ```rust
 use zgui::prelude::*;
@@ -27,450 +25,61 @@ fn Notes() -> impl IntoView {
 }
 
 const SHEET: &str = css!(
-    ".notes      { height: 240px; }
+    ".notes       { height: 240px; }
      .notes__body { padding: 12px; }"
 );
 ```
 
-The framework's own style sheet declares one rule for the `scroll` element:
+A scroll container needs a bounded size, such as `height: 240px` here or a size given by its flex
+parent. Otherwise it grows to fit its content and has nothing to scroll.
+
+The `scroll` element is a convenience. The framework style sheet gives it one rule:
 
 ```css
 scroll { display: block; overflow: auto; }
 ```
 
-That rule is the whole of what makes `scroll` special. A box is a scroll container when its used
-`overflow-x` **or** its used `overflow-y` is `auto` or `scroll`, whatever element it came from. A
-`column` with `overflow-y: auto` is a scroll container; a `scroll` element with `overflow: visible`
-is not.
+Any element is a scroll container when its `overflow-x` or `overflow-y` is `auto` or `scroll`. A
+`column` with `overflow-y: auto` scrolls. A `scroll` element with `overflow: visible` does not.
 
-| `overflow` | Clips its content | Scroll container | Gutter for the bar |
-|---|---|---|---|
-| `visible` | no | no | none |
-| `clip` | yes | no | none |
-| `hidden` | yes | no | none |
-| `auto` | yes | yes | reserved only once the content is found to overflow |
-| `scroll` | yes | yes | always reserved |
+| `overflow` | Clips content | Scroll container | User can scroll this axis | Scrollbar gutter |
+|---|---|---|---|---|
+| `visible` | no | no | no | none |
+| `clip` | yes | no | no | none |
+| `hidden` | yes | only if the other axis is `auto`/`scroll` | no | none |
+| `auto` | yes | yes | yes | reserved once the content overflows |
+| `scroll` | yes | yes | yes | always reserved |
 
-`auto` is the one value whose effect on layout depends on the result of that layout: it reserves the
-bar's width exactly when the content overflows, and whether the content overflows depends on how
-much room the reservation left. It therefore enters layout as `hidden`, and a box that turns out to
-overflow is laid out a second time with the gutter reserved. Two passes, and no more — the decision
-is kept on the box, so a container that was scrolling last frame does not flicker its gutter on
-every keystroke inside it.
+Each axis is handled on its own. With `overflow-x: hidden; overflow-y: auto`, the wheel, trackpad
+and touch move only the vertical axis. Code can still move the hidden axis with `scroll_to`.
 
-Layout keeps a roster of boxes with undecided `overflow: auto`. The gutter check examines those
-boxes only. A document with no such box does not scan its box tree and does not enter a second pass.
+With `overflow: auto`, layout reserves a 15 CSS pixel [scrollbar](#scrollbars) gutter once the
+content overflows, which narrows the content. The decision is kept between frames, so the gutter does not flicker while
+content inside changes. To avoid the sideways shift entirely, use `overflow: scroll`, or reserve
+the space with padding.
 
-Three quantities describe a scroll container, and none of them means anything without the other two:
+### Scroll position terms
 
-| Term | What it is |
+| Term | Meaning |
 |---|---|
-| scrollport | the part of the container the content is seen through — its content box |
-| content extent | how far the content reaches inside it |
-| offset | how far the content has been moved, measured from its start |
+| scrollport | the content box the content is seen through |
+| content extent | how far the content reaches |
+| offset | how far the content has been moved from its start |
 
-The legal range of an offset in one axis runs from zero to `content extent − scrollport`, and is
-zero when the content fits.
+An offset ranges from zero to `content extent − scrollport` on each axis. A positive offset reveals
+content further down and to the right. The offset belongs to the element, so it survives when the
+element's boxes are rebuilt, for example after a `display` change.
 
-## The offset model
+## Scroll an element into view
 
-Layout owns scroll *regions*: which boxes scroll, how far the content reaches, where the scrollport
-is. A separate layer owns scroll *offsets*. The split is the reason scrolling is cheap.
-
-Writing an offset marks the container as scrolled and marks nothing else — not its children, not its
-ancestors. The pass that turns boxes into absolute geometry composes the new positions on its way
-past. No selector matches again, nothing is measured again, no box is rebuilt. Scrolling a
-five-thousand-row list is one mark, not five thousand.
-
-An offset is filed under the **element**, never under the box it generated. A box is destroyed and
-made again whenever the element's display type changes, whenever a subtree is rebuilt, whenever a
-`:hover` rule reveals a control. An offset filed under a box would survive until the next such event
-and then send the reader silently back to the top.
-
-### Two offsets, not one
-
-| Offset | What it is | Who reads it |
-|---|---|---|
-| clamped | the legal position, snapped to the device pixel grid | listeners, observations, the scrollbar thumb, `ScrollPosition` |
-| composed | clamped plus the elastic displacement of an overscroll, unsnapped | the pass that places fragments |
-
-The two round differently on purpose. The clamped offset is snapped because a scrollport whose
-content begins a third of a pixel further along breaks and rounds text differently, and re-encoding
-a slice of the document on every frame of every wheel detent is not worth a third of a pixel. The
-elastic displacement is not snapped, because it is a rigid translation that can be composed exactly
-at any fraction, and a return that covers its band in about a third of a second spends most of its
-frames moving well under one device pixel — rounded, the edge would ratchet.
-
-### Units
-
-<FlowDiagram
-  label="What a positive scroll offset means"
-  direction="horizontal"
-  items={[
-    {
-      title: 'Positive scroll offset',
-      next: 'Changes the viewport',
-    },
-    {
-      title: 'Reveals content further right and down',
-      description: 'The content itself travels in the opposite direction: up and left across the screen.',
-    },
-  ]}
-/>
-
-Two coordinate spaces are in play, and the boundary between them is a real hazard.
-
-| Where | Unit |
-|---|---|
-| `ScrollPosition`, `NodeRef::scroll_offset`, `ScrollTarget::Offset`, `ScrollTarget::By` | device pixels |
-| `ScrollEvent` — the `on:scroll` payload | CSS pixels |
-| `ScrollDelta::Pixels` — part of the `on:wheel` payload | CSS pixels |
-
-<Callout type="warn">
-A device pixel is a pixel of the surface. A CSS pixel is what a style sheet is written in. On a
-surface with two device pixels per CSS pixel the same position is two different numbers.
-`NodeRef::scale()` returns how many device pixels one CSS pixel is, and is the only conversion you
-need: divide a device-pixel quantity by it to get CSS pixels.
-</Callout>
-
-The unit is on the type, so the compiler catches most of it. `CssPx`, `DevicePx`, `Point` and `Size`
-live in `zgui::geom` and are not in the prelude; the examples below import them where they are used.
-
-## Scrollbars
-
-The framework draws them. They are not elements and they are not in the document; they are extra
-fragments the layout pass produces for the container, painted in the container's own slot.
-
-| Part | When it is drawn | Size |
-|---|---|---|
-| track | whenever a gutter is reserved, whatever the content does | fills the gutter |
-| thumb | only when the content really can move | as long as the fraction of the content that is visible |
-
-The gutter is 15 CSS pixels wide. It is a constant — `zgui_style::sheets::ua::SCROLLBAR_SIZE` —
-because there is no CSS property that states it. Every rectangle a bar occupies is derived from the
-difference between the container's inner rectangle and its content box, which *is* the gutter;
-deriving it from the width a second time leaves a seam at a fractional scale.
-
-A bar is drawn outside the scrollport and is not clipped by it. A bar clipped by the region it
-scrolls would disappear the moment the content did.
-
-### How they are styled
-
-They are not styled with CSS. There is no selector for a track or a thumb, `scrollbar-color` and
-`scrollbar-width` are not supported properties, and `scrollbar-gutter` is not read. The bars follow
-the colour scheme the window is presented in, and nothing else:
-
-| Part | Light scheme | Dark scheme |
-|---|---|---|
-| track | black at 6 % alpha, square corners | white at 6 % alpha, square corners |
-| thumb | black at 32 % alpha, 4 device pixel radius | white at 28 % alpha, 4 device pixel radius |
-
-The thumb is drawn over the track, which is why a translucent thumb is legible and a translucent
-track is a hairline.
-
-<Callout type="info">
-The bars are chrome rather than content, so nothing in the document cascades to them. That is
-deliberate: a thousand identical scrollports would otherwise each carry a computed style for a strip
-of pixels no rule in the application ever mentions.
-</Callout>
-
-To reserve the gutter permanently, so that the content does not shift sideways on the frame a bar
-appears, use `overflow: scroll` instead of `auto`, or add `padding-right: 15px` to the container.
-
-### What a press on a bar does
-
-The router asks which scrollbar a press landed on before it asks anything else, and a press that
-landed on one is taken away from everything under it: it neither moves focus nor clicks the
-container.
-
-| Press lands on | What happens |
-|---|---|
-| the thumb | the distance from the thumb's near edge to the pointer is recorded, and nothing moves; each following move puts that edge at `pointer − grab` |
-| the track | the container pages one screenful towards the press |
-
-A thumb drag is expressed as an absolute destination rather than a relative step, so rounding cannot
-walk the thumb away from the pointer over a long drag.
-
-## Wheel, trackpad and touch
-
-`on:wheel` is the input. It bubbles, and it can be cancelled.
-
-```rust
-pub struct WheelEvent {
-    pub delta: ScrollDelta,   // Lines { x, y }, or Pixels(Size<CssPx, Css>)
-    pub phase: ScrollPhase,   // Discrete | Started | Moved | Momentum | Ended
-    pub position: Point<CssPx, Css>,
-    pub id: PointerId,
-    pub kind: PointerKind,
-}
-```
-
-A notched wheel reports whole **lines** and always reports `ScrollPhase::Discrete`. A trackpad or
-another precision surface reports **pixels** and reports `Started`, `Moved`, `Momentum` and `Ended`
-around the gesture. The unit stays on the value because converting it needs information the value
-does not have.
-
-### How one wheel notch is read
-
-Three owners answer the question, and no constant is invented anywhere:
-
-| Question | Answered by |
-|---|---|
-| how many lines does one detent mean | the desktop, through `ScrollSettings::lines_per_notch` — 3.0 on an ordinary Linux or Windows desktop |
-| has the person's direction preference been applied already | the desktop, through `ScrollSettings::direction` |
-| how tall is one line, and how far is one page | the scrolled container's own computed style |
-
-The line height comes from the container's resolved text style. A page is `scrollport − line`, and
-never less than one line, so a scrollport shorter than a line still pages by something.
-
-`ScrollDelta::to_pixels(line_height)` does the conversion if you need it yourself:
-
-```rust
-use zgui::geom::CssPx;
-
-let delta = ScrollDelta::Lines { x: 0.0, y: -3.0 };
-assert_eq!(delta.to_pixels(CssPx(16.0)).height, CssPx(-48.0));
-```
-
-### Chaining
-
-The wheel does not act on one container. It acts on the chain of scroll containers from the element
-under the pointer outwards to the root. Each one takes as much of the delta as it has room for and
-passes the remainder outwards, innermost first.
-
-<FlowDiagram
-  label="How nested scrolling consumes a delta"
-  direction="horizontal"
-  items={[
-    {
-      title: '100 px requested',
-      description: 'The inner list has 40 px of room left.',
-      next: 'The list consumes 40 px',
-    },
-    {
-      title: '60 px remains',
-      next: 'The page consumes the remainder',
-    },
-    {
-      title: '0 px remains',
-      description: 'The entire delta has been consumed.',
-    },
-  ]}
-/>
-
-The two axes are answered independently, which is why a sideways flick over a vertical list scrolls
-the page sideways while the list stays exactly where it is. Whatever survives the outermost
-container becomes elastic displacement on that container.
-
-The chain is walked up the **element** tree, so a wrapper with `display: contents` does not hide the
-container above it.
-
-### Taking the wheel over
-
-Scrolling is the framework's default behaviour for a wheel event, computed after every listener on
-the path has run and dropped if any of them called `prevent_default`. The `:prevent` modifier does
-that for you.
-
-```rust
-use zgui::geom::CssPx;
-
-let zoom = RwSignal::new_local(1.0_f32);
-
-view! {
-    box(
-        class = "map",
-        on:wheel:prevent = move |ev| {
-            // Nothing scrolls. The zoom is ours.
-            let by = ev.delta.to_pixels(CssPx(16.0)).height.0;
-            zoom.update(|level| *level = (*level - by * 0.001).clamp(0.25, 8.0));
-        }
-    ) {
-        canvas(class = "map__surface")
-    }
-}
-```
-
-### Touch
-
-A finger dragging a container is a scroll and nothing else.
-
-| Gesture | What it does |
-|---|---|
-| pan starts | the chain is decided once, where the finger went down, and held for the whole drag |
-| pan moves | the container scrolls against the movement, so the content follows the contact |
-| pan ends | the container is given the speed the finger left with, and flings |
-
-The chain is fixed at the start on purpose. A chain re-derived from where the finger is *now* is a
-list that stops following it the moment the drag leaves the scrollport. One drag runs at a time; a
-second contact that begins panning takes the scroll over.
-
-### There is no keyboard scrolling
-
-The framework has exactly two defaults for a key: Tab moves focus, and Enter or Space activates what
-has focus. The arrows, Page Up, Page Down, Home and End do nothing to a scroll container. Write them
-where you want them:
-
-```rust
-use zgui::geom::{DevicePx, Point};
-
-let port = NodeRef::new();
-
-view! {
-    scroll(
-        class = "list",
-        node_ref = port,
-        tabindex = Focus::Sequential,
-        on:key_down = move |ev| {
-            let page = port.scroll_position().scrollport.height.0;
-            let line = 40.0 * port.scale();
-            let step = match &ev.key {
-                Key::Named(NamedKey::ArrowDown) => line,
-                Key::Named(NamedKey::ArrowUp) => -line,
-                Key::Named(NamedKey::PageDown) => page,
-                Key::Named(NamedKey::PageUp) => -page,
-                _ => return,
-            };
-            port.scroll_to(
-                ScrollTarget::By(Point::new(DevicePx(0.0), DevicePx(step))),
-                ScrollBehavior::Smooth,
-            );
-        }
-    ) { /* rows */ }
-}
-```
-
-`scrollport.height` is already in device pixels, which is the space `ScrollTarget::By` takes, so
-paging needs no conversion. A line of 40 is a number somebody wrote in CSS pixels, so it is
-multiplied by `port.scale()`.
-
-## The glide, and overscroll
-
-A wheel detent does not jump. It travels.
-
-| Input | What it does |
-|---|---|
-| a notched wheel — `ScrollPhase::Discrete` | glides to its destination over 240 ms, on a cubic ease-out |
-| a trackpad or touch — any other phase | arrives in the frame it was delivered in |
-
-The split is the whole of it. A precision surface's deltas are already a motion, and animating a
-motion again is what makes a trackpad feel like treacle. A backend that reports that the platform
-animates its own wheel turns the glide off entirely.
-
-**Detents compose; they do not restart.** Somebody turning a wheel three times in half a second is
-asking to go three times as far. A new detent is added to the destination the running motion is
-already heading for, and only the ease is restarted. Re-aiming from the container's current position
-would throw away everything the previous detents had not yet covered, and three quick turns would
-land barely further than one.
-
-The ease has no ease-in half. A scroll that visibly does nothing for two frames after a key press
-reads as a dropped key press.
-
-### Overscroll
-
-What no container in the chain could absorb becomes an elastic displacement on the outermost one.
-
-| Constant | Value | Meaning |
-|---|---|---|
-| band | 120 device pixels | the displacement approaches this and never reaches it |
-| resistance | `band × x / (band + x)` over the unresisted distance | every further pixel of gesture moves less than the last |
-| return rate | 20 rad/s, critically damped | settled in about a third of a second |
-
-The displacement is **not** a scroll offset. `scroll_offset`, the thumb and the `on:scroll` payload
-all report the clamped position while the edge is stretched. A displacement that has not returned
-keeps the frame loop awake, so the return is drawn rather than skipped.
-
-A run of detents against the bottom of a list keeps the speed the previous one left, so it reads as
-one continuous stretch rather than one jerk per detent.
-
-## Programmatic scrolling
-
-Three types, all in the prelude.
-
-<TypeTable
-  type={{
-    'ScrollTarget::IntoView': {
-      description: 'Bring this node into view, moving as little as possible.',
-      type: 'variant',
-    },
-    'ScrollTarget::IntoViewStart': {
-      description: 'Bring it into view at the start of the scrollport.',
-      type: 'variant',
-    },
-    'ScrollTarget::IntoViewEnd': {
-      description: 'Bring it into view at the end of the scrollport.',
-      type: 'variant',
-    },
-    'ScrollTarget::IntoViewCenter': {
-      description: 'Bring it into view and centre it.',
-      type: 'variant',
-    },
-    'ScrollTarget::Offset(p)': {
-      description: 'Scroll this container to an absolute offset, in device pixels.',
-      type: 'Point<DevicePx, Device>',
-    },
-    'ScrollTarget::By(p)': {
-      description: 'Scroll this container by a relative amount, in device pixels.',
-      type: 'Point<DevicePx, Device>',
-    },
-  }}
-/>
-
-<TypeTable
-  type={{
-    'ScrollBehavior::Instant': {
-      description: 'Move in one frame. The default.',
-      type: 'variant',
-    },
-    'ScrollBehavior::Smooth': {
-      description: 'Animate to the destination.',
-      type: 'variant',
-    },
-  }}
-/>
-
-```rust
-pub struct ScrollPosition {
-    pub offset: Point<DevicePx, Device>,
-    pub content_size: Size<DevicePx, Device>,
-    pub scrollport: Size<DevicePx, Device>,
-}
-
-impl ScrollPosition {
-    pub fn remaining(self) -> Size<DevicePx, Device>;   // never below zero
-    pub fn is_at_end_vertically(self) -> bool;
-    pub fn is_at_end_horizontally(self) -> bool;
-}
-```
-
-A [`NodeRef`](/docs/learn/attributes) is how a view reaches a node it built.
-
-| Method | Answers |
-|---|---|
-| `scroll_offset()` | the offset, from the last completed frame |
-| `scroll_position()` | offset, content extent and scrollport, from the last completed frame |
-| `scroll_to(target, behavior)` | asks for a scroll; returns nothing |
-| `observe_scroll()` | a `Signal<ScrollPosition, LocalStorage>` that updates every frame the container moves |
-| `observe_scroll_while(active)` | the same, but the observation is given back while `active` answers false |
-
-The two targeting families act on different nodes, and this is the part to get right:
-
-| Target | Which container moves |
-|---|---|
-| `Offset`, `By` | **this** node, which must itself be a scroll container |
-| `IntoView`, `IntoViewStart`, `IntoViewEnd`, `IntoViewCenter` | the nearest scrolling ancestor that is **not** this node |
-
-`IntoView` on a target taller than the scrollport aligns it to its start, which is the part of it
-that anyone asking to see it means.
-
-### Scrolling an element into view
+Call `scroll_to` on a [`NodeRef`](/docs/learn/attributes) to the element you want to show. Its
+nearest scrolling ancestor moves:
 
 ```rust
 use zgui::prelude::*;
 use zgui::{component, css, view};
 
-/// The handle is part of the row, exactly as a per-row signal is: `NodeRef` is `Copy`, and a
-/// row that goes away takes its handle with it. A `NodeRef` is not `Send`, so a collection of
-/// these needs `LocalStorage`.
+/// `NodeRef` is `Copy` and not `Send`, so a list of these needs `LocalStorage`.
 #[derive(Clone)]
 struct Section {
     id: u64,
@@ -486,7 +95,6 @@ fn Manual(sections: Signal<Vec<Section>, LocalStorage>) -> impl IntoView {
                 for section in move || sections.get(), key = |s: &Section| s.id {
                     control(
                         class = "manual__link",
-                        // Only `section.node` is captured, and it is `Copy`.
                         on:click = move |_| section.node.scroll_to(
                             ScrollTarget::IntoViewStart,
                             ScrollBehavior::Smooth,
@@ -518,21 +126,52 @@ const SHEET: &str = css!(
 );
 ```
 
-`section.node` names the section, not the container, so `scroll_to` moves `.manual__body` — the
-nearest scrolling ancestor that is not the section itself. `.manual__index` is a scroll container
-too, made by one `overflow-y` declaration and no `scroll` element.
+`section.node` refers to the section, so `scroll_to` moves `.manual__body`, its nearest scrolling
+ancestor.
+
+`ScrollTarget`, `ScrollBehavior` and `ScrollPosition` are in the prelude.
+
+| `ScrollTarget` | Effect | Container that moves |
+|---|---|---|
+| `IntoView` | brings the node into view, moving as little as possible | the nearest scrolling ancestor |
+| `IntoViewStart` | aligns the node to the start of the scrollport | the nearest scrolling ancestor |
+| `IntoViewEnd` | aligns the node to the end | the nearest scrolling ancestor |
+| `IntoViewCenter` | centres the node | the nearest scrolling ancestor |
+| `Offset(Point<DevicePx, Device>)` | scrolls to an absolute offset | this node, which must scroll |
+| `By(Point<DevicePx, Device>)` | scrolls by a relative amount | this node, which must scroll |
+
+`ScrollBehavior::Instant` (the default) moves in one frame. `ScrollBehavior::Smooth` animates over
+240 ms. A node taller than the scrollport is aligned to its start by every `IntoView` variant.
 
 <Callout type="warn">
-`scroll_to` schedules a scroll; it does not perform one. The scroll is carried out later in the same
-frame, against the geometry of the **last completed** frame. Two things follow. Reading
-`scroll_position()` immediately after the call still reports the old offset. And scrolling to a node
-that was created in the same turn moves nothing, because that node had no geometry when the scroll
-was carried out — revealing a panel and scrolling to it is two turns, not one.
+`scroll_to` queues a scroll. It runs later in the same frame, against the geometry of the last
+completed frame. So `scroll_position()` read right after the call still shows the old offset, and
+scrolling to a node created in the same turn does nothing because it has no geometry yet. Reveal a
+panel in one turn and scroll to it in the next.
 </Callout>
 
-### Watching a scroll
+### Scroll to an offset
 
-`on:scroll` is the result rather than the input. It **does not bubble** and cannot be cancelled.
+`ScrollTarget::Offset` and `ScrollTarget::By` move the container itself, so call them on a
+`NodeRef` to the scroll container. Their values are in **device pixels**. Multiply a CSS-pixel
+distance by `NodeRef::scale()`, which returns device pixels per CSS pixel:
+
+```rust
+use zgui::geom::{DevicePx, Point};
+
+// `port` is a NodeRef on the scroll container. Scroll down by 40 CSS pixels.
+let step = 40.0 * port.scale();
+port.scroll_to(ScrollTarget::By(Point::new(DevicePx(0.0), DevicePx(step))), ScrollBehavior::Smooth);
+```
+
+An offset past the end is clamped to the end when the scroll runs, so
+`ScrollTarget::Offset(Point::new(DevicePx(0.0), DevicePx(f32::MAX)))` scrolls to the bottom.
+`CssPx`, `DevicePx`, `Point` and `Size` live in `zgui::geom` and are not in the prelude. The
+[units table](#units) lists which API uses which unit.
+
+## React to scrolling
+
+`on:scroll` reports the new position. It does not bubble and cannot be cancelled.
 
 ```rust
 scroll(
@@ -549,137 +188,82 @@ pub struct ScrollEvent {
 }
 ```
 
-One container that moved several times in one frame — a wheel event plus a glide step — is reported
-**once**, from where it started to where it ended. The event is dispatched after geometry is
-computed and before anything is painted, and the reactive graph is flushed and the document restyled
-immediately afterwards, so a handler that rebuilds what is on screen is drawn in its final place in
-the same frame rather than one frame late.
+A container that moved several times in one frame is reported once. The event fires after layout and
+before painting, so anything a handler changes is drawn in the same frame.
 
-`observe_scroll()` is the same information as a signal, and is what a virtualised list uses. It costs
-the frame one observation per node, refcounted, so several callers watching one container pay for
-one.
+To read the position as a signal, use a `NodeRef`:
 
-### Freezing the window
-
-`zgui::view::current_host()` answers `Some(HostHandle)` inside a window's scope, and
-`freeze_scrolling(true)` on that handle
-stops the *window's own* container moving while leaving everything about the layout alone: the
-offset it holds, the width its content wrapped to, the gutter its bar occupies. A modal surface
-holds this while it is open. Taking the scrolling away by
-restyling instead — `overflow: hidden` on the root — clamps the offset to the top, so the page jumps
-under the modal and jumps back when it closes. Containers inside the page keep their own scrolling.
-Calls do not nest. [Overlays and portals](/docs/building/overlays-and-portals) covers the rest.
-
-## When the content changes size
-
-There is no scroll anchoring. `overflow-anchor` is not a supported property and nothing tries to
-guess which line the reader was looking at. The offset is a number, held under the element, and
-layout moves the content underneath it.
-
-Exactly two corrections are made, and both are stated as one rule: **a resize never moves the reader
-on purpose, and never leaves them past the end.**
-
-| What changed | What happens to the offset |
+| Method | Returns |
 |---|---|
-| the container got shorter, or the content got smaller, so the offset is now past the end | clamped down to the new end |
-| the container got taller, or only its width changed, and the offset is still legal | nothing moves at all |
-| the device pixel ratio changed | every offset is multiplied by the change |
+| `scroll_offset()` | the offset from the last completed frame |
+| `scroll_position()` | offset, content extent and scrollport from the last completed frame |
+| `observe_scroll()` | a `Signal<ScrollPosition, LocalStorage>` updated every frame the container moves |
+| `observe_scroll_while(active)` | the same, observing only while `active` returns true |
+| `scroll_to(target, behavior)` | nothing; queues a scroll |
 
-An offset is never re-derived as a fraction of the extent, because a fraction is not what a reader is
-looking at. The clamp runs after any layout pass that actually ran, and costs one region lookup per
-container that has ever been scrolled.
-
-The consequence is the one to plan for: **content that grows above the scrollport pushes what the
-reader is looking at down by exactly the height that was added.** Nothing corrects it. Two patterns
-handle it.
-
-**Follow the end.** A log or a chat that should stay at the bottom watches the content extent and
-puts itself back whenever it grows:
+Several observers of one container share one observation.
 
 ```rust
-use zgui::geom::{DevicePx, Point};
-use zgui::reactive::RenderEffect;
-
-#[derive(Clone)]
-struct Line {
-    id: u64,
-    text: String,
+pub struct ScrollPosition {
+    pub offset: Point<DevicePx, Device>,
+    pub content_size: Size<DevicePx, Device>,
+    pub scrollport: Size<DevicePx, Device>,
 }
 
-#[component]
-fn Log(lines: Signal<Vec<Line>>) -> impl IntoView {
-    let port = NodeRef::new();
-    // Whether the reader is at the bottom. Scrolling up turns it off; scrolling back turns it on.
-    let pinned = RwSignal::new_local(true);
-    // `content_size` here is the extent of the scrolled content, so an appended line moves it.
-    let position = port.observe_scroll();
-
-    let following = RenderEffect::new(move |_| {
-        let position = position.get();
-        if pinned.get_untracked() && !position.is_at_end_vertically() {
-            // Past the end; the offset is clamped to the true end when it lands.
-            port.scroll_to(
-                ScrollTarget::Offset(Point::new(DevicePx(0.0), DevicePx(f32::MAX))),
-                ScrollBehavior::Instant,
-            );
-        }
-    });
-    on_cleanup_local(move || drop(following));
-
-    view! {
-        scroll(
-            class = "log",
-            node_ref = port,
-            on:scroll = move |ev| pinned.set(ev.is_at_end_vertically())
-        ) {
-            column {
-                for line in move || lines.get(), key = |line: &Line| line.id {
-                    text {{line.text.clone()}}
-                }
-            }
-        }
-    }
+impl ScrollPosition {
+    pub fn remaining(self) -> Size<DevicePx, Device>;   // never below zero
+    pub fn is_at_end_vertically(self) -> bool;
+    pub fn is_at_end_horizontally(self) -> bool;
 }
 ```
 
-The observation is delivered after the layout that grew the content, and the scroll it asks for is
-carried out on the next frame, against that layout. The effect settles: the scroll it performs
-raises `is_at_end_vertically`, so the next run does nothing.
+## Virtualise a long list
 
-**Correct by what was added.** When older rows are inserted above, move the offset down by the height
-they occupy. With rows of a known height that is arithmetic on `ScrollTarget::By`. With rows of
-unknown height, hold a `node_ref` on the row that was at the top and call
-`scroll_to(ScrollTarget::IntoViewStart, ScrollBehavior::Instant)` in the turn after the insert, when
-that row has geometry again.
+A list of 100 000 rows means 100 000 elements to style, lay out, paint and hit-test, but a scrollport
+30 rows tall shows only 30. Virtualising builds only the visible rows and uses padding to stand in
+for the rest, so the scrollbar keeps the right length. Without it, the cost of every scroll frame
+grows with the number of boxes; on the reference machine a plain scroller exceeds a 16.6 ms frame at
+about 23 000 rows (see [Measurements](/docs/performance/measurements)).
 
-## Virtualising a long list
+The component library ships one: [`VirtualList`](/docs/component-library/components#data) from
+`zgui-ui` takes a row count, a fixed row height and a `row` closure, and also sets the list's
+accessible row positions:
 
-A list of a hundred thousand rows is a hundred thousand elements to style, lay out, paint and
-hit-test, and a scrollport thirty rows tall never shows more than thirty. Virtualising means
-building only the rows that can be seen, and standing in for the rest with two empty boxes so that
-the container still measures the whole list and the scrollbar is still the right length.
+```rust
+use zgui_ui::prelude::*;
 
-There is no framework machinery for this. It is built from a `node_ref`, one observation, one derived
-value and a keyed `for`. Here is the whole of it.
+view! {
+    VirtualList(
+        count = lines,
+        row_size = 22.0,
+        label = "Log",
+        row = move |index: usize| view! { text {{move || format!("line {index}")}} }
+    )
+}
+```
+
+### Build a virtual list yourself
+
+Without `zgui-ui`, build the same thing from a `node_ref`, one observation, one derived value and a
+keyed `for`:
 
 ```rust
 use zgui::prelude::*;
 use zgui::{component, css, view};
 
-/// How tall one row is, in CSS pixels. Declared, not measured — see the note below.
+/// Row height in CSS pixels. Declared, not measured.
 const ROW: f32 = 24.0;
 
-/// How many rows to build past each edge of the scrollport.
+/// Extra rows built past each edge of the scrollport.
 const OVERSCAN: usize = 4;
 
-/// Which rows are worth building, and how much space stands in for the rest.
 #[derive(Copy, Clone, PartialEq, Debug, Default)]
 struct Visible {
     first: usize,
     count: usize,
-    /// The height of everything before the first built row, in CSS pixels.
+    /// Height of the rows before the first built row, in CSS pixels.
     lead: f32,
-    /// The height of everything after the last built row, in CSS pixels.
+    /// Height of the rows after the last built row, in CSS pixels.
     trail: f32,
 }
 
@@ -689,13 +273,12 @@ impl Visible {
     }
 }
 
-/// `port` and `offset` are both in CSS pixels.
+/// `port` and `offset` are in CSS pixels.
 fn visible(rows: usize, port: f32, offset: f32) -> Visible {
     if rows == 0 {
         return Visible::default();
     }
-    // Rounded up, plus one: a port 400 px tall showing 24 px rows meets eighteen rows whenever
-    // it is scrolled to anything but an exact multiple of the row height.
+    // Rounded up, plus one: a scrolled port can show part of an extra row.
     let fits = ((port.max(0.0) / ROW).ceil() as usize).max(1) + 1;
     let anchor = ((offset.max(0.0) / ROW).floor() as usize).min(rows - 1);
     let first = anchor.saturating_sub(OVERSCAN);
@@ -711,13 +294,12 @@ fn visible(rows: usize, port: f32, offset: f32) -> Visible {
 #[component]
 fn Ledger(rows: Signal<usize>) -> impl IntoView {
     let port = NodeRef::new();
-    // One observation on the container. It is taken when the handle binds, so asking for it
-    // here — before the element exists — is the ordinary way to use it.
+    // The observation starts when the handle binds, so asking before the element exists is fine.
     let position = port.observe_scroll();
 
     let seen = Signal::derive_local(move || {
         let position = position.get();
-        // The observation answers in device pixels and ROW is in CSS pixels.
+        // The observation is in device pixels; ROW is in CSS pixels.
         let scale = port.scale();
         let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
         visible(
@@ -749,133 +331,330 @@ const SHEET: &str = css!(
 );
 ```
 
-What each part does:
+How it works:
 
-<Steps>
+1. `observe_scroll()` turns the container's position into a signal, updated in the frame the scroll
+   happens.
+2. `seen` computes which rows to build. It reruns on every scroll, but its value changes only when
+   the visible run changes, so scrolling within one row rebuilds nothing.
+3. `padding-top` and `padding-bottom` stand in for the rows that are not built, so the content extent
+   equals the full list.
+4. The `for` is keyed by row index. Moving the run by one row removes one row and builds one; see
+   [Control flow](/docs/learn/control-flow).
 
-<Step>
-
-**The handle and the observation.** `port` names the scroll container. `observe_scroll()` turns its
-position into a signal that is written during the frame the scroll happens in, before anything is
-painted.
-
-</Step>
-
-<Step>
-
-**The derived run.** `seen` reads the position, converts to CSS pixels, and answers which contiguous
-run of rows to build. It re-runs on every scroll — but its *answer* changes only when the run
-changes, so scrolling within one row rebuilds nothing at all.
-
-</Step>
-
-<Step>
-
-**The two spacers.** `padding-top` and `padding-bottom` on the inner `column` stand in for the rows
-that are not built. Their heights plus the built rows always add up to the whole list, which is what
-keeps the scrollbar the size it would be if every row existed.
-
-</Step>
-
-<Step>
-
-**The keyed list.** The key is the row's own index. Moving the run by one row destroys one row,
-builds one row, and moves the rest — see [Control flow](/docs/learn/control-flow) for why a key is
-what makes that possible.
-
-</Step>
-
-</Steps>
+On the first frame the scrollport is zero, because nothing has been laid out yet. `fits` is at least
+one row, so the list has something to measure and the next frame corrects itself.
 
 <Callout type="warn">
-The row height is declared and not measured. Which rows to build has to be decided *before* those
-rows exist, so it cannot be decided from their heights: measuring row 4 200 means building row
-4 200, which is the cost virtualisation exists to avoid. A style sheet that disagrees with `ROW`
-gives a scrollbar of the wrong length, not a wrong set of rows.
+The row height must be declared, not measured: measuring row 4 200 means building it, which is what
+virtualising avoids. If the style sheet disagrees with `ROW`, the scrollbar has the wrong length.
 </Callout>
 
-Two inputs need care and are handled above. A row height of zero would divide the list into
-infinitely many rows. A scrollport of zero is the **ordinary** state on the first frame, before
-anything has been laid out and before the observation has fired; `fits` is floored at one row so
-that the container has something to measure and the next frame knows better.
+## Keep the position when content changes
 
-## What scrolling costs
+zgui does not anchor the scroll position to the content; `overflow-anchor` is not supported. The
+offset stays the same number while the content underneath it changes:
 
-Scrolling a virtualised list is two different frames wearing the same clothes:
-
-- a **translation** frame — the same rows at a new offset;
-- a **recycle** frame — one row-height of travel, so one row leaves one end and one arrives at the
-  other.
-
-Averaging them hides the interesting one, so they are measured separately. The numbers below were
-measured by the run that wrote `docs/performance.md`, which `cargo xtask perf` generates; the
-scenario is a ten-thousand-row virtualised list carried past its port at 120 Hz
-(`crates/zgui-bench/src/scenario/scroll.rs`), 600 ticks with one wheel notch every fortieth.
-
-The **band** is the ceiling this build must stay under, and a run above it fails the test suite. The
-**budget** is what the design was supposed to cost, and "met" says the measurement is inside it.
-[Measurements](/docs/performance/measurements) covers both.
-
-| Measurement | Value | Band | Budget |
-|---|---:|---:|---|
-| `scroll.translation` | 44.18 µs | 61.60 | 1000.00 met |
-| `scroll.recycle` | 1021.42 µs | 1442.00 | 1500.00 met |
-| `scroll.translation.restyles` | 0.00 elements | 0.00 | 0.00 met |
-| `scroll.translation.relayouts` | 0.00 nodes | 0.00 | 0.00 met |
-| `scroll.translation.hit_rebuilds` | 0.00 rebuilds | 0.00 | 0.00 met |
-
-The last three are the design statement, and their band is zero rather than "small". A translation
-restyles nothing because moving content changes no computed style: an offset is not a layout input
-and is not part of any declaration, so no selector can match differently because of it. It relays
-out nothing because moving content changes no size: the scroll region — where the scrollport is, how
-far the content reaches — is layout's answer and did not change. And the hit index is *translated*
-with the content rather than rebuilt from it, so a pointer still finds the right row without the
-index being made again.
-
-The fragment pass still moves the rigid subtree and carries its hit entries. It also reports whether
-all movement used one vector and whether the frame damaged anything else. When the renderer keeps a
-persistent composed target, zgui can copy the valid pixels inside the scrollport and draw only the
-bands exposed by the movement.
-
-The shift is accepted only when all of these conditions are true:
-
-- exactly one scroll container moved;
-- all reported movement is rigid, settled, and equal;
-- the movement is a whole number of device pixels and no elastic overscroll is active;
-- the renderer supports shifts of its composed target;
-- the scrollport has an opaque backing, and later painted content does not overlap it.
-
-If any condition is false, zgui draws the normal damage. A refusal changes performance only. The
-output stays the same.
-
-A successful shift keeps damage from other changes and adds the exposed horizontal and vertical
-bands. A scrollbar thumb or a newly mounted row can therefore draw over the shifted pixels without
-forcing the complete scrollport to be emitted again.
-
-A recycle frame pays for the row that arrived. The current workload rebuilds 8 boxes, relays out 29
-nodes, and emits 404 primitives. Its measured median is 1021.42 µs (`docs/performance.md`).
-
-The framework's own glide over the 1 851-box gallery is measured at
-`kitchen.glide_tick` = 973.26 µs (`docs/performance.md`).
-
-### Why virtualising is not optional for a long list
-
-These are advisory absolutes recorded on the maintainer's machine — a 13th Gen Intel Core i9-13900K,
-release profile — and they gate nothing (`docs/perf/reference-workloads.md`):
-
-| Document | Glide cost per box |
+| Change | Offset |
 |---|---|
-| virtualised, 100 000 rows | 27 845 – 28 217 ns per **realised** box, and 39 of them are realised |
-| unvirtualised probe, 17 507 boxes | 172 ns |
-| unvirtualised probe, 35 007 boxes | 211 ns |
-| unvirtualised probe, 70 007 boxes | 287 ns |
-| unvirtualised probe, 140 007 boxes | 5 660 ns |
+| the offset is now past the end (container shrank or content shrank) | clamped to the new end |
+| the offset is still legal | unchanged |
+| the device pixel ratio changed | scaled by the change |
 
-The virtualised list costs about a millisecond a frame whatever the data behind it. The unvirtualised
-one is a couple of hundred nanoseconds per box until it stops fitting in cache, and then it is 792
-milliseconds a frame at twenty thousand rows — a cliff rather than a slope. A rigid non-virtualised
-scroller crosses a 16.6 ms frame budget at roughly 160 000 boxes, about 23 000 rows
-(`docs/perf/glide-split.md`).
+So content inserted above the visible area pushes what the user sees down by the inserted height.
+Two patterns handle this.
+
+### Stay at the bottom of a log
+
+A log or chat that should stay at the bottom while the user is there:
+
+```rust
+use zgui::geom::{DevicePx, Point};
+use zgui::reactive::RenderEffect;
+
+#[derive(Clone)]
+struct Line {
+    id: u64,
+    text: String,
+}
+
+#[component]
+fn Log(lines: Signal<Vec<Line>>) -> impl IntoView {
+    let port = NodeRef::new();
+    // Whether the user is at the bottom. Scrolling up clears it; scrolling back sets it.
+    let pinned = RwSignal::new_local(true);
+    let position = port.observe_scroll();
+
+    let following = RenderEffect::new(move |_| {
+        let position = position.get();
+        if pinned.get_untracked() && !position.is_at_end_vertically() {
+            // Clamped to the real end when it runs.
+            port.scroll_to(
+                ScrollTarget::Offset(Point::new(DevicePx(0.0), DevicePx(f32::MAX))),
+                ScrollBehavior::Instant,
+            );
+        }
+    });
+    on_cleanup_local(move || drop(following));
+
+    view! {
+        scroll(
+            class = "log",
+            node_ref = port,
+            on:scroll = move |ev| pinned.set(ev.is_at_end_vertically())
+        ) {
+            column {
+                for line in move || lines.get(), key = |line: &Line| line.id {
+                    text {{line.text.clone()}}
+                }
+            }
+        }
+    }
+}
+```
+
+The observation arrives after the layout that grew the content, and the scroll runs on the next
+frame. Once the log is at the end, the effect does nothing.
+
+### Insert rows above the visible area
+
+When older rows are inserted above, scroll down by their height. With fixed row heights, use
+`ScrollTarget::By`. With unknown heights, keep a `node_ref` on the row that was at the top and call
+`scroll_to(ScrollTarget::IntoViewStart, ScrollBehavior::Instant)` in the turn after the insert.
+
+## Scroll with the keyboard
+
+zgui has no built-in keyboard scrolling. Arrow keys, Page Up/Down, Home and End do nothing to a
+scroll container unless you handle them:
+
+```rust
+use zgui::geom::{DevicePx, Point};
+
+let port = NodeRef::new();
+
+view! {
+    scroll(
+        class = "list",
+        node_ref = port,
+        tabindex = Focus::Sequential,
+        on:key_down = move |ev| {
+            let page = port.scroll_position().scrollport.height.0;
+            let line = 40.0 * port.scale();
+            let step = match &ev.key {
+                Key::Named(NamedKey::ArrowDown) => line,
+                Key::Named(NamedKey::ArrowUp) => -line,
+                Key::Named(NamedKey::PageDown) => page,
+                Key::Named(NamedKey::PageUp) => -page,
+                _ => return,
+            };
+            port.scroll_to(
+                ScrollTarget::By(Point::new(DevicePx(0.0), DevicePx(step))),
+                ScrollBehavior::Smooth,
+            );
+        }
+    ) { /* rows */ }
+}
+```
+
+`scrollport.height` is already in device pixels. The 40 px line is in CSS pixels, so it is multiplied
+by `port.scale()`.
+
+## Use the wheel for something else
+
+Scrolling is the default action of a wheel event. It runs after all listeners and is skipped if any
+listener called `prevent_default`. The `:prevent` modifier does this for you:
+
+```rust
+use zgui::geom::CssPx;
+
+let zoom = RwSignal::new_local(1.0_f32);
+
+view! {
+    box(
+        class = "map",
+        on:wheel:prevent = move |ev| {
+            // Nothing scrolls. The wheel zooms instead.
+            let by = ev.delta.to_pixels(CssPx(16.0)).height.0;
+            zoom.update(|level| *level = (*level - by * 0.001).clamp(0.25, 8.0));
+        }
+    ) {
+        canvas(class = "map__surface")
+    }
+}
+```
+
+The end of a gesture always releases stretched edges, even if a listener prevented the default.
+
+## Stop the page scrolling behind a modal
+
+`zgui::view::current_host()` returns the window's `HostHandle`. `freeze_scrolling(true)` on it stops
+the window's own scroll container from moving, without changing its layout, offset or gutter. Modal
+overlays use this. Setting `overflow: hidden` on the root instead would reset the offset to the top.
+Containers inside the page still scroll. Calls do not nest. See
+[Overlays and portals](/docs/building/overlays-and-portals).
+
+## Scrollbars
+
+zgui draws scrollbars itself. They are not elements and are not in the document.
+
+| Part | When it exists | Size |
+|---|---|---|
+| track | whenever a gutter is reserved | fills the gutter |
+| thumb | only when the content can move | proportional to the visible fraction of the content |
+
+The gutter is 15 CSS pixels wide (`zgui_style::sheets::ua::SCROLLBAR_SIZE`). Bars are drawn outside
+the scrollport and are not clipped by it.
+
+Scrollbars cannot be styled with CSS. There is no selector for them, and `scrollbar-color`,
+`scrollbar-width` and `scrollbar-gutter` are not supported. Their look follows the window's colour
+scheme:
+
+| Part | Light scheme | Dark scheme |
+|---|---|---|
+| track | transparent | transparent |
+| thumb | black at 35 % alpha | white at 50 % alpha |
+
+The thumb is painted as a slim capsule, 6 device pixels thick, centred in the gutter. Its hit area
+still covers the full gutter width, and the invisible track still responds to presses.
+
+A press on a scrollbar is handled before anything else. It does not move focus and does not click
+the container.
+
+| Press on | Effect |
+|---|---|
+| the thumb | dragging moves the thumb with the pointer, keeping the grab point under it |
+| the track | the container pages one screenful towards the press |
+
+## Performance
+
+A frame that only scrolls restyles nothing, relays out nothing and does not rebuild the hit index.
+When a scrollport has an opaque background and nothing outside the container draws over it, zgui can
+also reuse the pixels already drawn and paint only the strip the movement uncovered. See the
+[Cost model](/docs/performance/cost-model) for the exact conditions.
+
+## Units
+
+| Where | Unit |
+|---|---|
+| `ScrollPosition`, `NodeRef::scroll_offset`, `ScrollTarget::Offset`, `ScrollTarget::By` | device pixels |
+| `ScrollEvent` (the `on:scroll` payload) | CSS pixels |
+| `ScrollDelta::Pixels` (part of the `on:wheel` payload) | CSS pixels |
+
+<Callout type="warn">
+On a surface with two device pixels per CSS pixel, the same position is two different numbers.
+`NodeRef::scale()` returns device pixels per CSS pixel. Divide a device-pixel value by it to get CSS
+pixels.
+</Callout>
+
+The unit is part of the type, so the compiler catches most mistakes.
+
+## How input scrolls
+
+`on:wheel` delivers wheel and trackpad input. It bubbles and can be cancelled.
+
+```rust
+pub struct WheelEvent {
+    pub delta: ScrollDelta,   // Lines { x, y } or Pixels(Size<CssPx, Css>)
+    pub phase: ScrollPhase,   // Discrete | Started | Moved | Momentum | Ended
+    pub position: Point<CssPx, Css>,
+    pub id: PointerId,
+    pub kind: PointerKind,
+}
+```
+
+`WheelEvent` and `ScrollPhase` are in `zgui::vocab`; `ScrollDelta` is in the prelude.
+
+| Device | Delta | Phase |
+|---|---|---|
+| notched mouse wheel | `Lines` | `Discrete` |
+| trackpad or other precision surface | `Pixels` | `Started`, `Moved`, `Ended` |
+| platform momentum after the fingers lift (macOS) | `Pixels` | `Momentum` |
+
+### Distance per wheel notch
+
+| Question | Answered by |
+|---|---|
+| lines per notch | the desktop, through `ScrollSettings::lines_per_notch` (3 on Linux, Windows and macOS) |
+| has the user's direction preference been applied | the desktop, through `ScrollSettings::direction` |
+| how tall one line is | the scrolled container's computed text style |
+
+A page is `scrollport − one line`, and never less than one line. Use `ScrollDelta::to_pixels` to
+convert a delta yourself:
+
+```rust
+use zgui::geom::CssPx;
+
+let delta = ScrollDelta::Lines { x: 0.0, y: -3.0 };
+assert_eq!(delta.to_pixels(CssPx(16.0)).height, CssPx(-48.0));
+```
+
+A whole wheel notch on X11, Wayland or Windows glides to its destination over 240 ms with a cubic
+ease-out. A new notch extends the destination of the running glide, so three fast notches travel
+three times as far as one. Trackpad and touch input, and wheels on platforms that animate the wheel
+themselves (macOS), are applied in the frame they arrive.
+
+### Nested containers
+
+A wheel notch acts on the chain of scroll containers from the element under the pointer up to the
+root. Each container takes as much as it has room for and passes the rest outwards. If an inner list
+has 40 px left and the notch asks for 100 px, the list moves 40 px and the page moves 60 px.
+
+The axes are handled separately. A sideways flick over a vertical list scrolls the page sideways. The
+chain follows the element tree, so a `display: contents` wrapper does not break it.
+
+### Trackpad gestures
+
+A trackpad gesture behaves as it does in AppKit and in browsers:
+
+- **It latches to one container.** The first movement picks the innermost container that can move
+  in that direction. The gesture moves only that container until the fingers lift, even if the
+  pointer leaves it. If a list reaches its end mid-gesture, the list stretches and the page around
+  it stays still.
+- **It rails to one axis.** A gesture that starts clearly along one axis (at least twice as much
+  movement on it as on the other) ignores the other axis until it ends.
+- **The finger holds the stretch.** While the fingers are down, a stretched edge stays where the
+  finger put it. Moving back first undoes the stretch, then scrolls. When the fingers lift, the edge
+  springs back.
+- **Momentum bounces.** When platform momentum carries the container to an end, the edge travels
+  past it at the gesture's speed, returns, and the rest of the momentum is dropped. If an edge was
+  still stretched when the fingers lifted, the momentum that follows is dropped.
+
+### Touch
+
+A finger dragging a container scrolls it.
+
+| Gesture | Effect |
+|---|---|
+| pan starts | the scroll chain is chosen where the finger went down and kept for the whole drag |
+| pan moves | the content follows the finger |
+| pan ends | the container keeps the finger's speed and decelerates |
+
+Only one drag runs at a time. A second contact that starts panning takes over.
+
+### Elastic edges
+
+Scroll input that no container can absorb can stretch an edge past its end. The edge springs back
+when the input stops. Which input may stretch is a desktop setting, `ScrollSettings::elastic`:
+
+| `Elastic` | Stretches on |
+|---|---|
+| `Kinetic` (default on every backend) | trackpad gestures and touch; a mouse wheel stops at the end |
+| `Always` | every input, including a wheel |
+| `Never` | nothing |
+
+- Only an axis that a container actually scrolls can stretch. Content that fits its scrollport does
+  not move.
+- For wheel input, the outermost container in the chain that scrolls on that axis stretches. A
+  trackpad gesture stretches the container it latched to.
+- The stretch follows an AppKit-style rubber band, measured against the scrollport's size. The
+  first pixels move at about half the finger's speed, later ones less. No pull moves the content a
+  full scrollport.
+- The return is an exponential decay. An edge released 100 device pixels out is back within 2 pixels
+  after about 0.3 seconds, at any frame rate.
+
+The stretch is not part of the offset. `scroll_offset`, the thumb, observations and `on:scroll` all
+report the clamped position, snapped to the device pixel grid, while an edge is stretched. Only
+painting adds the stretch, unsnapped, so an edge returning from overscroll moves smoothly.
 
 ## Next
 

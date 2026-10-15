@@ -1,14 +1,11 @@
 ---
 title: Paint and the scene
-description: "How the fragment tree becomes a display list: the primitive set, the stacking-order walk, per-fragment replay, damage culling, batching and vector passes."
+description: "How paint turns the fragment tree into a display list: primitives, clips, draw order, the stacking walk, damage culling, replay, vector routes, vector passes and batching."
 ---
 
-Paint is the stage between geometry and pixels. It reads the fragment tree and the computed styles,
-and it writes one value — a display list — that a renderer draws without asking any further
-questions. This page assumes [the architecture overview](/docs/architecture/overview) and the
-guide. None of it is needed to write an application.
-
-Two crates do the work. `zgui-scene` defines the display list. `zgui-paint` fills one in.
+Paint is the stage between layout and the renderer. It reads the fragment tree and computed styles
+and writes one value, a display list, which the renderer draws without making any further decisions.
+`zgui-scene` defines the display list, and `zgui-paint` fills it in.
 
 <FlowDiagram
   label="How paint turns fragments into renderer input"
@@ -21,38 +18,33 @@ Two crates do the work. `zgui-scene` defines the display list. `zgui-paint` fill
     {
       title: 'A frozen damage set',
       code: 'zgui-bits',
-      next: 'Painter::emit walks stacking order, gated on damage',
+      next: 'The emit walk replays or encodes each fragment the damage reaches',
     },
     {
       title: 'A Scene',
       code: 'zgui-scene',
-      next: 'Scene::finish sorts, remaps the log, and plans vector passes',
+      next: 'Scene::finish plans vector passes and mark bins, and sorts the remap lists',
     },
     {
-      title: 'Batches and a vector pass plan',
+      title: 'Batches, a pass plan and a mark plan',
       code: 'zgui-render',
-      description: 'The complete value consumed by the renderer.',
+      description: 'The complete value the renderer consumes.',
     },
   ]}
 />
 
-## The display list is a value
+## The display list
 
-A **display list** is the complete set of drawing operations one frame issues, written down. It is
-not a stream of calls into a device. It is data: a struct of arrays with no handle, no context and
-no renderer anywhere in it. The crate documentation of `crates/zgui-scene/src/lib.rs` states it
-directly — "everything a frame draws, as a value, with no renderer in sight".
+A display list is everything one frame draws, stored as data. It holds no device handle, context or
+renderer. This has three consequences:
 
-Three things follow, and each of them is why the design is worth the indirection.
-
-| Property | What it buys |
+| Property | Consequence |
 |---|---|
-| No device in the type | The whole paint stage runs and is asserted on headless. Most of the framework's tests never open a window. |
-| Printable and comparable | A scene is a stable transcript. A change to what a frame draws is a diff in a review, not a screenshot. |
-| One input, several consumers | The wgpu renderer and `zgui_testkit_scene::CaptureRenderer` read exactly the same bytes. A second renderer needs no new producer. |
+| No device in the type | Paint runs and is tested headless. Most framework tests never open a window. |
+| Printable and comparable | A scene prints as a stable transcript, so a change to what a frame draws is a reviewable diff. |
+| One input, several consumers | The wgpu renderer and `zgui_testkit_scene::CaptureRenderer` read the same value. |
 
-`Scene` is reachable from an application as `zgui::scene`. Its public fields are the arrays and the
-side tables:
+The type is `Scene`, reachable as `zgui::scene`:
 
 ```rust
 pub struct Scene {
@@ -60,23 +52,26 @@ pub struct Scene {
     pub clips: ClipTable,
     pub paints: PaintTable,
     pub text_paints: TextPaintTable,
+    pub shader_params: ShaderParamsTable,
     pub spatial: SpatialTree,
-    // private: the operation log, the retained copies of both, the bounds
-    // tree, the layer stack, the pass plan, the viewport, and two flags.
+    // private: the operation log, remap lists, bounds tree, pass plan, mark plan, viewport, …
 }
 ```
 
-### One array per kind, not one array of an enum
+Primitives are stored in one array per kind:
 
 ```rust
 // crates/zgui-scene/src/scene/primitives.rs
 pub struct Primitives {
     pub quads: Vec<Quad>,
+    pub shaded: Vec<ShadedQuad>,
     pub shadows: Vec<Shadow>,
     pub decorations: Vec<Decoration>,
     pub mono_sprites: Vec<MonoSprite>,
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub color_sprites: Vec<ColorSprite>,
+    pub marks: Vec<MarkItem>,
+    pub mark_payloads: Vec<Arc<MarkPayload>>,   // parallel to `marks`
     pub vectors: Vec<VectorItem>,
     pub externals: Vec<ExternalQuad>,
     pub backdrops: Vec<BackdropFilter>,
@@ -84,75 +79,73 @@ pub struct Primitives {
 }
 ```
 
-A run of quads is then a contiguous slice. Every instance struct is `#[repr(C)]`,
-`bytemuck::Pod` and `Zeroable`, with no padding, checked field by field at compile time by
-`crates/zgui-scene/src/prim/layout.rs`. A batch of them copies into a device instance buffer as
-bytes. A reordered field is a build failure rather than a rendering artefact.
+A run of one kind is a contiguous slice. Every instanced struct is `#[repr(C)]`, `bytemuck::Pod`
+and padding-free, checked field by field at compile time in `crates/zgui-scene/src/prim/layout.rs`.
+It copies into a GPU buffer as bytes, and a reordered field fails the build.
 
-Everything of variable size lives in a side table addressed by index from the instance: the clip
-chain, the paint, the matrix. A `conic-gradient` with forty stops therefore costs a quad exactly as
-many instance bytes as a flat colour does.
+Anything variable-sized lives in a side table addressed by index: the clip chain, the paint, the
+shader parameters, the matrix. A quad with a forty-stop `conic-gradient` has the same instance size
+as a quad with a flat colour.
 
 <Callout type="info">
-The invariant every primitive holds, stated at `crates/zgui-scene/src/prim/mod.rs`: `bounds` is the
-**ink**, not the geometry. It is everything the primitive paints. A shadow's `bounds` is already
-dilated by its blur. Under-reporting the ink leaves stale pixels on the screen, because the ink is
-what the damage test and the clip cull are run against.
+Every primitive's `bounds` is its **ink**: everything it paints, not its geometry. A shadow's bounds
+include its blur. Damage tests and clip culls run against the ink, so under-reporting it leaves stale
+pixels on screen.
 </Callout>
 
-## Every primitive
+## Primitives
 
-`PrimitiveKind` has eleven variants. The variant order is the tie-break between two primitives at
-equal draw order, and it is a batching preference, never a correctness mechanism.
+`PrimitiveKind` has thirteen variants. When two primitives have the same draw order, the variant
+order breaks the tie. This is a batching preference, never a correctness mechanism.
 
 ```rust
 // crates/zgui-scene/src/prim/kind.rs
 pub enum PrimitiveKind {
-    GroupStart, Shadow, Quad, Vector, Decoration,
+    GroupStart, Shadow, Quad, Shaded, Marks, Vector, Decoration,
     MonoSprite, SubpixelSprite, ColorSprite, External, Backdrop, GroupEnd,
 }
 ```
 
-| Kind | Type | What it draws |
+| Kind | Type | Draws |
 |---|---|---|
-| `Quad` | `Quad` | A rectangle with elliptical corner radii, a fill, and a four-sided border with a style. Every background, every border, every scrollbar part. |
-| `Shadow` | `Shadow` | One `box-shadow`, outer or inset. Carries the casting box separately from its own dilated bounds. |
-| `Decoration` | `Decoration` | One text decoration line. Underline, overline and strikethrough are all this primitive; only the rectangle differs. |
-| `MonoSprite` | `MonoSprite` | A glyph or small vector mask with one coverage value per pixel. |
-| `SubpixelSprite` | `SubpixelSprite` | A glyph tile antialiased per colour channel. |
-| `ColorSprite` | `ColorSprite` | A full-colour tile: a decoded image, a colour emoji, a rasterised drawing. Takes corner radii and an opacity. |
-| `Vector` | `VectorItem` | A Bézier outline, filled and stroked. Not drawn here — planned into a rasterisation pass. |
-| `External` | `ExternalQuad` | A texture the renderer did not produce: a video frame, a capture surface. |
+| `Quad` | `Quad` | A rectangle with superellipse corners, a fill and a styled four-sided border. Backgrounds, borders, scrollbar parts, and recognised vector shapes. |
+| `Shaded` | `ShadedQuad` | A rectangle filled or covered by an application [shader effect](/docs/advanced/custom-shaders). Names a shader and a parameter block. |
+| `Shadow` | `Shadow` | One `box-shadow`, outer or inset. |
+| `Marks` | `MarkItem` | Many recognised shapes (discs, boxes, polylines, glyph cells) drawn from a shared payload with one paint. See [Marks](#marks). |
+| `Vector` | `VectorItem` | A path for the general rasteriser, planned into a pass rather than drawn directly. |
+| `Decoration` | `Decoration` | One text decoration line. |
+| `MonoSprite` | `MonoSprite` | A single-channel coverage tile: a glyph or an atlas vector mask. |
+| `SubpixelSprite` | `SubpixelSprite` | A glyph tile with per-channel coverage. |
+| `ColorSprite` | `ColorSprite` | A full-colour tile: an image, a colour emoji, a CPU vector layer. Takes corner radii and an opacity. |
+| `External` | `ExternalQuad` | A texture the renderer did not produce, such as a video frame. |
 | `Backdrop` | `BackdropFilter` | A filter over the composite already beneath it. |
-| `GroupStart` / `GroupEnd` | `GroupBoundary` | The matched pair that redirects everything between them into a target of its own, then composites it back with an opacity, a blend mode and a filter chain. |
+| `GroupStart` / `GroupEnd` | `GroupBoundary` | A matched pair that redirects everything between them into a target, then composites it back with an opacity, blend mode and filter chain. |
 
-A **sprite** is a rectangle of a texture drawn at a place on the screen. The texture is an **atlas**
-— one large image holding many small ones, so that a thousand glyphs read one texture and draw in
-one call. `SpriteTile` names the texture and the texel rectangle inside it.
+A **sprite** is a rectangle of a texture drawn somewhere on screen. The texture is usually an
+**atlas** holding many small images, so a thousand glyphs bind one texture and draw in one call.
 
 ```rust
 // crates/zgui-scene/src/prim/quad.rs
 pub struct Quad {
-    pub order: DrawOrder,   // u32, and always at offset zero
-    pub style: u32,         // BorderStyle in the low byte, dash phase above
+    pub order: DrawOrder,       // always at offset zero
+    pub style: u32,             // BorderStyle in the low byte, dash phase above
     pub bounds: [f32; 4],
-    pub radii: [f32; 8],    // elliptical, two per corner, clockwise from top left
-    pub border: [f32; 4],   // top, right, bottom, left
+    pub radii: [f32; 8],        // two semi-axes per corner, clockwise from top left
+    pub border: [f32; 4],       // top, right, bottom, left
     pub fill: PaintRef,
     pub stroke: PaintRef,
-    pub clip: u32,          // ClipId
-    pub transform: u32,     // SpatialId slot
+    pub clip: u32,              // ClipId
+    pub transform: u32,         // SpatialId slot
+    pub shape: f32,             // superellipse exponent; 2 is an ellipse
+    pub paint_origin: [f32; 2],
 }
 ```
 
-Every instance begins with its `DrawOrder` and ends with its clip and transform indices. That shape
-is the same for all of them.
-
 <Accordions>
-<Accordion title="Shadows, sprites and the rest, in detail">
+<Accordion title="Shadow and sprite details">
 
-`Shadow` carries two rectangles because the shape it casts and the pixels it covers are different
-things:
+`Shadow` carries three rectangles: the shape it blurs, the box it belongs to, and the pixels it
+covers.
 
 ```rust
 // crates/zgui-scene/src/prim/shadow.rs
@@ -160,807 +153,658 @@ pub struct Shadow {
     pub order: DrawOrder,
     pub blur: f32,                  // standard deviation, device pixels
     pub bounds: [f32; 4],           // everything it paints
+    pub shape_bounds: [f32; 4],     // the blurred shape
     pub radii: [f32; 8],
-    pub element_bounds: [f32; 4],   // the casting box
+    pub element_bounds: [f32; 4],   // the casting box (outer) or the clipping box (inset)
     pub element_radii: [f32; 8],
     pub color: [f32; 4],            // premultiplied, gamma-encoded sRGB
     pub clip: u32,
     pub transform: u32,
     pub inset: u32,
-    pub reserved: u32,              // written zero, so there is no padding
-}
-
-impl Shadow {
-    pub const BLUR_EXTENT: f32 = 3.0;
+    pub shape: f32,                 // superellipse exponent of the corners
 }
 ```
 
-A drop shadow's `bounds` is the shape, offset and outset by the spread, then outset by
-`3.0 * blur` on every side. Three standard deviations puts the remaining Gaussian below one part in
-a thousand, which is under half a level at eight bits per channel.
+For a drop shadow, `shape_bounds` is the border box offset and grown by the spread, and `bounds` is
+that dilated by `Shadow::BLUR_EXTENT = 3.0` standard deviations. For an inset shadow,
+`element_bounds` is the **padding box** (so the shadow never covers the border), `shape_bounds` is
+the hole (the padding box offset and shrunk by the spread, with concentric corners), and `bounds` is
+the padding box.
 
-`MonoSprite` and `SubpixelSprite` come from one macro and are laid out identically. They are two
-types only so that a batch of one never mixes with a batch of the other, because they need different
-device pipelines. Which one a glyph run becomes is decided at emit time by two independent
-conditions: whether the device supports dual-source blending, and whether the destination is opaque.
-Per-channel coverage writes no alpha, so a run landing inside an isolated group has to be a
-`MonoSprite`.
+`MonoSprite` and `SubpixelSprite` share a layout. They are separate types so that a batch never
+mixes them, because they need different pipelines. A glyph run uses per-channel coverage only when
+the device supports dual-source blending, the target it lands in is opaque, and its transform moves
+it by whole device pixels. A run inside an isolated group, or under a fractional pan, scale or
+rotation, uses `MonoSprite`.
 
-`ExternalQuad` is the one primitive that is neither instanced nor `Pod`. Each one is drawn on its
-own with its own bind group, because each names a different texture.
+`ExternalQuad` is the one primitive that is neither instanced nor `Pod`. Each is drawn on its own
+with its own bind group.
 
 </Accordion>
 </Accordions>
 
 ## Clips
 
-A **clip** is a shape that admits some pixels of a primitive and refuses the rest. A scroll port
-clips its rows; a rounded button clips its background image.
+A **clip** admits some pixels of a primitive and refuses the rest: a scrollport clipping its rows, a
+rounded button clipping its image.
 
 ```rust
 // crates/zgui-scene/src/clip/
 pub enum ClipLink {
-    RoundedRect { rect: Rect<DevicePx, Device>, radii: Corners<Vec2<DevicePx>> },
+    RoundedRect {
+        rect: Rect<DevicePx, Device>,
+        radii: Corners<Vec2<DevicePx>>,
+        shape: CornerShape,
+        space: SpatialId,
+    },
     Mask { tile: AtlasTile, transform: SpatialId, source: MaskSource },
 }
 
 pub enum ClipNode { Root, Link { link: ClipLink, parent: ClipId } }
-
-pub type ClipTable = Table<ClipId, ClipNode>;
 ```
 
-Chains are a trie, stored innermost first with parent pointers. Two chains that share an outer
-prefix share nodes, and `ClipTable::common_ancestor` is a walk up two parent pointers. A primitive
-carries one `u32`.
+Clip chains form a trie stored innermost-first with parent pointers. Chains that share an outer
+prefix share nodes, and a primitive carries a single `u32`.
 
-```rust
-impl ClipTable {
-    pub const MAX_INLINE_ROUNDED: usize = 2;
-    pub fn push(&mut self, parent: ClipId, link: ClipLink) -> ClipId;
-    pub fn depth(&self, id: ClipId) -> u32;
-    pub fn resolve(&self, id: ClipId) -> ResolvedClip;
-    pub fn needs_group_target(&self, id: ClipId) -> bool;   // rounded > 2 || masks > 1
-    pub fn bounds(&self, id: ClipId) -> Rect<DevicePx, Device>;
-    pub fn bounds_in(&self, id: ClipId, space: u32) -> Rect<DevicePx, Device>;
-    pub fn residual(&mut self, id: ClipId, ancestor: ClipId) -> ClipId;
-}
-```
+- `ClipTable::resolve` intersects every rectangle in a chain into one box and keeps at most
+  `MAX_INLINE_ROUNDED = 2` rounded tests. A fragment shader evaluates those per pixel.
+- A chain that needs more rounded tests, or more than one mask, is reported by `needs_group_target`
+  and gets a group target. It is never silently truncated.
+- `common_ancestor` and `residual` split a chain into a shared part and a remainder. Vector pass
+  planning uses them.
 
-`resolve` intersects every rectangle in the chain into one axis-aligned box and keeps at most
-`MAX_INLINE_ROUNDED` rounded tests, which is what a fragment shader can evaluate per pixel. What
-overflows that budget is **not** silently dropped: `needs_group_target` reports it, and the caller
-must ask. Applying two of three rounded tests is a wrong pixel with no error attached to it.
-
-`Scene::push_*` culls with `ClipTable::bounds_in`. It intersects only clip links measured in the
-same coordinate system as the primitive's ink:
-
-```rust
-// crates/zgui-scene/src/scene/insert.rs
-fn assign_order(
-    &mut self,
-    ink: Rect<DevicePx, Device>,
-    clip: ClipId,
-    space: u32,
-) -> Option<DrawOrder> {
-    let admitted = self.clips.bounds_in(clip, space);
-    let Some(clipped) = ink.intersection(admitted) else {
-        counter::bump(Counter::PrimitivesCulled);
-        self.note_unreplayable();
-        return None;
-    };
-    // ...
-}
-```
-
-A row of a thousand-row list that has scrolled out of its port never reaches an array, never enters
-the bounds tree and never reaches the operation log. `push_*` returns `None` and the caller counts
-one culled primitive.
-
-A clip measured in another coordinate system cannot be compared with this local ink. The cull
-leaves that link for the shader, which resolves the complete chain through the frame's matrices.
-This admits some primitives that the shader later clips, but it does not incorrectly remove content
-that a transform moved into view.
+`Scene::push_*` culls with `ClipTable::bounds_in(clip, space)`, which intersects only the links
+measured in the same coordinate system as the primitive's ink. A row scrolled out of its port never
+reaches an array, the bounds tree or the log. A link in another coordinate system is left to the
+shader, which resolves the full chain through the frame's matrices, so content that a transform
+moved into view is never wrongly culled.
 
 ## Coordinate systems
 
-A transform is not stored in the instance either. `SpatialTree` holds the matrices, and a primitive
-carries a slot index.
+A primitive names its coordinate system by a slot index into `SpatialTree`, not by a matrix. A
+coordinate system is identified by the **box that establishes it**. Moving the box updates a node
+instead of creating a new identity, and a thousand untransformed rows all resolve to one node.
 
-The name of a coordinate system is **the box that establishes it**, not the matrix it currently
-holds. Moving a box is therefore a write into a node rather than a new identity, and a thousand rows
-with no transform of their own all resolve to one node — a doctest in
-`crates/zgui-scene/src/spatial/space.rs` asserts `tree.len() == 1` for exactly that case.
+`Placements::of(&tree)` flattens the tree into the dense matrix array that a shader indexes. Each
+slot keeps an occupancy generation, so a name whose box has gone is refused rather than resolved
+through a slot that another box now owns. Because a primitive carries only the slot, the scene can
+record full names beside each log entry and check them with
+`Scene::record_spatial_dependencies(true)` and `check_spatial_dependencies()`. These checks are
+enabled when `ZGUI_INVARIANTS` is set.
 
-`Placements::of(&tree)` flattens the tree into the dense array of matrices a shader indexes. A slot
-no node occupies holds the identity. Each slot also keeps an occupancy generation, so a name whose
-box has gone is **refused** rather than answered out of a slot some other box now owns.
+## Draw order
 
-That refusal cannot be made per primitive, because a primitive carries only the slot. So the scene
-keeps an optional audit: `Scene::record_spatial_dependencies(true)` records the full name beside
-each log entry, and `Scene::check_spatial_dependencies()` reports every primitive whose slot changed
-hands under it. It is enabled by default when `ZGUI_INVARIANTS` is set
-(`crates/zgui-scene/src/invariant/mod.rs`). Without it, a box drawn through an unrelated box's matrix
-looks plausible and passes every other check the project has.
-
-## Draw order: the bounds tree
-
-Every primitive carries a `DrawOrder`, which is a `u32`. Higher draws later. The number comes from
-an R-tree over the inks already inserted this frame:
+Every primitive carries a `DrawOrder` (`u32`); higher draws later. The order comes from an R-tree
+over the inks inserted so far this frame (`crates/zgui-scene/src/order/tree.rs`):
 
 ```rust
-// crates/zgui-scene/src/order/tree.rs
 let mut tree = BoundsTree::new();
 assert_eq!(tree.insert(rect(0.0)), 1);
 assert_eq!(tree.insert(rect(5.0)), 2, "overlaps the first, so it sorts above it");
 assert_eq!(tree.insert(rect(100.0)), 1, "disjoint, so it reuses the low order");
 ```
 
-`insert` returns one more than the highest order among everything the rectangle intersects. Each
-node caches the highest order in its subtree, so the query prunes on the cached order and on the
-bounding box. `MAX_CHILDREN` is 12 — wide rather than binary, because the per-node work is one
-bounding-box test and a shallower tree touches fewer nodes. The file carries a `DERIVED-FROM` header
-crediting the GPUI project's `bounds_tree.rs` under Apache-2.0.
+`insert` returns one more than the highest order among everything the rectangle intersects. Nodes
+cache their subtree's highest order, and `MAX_CHILDREN` is 12. Two properties follow, and the rest
+of the crate relies on them:
 
-Two consequences carry the rest of the crate:
+1. **Disjoint content reuses low orders**, so a page of non-overlapping boxes draws in few calls.
+2. **Equal order implies no overlap.** Two primitives at the same order cannot cover the same pixel,
+   so their sequence is free and is used for batching.
 
-1. **Disjoint content reuses low orders.** A page of a hundred non-overlapping boxes ends with a
-   hundred primitives at order one, and a renderer draws them in one call.
-2. **Equal order implies no overlap.** Anything that overlaps something already inserted is given a
-   strictly higher order. Two primitives at equal order cannot be on top of one another, so their
-   relative sequence cannot change a pixel — which is why the sequence may be chosen for batching.
+The tree compares **device rectangles**. Each primitive's ink is recorded in the space it is drawn
+in and placed through that space's matrix before insertion. A primitive in a transformed subtree is
+ordered against what it covers on screen, not against an untransformed box.
 
-Two barriers sit over the query. `insert_above_all` ignores overlap and takes the global maximum
-plus one, which is what a group marker needs so that unrelated content reusing a low order cannot
-land inside a group's range. `set_order_floor` raises the minimum for everything inserted
-afterwards. A closing marker raises the floor to its own order **plus one**, because `GroupEnd` is
-last in the kind order at equal draw order.
+Two shortcuts reduce the number of queries without breaking the second property:
 
-Painting order itself is not this structure's business. It assigns numbers; correct CSS painting
-order comes from emitting primitives in the right sequence. That is the walk.
+- **Runs.** A line of text is a few dozen glyphs side by side. `Scene::begin_run` orders them against
+  each other locally, files the whole run as one block above whatever its union overlaps, and gives
+  each glyph the block's base plus its local order. That is one query instead of one per glyph.
+- **Replayed chunks.** A recorded chunk carries its members' orders relative to each other. A replay
+  asks the tree once where the chunk now sits (`insert_block`) and adds the stored offsets.
+
+Both can only err upwards: a primitive may take a higher order than its own query would give, never
+an order equal to something it overlaps.
+
+`insert_above_all` ignores overlap and takes the global maximum plus one. Group markers use it, so
+unrelated content cannot land inside the group's range. `set_order_floor` raises the minimum for
+later inserts; a closing marker sets it to its own order plus one.
+
+Draw order does not decide CSS painting order. Painting order comes from the sequence in which the
+walk emits primitives.
 
 ## The stacking-order walk
 
-A document is not painted in document order. It is painted as a forest of **stacking contexts** — a
-stacking context is the unit painting order is decided in, established by a box with a `z-index`, a
-transform, an `opacity` below one and a few other properties. Inside each one, children are painted
-in the passes of CSS 2.1 Appendix E: negative stacking children, block backgrounds, floats, inline
-content, positioned and zero-index children, then positive stacking children.
-
-Which pass a box belongs to and what it sorts by are the layout stage's answers, called from here.
-What paint adds is an inside and an outside:
+A document is painted as a forest of **stacking contexts**, each established by a box with a
+`z-index`, a transform, `opacity` below one, or a similar property. Inside a stacking context,
+children are painted in the passes of CSS 2.1 Appendix E: negative stacking children, block
+backgrounds, floats, inline content, positioned and zero-index children, positive stacking children.
 
 ```rust
 // crates/zgui-paint/src/walk/stacking.rs
 pub trait Visitor {
-    /// Called on the way in. Returning `false` skips the box's subtree entirely.
+    /// Asked once per child before it is ranked. Returning `false` drops its subtree.
+    fn descends(&mut self, store: &LayoutStore, key: BoxKey) -> bool { true }
+    /// Called on the way in. Returning `false` skips the box's subtree.
     fn enter(&mut self, store: &LayoutStore, key: BoxKey) -> bool;
-    /// Called on the way out, and only for a box whose `enter` returned `true`.
+    /// Called on the way out, only for a box whose `enter` returned `true`.
     fn leave(&mut self, store: &LayoutStore, key: BoxKey);
 }
-
-pub fn walk(store: &LayoutStore, root: BoxKey, visitor: &mut impl Visitor);
-pub fn children_in_paint_order(store: &LayoutStore, key: BoxKey) -> Vec<BoxKey>;
 ```
 
-`children_in_paint_order` sorts by `(level, z_index, document position)` with a **stable** sort, so
-two children in the same pass with the same `z-index` keep the order they were laid out in. A flex
-`order` has already moved that position, exactly as it moves painting.
+`walk` reads each box's layout child list, keeps the children that `descends` accepts, and only then
+ranks them by `(level, z_index, document position)` with a stable sort. Ranking is the expensive
+part, so a damaged corner of a long list ranks only the few rows it touches. The order of the kept
+children is the same as a full sort would give. `enter` and `leave` are separate because a group
+must open before its subtree and close after it, and an outline is drawn after the descendants it
+sits over (Appendix E step ten).
 
-The enter-and-leave shape exists for two reasons. A group must be opened before its subtree and
-closed after it. And an outline must be drawn after the descendants it sits over — Appendix E's step
-ten — which is why the outline is emitted in `leave` and not beside the background.
+For every box it reaches, the walk:
 
-A subtree whose folded opacity is zero is refused before either stack is pushed. No descendant can
-change a pixel, so paint skips its style lookups, ink tests, and child walk as well as its
-primitives. Fully transparent vector items and singular transformed vector subtrees are also
-removed before vector pass planning.
+1. **Tests the subtree** in `descends`, before the box is ranked. If the damage misses the union of
+   its fragments' `subtree_ink` (plus caret and selection marks), the subtree is counted as skipped
+   and dropped.
+2. **Lowers the style** with `PaintStyleCache::lower`. The result is memoised on the identity of the
+   shared computed-value groups, so a thousand identical buttons lower a handful of paint styles.
+3. **Applies running animations** to a *copy* of the lowered style, because the cached entry is
+   shared.
+4. **Decides isolation**: `None`, `Folded(alpha)` or `Target`. It opens a group or pushes a backdrop
+   if needed.
+5. **Pushes the stacks**: folded alpha, target opacity, text decorations and the text fill ramp.
+6. **Paints each fragment**, by replay or by encoding.
 
-### What one fragment emits, in order
+A subtree whose folded opacity is zero is refused before anything is pushed, with no style lookups,
+ink tests or child walk.
 
-Stated once, in `crates/zgui-paint/src/walk/order.rs`:
+One fragment emits, in order (`crates/zgui-paint/src/walk/order.rs`):
 
-1. the shadows the box casts outwards, behind everything;
-2. its background, and its border over that;
-3. the shadows it casts inwards, over the background;
-4. its content — glyphs, an image, its own outlines, a scrollbar part;
-5. and, after the box's *descendants* rather than here, its outline.
-
-### What `enter` does
-
-`crates/zgui-paint/src/walk/mod.rs`, in order, for every box the walk reaches:
-
-<Steps>
-
-<Step>
-
-**Test the subtree.** Take the union of every fragment's `subtree_ink`, plus the extents of the
-caret and selection marks drawn with a line. If the damage does not reach it, count one skipped
-subtree and return `false`. Nothing below is visited.
-
-</Step>
-
-<Step>
-
-**Lower the style.** `PaintStyleCache::lower` turns the computed style into the paint stage's own
-representation, memoised on the identity of the shared computed-value groups the style is made of. A
-thousand identically styled buttons lower a handful of paint styles.
-
-</Step>
-
-<Step>
-
-**Compose the animation.** Any running animation's overrides are composed onto a **copy** of that
-lowering. The entry itself is shared with every element that cascaded to the same result, so writing
-an animated value into it would animate all of them.
-
-</Step>
-
-<Step>
-
-**Decide isolation.** `Isolation::None`, `Isolation::Folded(alpha)` or `Isolation::Target`. A
-backdrop filter is pushed here; a group boundary is opened here when a target is needed.
-
-</Step>
-
-<Step>
-
-**Push the stacks.** The folded alpha, whether the target in force is opaque, the text decorations
-contributed by this box, and the text ramp it contributes. Each is pushed once per entered box and
-popped once per leave, whatever the box turned out to hold.
-
-</Step>
-
-<Step>
-
-**Paint each fragment of the box**, by replay or by encoding.
-
-</Step>
-
-</Steps>
+1. outer shadows;
+2. background, then border;
+3. inset shadows;
+4. content: glyphs, an image, drawings, a scrollbar part;
+5. after the box's descendants, its outline.
 
 ### Groups and the opacity fold
 
-A blend mode, a filter, an explicit `isolation`, a `clip-path` shape and a three-dimensional
-transform all need a boundary whatever the content is. **Opacity is the one that sometimes does
-not.** Double-darkening only happens where two primitives of the subtree overlap. Where they do
-not, multiplying the alpha into each primitive's own paint gives identical pixels and costs nothing.
+Blend modes, filters, explicit `isolation`, `clip-path` and 3D transforms always need a group target.
+Opacity does not, as long as no two primitives of the subtree overlap: multiplying the alpha into
+each primitive's paint gives identical pixels at no cost. That decision is made over the **fragment
+tree's** ink during layout, not over what a frame emitted, so a frame that painted half a subtree
+gets the same answer as one that painted all of it.
 
-That decision is taken over the *fragment tree's* ink, on the layout stage's unwind, and only read
-here. It is deliberately not taken over the primitives a frame emitted: a frame that painted half a
-subtree would answer differently from one that painted all of it, and the two would differ by a
-pixel.
-
-Group markers are matched pairs and are **never culled** — not by a clip that admits nothing, and
-not by a damage set that misses them. Half a pair leaves a target open, or composites one that was
-never begun.
+Group markers are never culled, by clips or by damage. Half a pair would leave a target open.
 
 ## Culling against damage
 
-**Damage** is the set of rectangles of the surface that the frame must redraw; everything outside
-them still holds the previous frame's pixels. `DamageSet` holds at most four, pairwise disjoint, or
-the single flag that says the whole surface (see [Invalidation](/docs/architecture/invalidation)).
+**Damage** is the set of device rectangles a frame must redraw. Everything outside it still holds
+the previous frame's pixels. A `DamageSet` holds up to `MAX_DAMAGE = 6` pairwise-disjoint rectangles,
+or a "full" flag. How damage is collected and merged, mostly by layout's fragment diff, is covered in
+[Invalidation and damage](/docs/architecture/invalidation).
 
-The gate is **not a dirty bit.** The renderer clears each damage rectangle before redrawing it, so
-everything intersecting one has to be emitted whether it changed or not. A clean row under a
-repainting tooltip is emitted. A dirty fragment far from every rectangle cannot exist, because
-whatever made it dirty put its ink in the set.
+**The cull tests intersection, not a dirty bit.** The renderer clears each damage rectangle before
+redrawing it, so everything that touches one must be emitted, whether it changed or not.
 
-So the test is intersection, at three places:
-
-| Where | What is tested | What it saves |
+| Where | Tested | Saves |
 |---|---|---|
-| `Visitor::enter` | The union of the subtree's ink, plus caret and selection marks | A whole subtree, in constant time. This is what makes a hover on a thousand-row table cost the rows near the pointer. |
-| `Painter::paint` | One fragment's `cull_rect`, which is its ink unioned with any read extent, plus marks | One fragment, while its children are still visited — a child can paint outside its parent. |
-| `Scene::push_*` | The primitive's ink against clip links measured in the same coordinate system | One primitive that its local clip bounds admit nothing of. |
+| `Visitor::descends` | Union of the subtree's ink, plus caret and selection marks | A whole subtree in constant time. A hover over a thousand-row table costs the rows near the pointer. |
+| `Painter::paint` | One fragment's `cull_rect`: its ink plus any read extent | One fragment. Its children are still visited, because they can paint outside it. |
+| `Scene::push_*` | The primitive's ink against same-space clip links | One primitive. |
 
-```rust
-// crates/zgui-paint/src/walk/mod.rs
-fn reaches(&self, rect: Rect<DevicePx, Device>) -> bool {
-    self.input.damage.is_full() || self.input.damage.intersects(pixels(rect))
-}
-```
+### Growing the damage before the walk
 
-Nothing is skipped when the damage set is full, and group markers are never skipped at all.
-
-### Why the damage is grown first, and frozen
-
-Some fragments read pixels they do not write. A blur, a drop shadow and a `backdrop-filter` all
-sample outside their own bounds. `zgui_paint::expand` grows the damage over a registry of exactly
-those fragments, before the walk starts:
+Some fragments read pixels they do not write: blur, drop-shadow filters and `backdrop-filter`.
+Before the walk, `zgui_paint::expand` grows the damage over a registry of exactly those fragments:
 
 ```rust
 // crates/zgui-paint/src/damage/accumulate.rs
-pub struct Expansion { pub absorbed: usize, pub passes: usize, pub escalated: bool }
 pub const FULL_DAMAGE_SHARE: f64 = 0.5;
-
 pub fn expand(store: &LayoutStore, damage: &mut DamageSet,
               surface: Size<i32, Device>, scale: f32) -> Expansion;
-pub fn vacated(document: &mut Document, store: &LayoutStore, damage: &mut DamageSet) -> usize;
 ```
 
-It walks the registry and not the fragment tree, and it runs to a fixpoint bounded by the registry's
-length, because one grown rectangle can reach a second group's source region. It escalates to the
-whole surface on two triggers: the damaged area passing `FULL_DAMAGE_SHARE` of the surface, or the
-iteration bound running out.
+One grown rectangle can reach another group's source, so expansion runs to a fixpoint, bounded by
+the registry's length. It escalates to full damage when the damaged area passes half the surface or
+the bound runs out.
 
-The order is load-bearing in both directions:
+Expansion must run before the walk, not during or after it:
 
-- **Expansion cannot be folded into the walk.** The walk skips a clean subtree in constant time on
-  its ink, and a read extent is deliberately not part of that ink. A blurred panel whose own pixels
-  are untouched, over animating content, would be skipped at an ancestor — and the region its blur
-  samples would be cleared by the renderer and repainted by nobody.
-- **Expansion cannot run after the walk.** A rectangle added afterwards is cleared and never
-  redrawn. That is a hole rather than a smear.
+- **Not during.** The walk skips clean subtrees on their ink alone. A blurred panel over animating
+  content would be skipped while its source region was cleared.
+- **Not after.** A rectangle added after the walk is cleared and never redrawn.
 
-`read_extent_of` and `cull_rect` call the same `zgui_scene::group::read_extent` the expansion did.
-Two readers, one implementation, on purpose: if they disagreed, the difference would be a region
-read but never repainted. The `scale` passed to `expand` must be the frame's own, for the same
-reason — a filter's reach is a length.
-
-`vacated` is the third rectangle and is neither of the two: a removed subtree leaves pixels behind
-that no living fragment can report. It **takes** the removed roots out of the document, so exactly
-one caller may run it, and it must run while the removed geometry still exists.
-
-### What that is worth
-
-From the "Where the frame's cost is" table in `docs/performance.md`, written by `cargo xtask perf`:
-
-| Scenario | Primitives emitted | Primitives culled | Bounds-tree inserts |
-|---|---:|---:|---:|
-| idle | 0 | 0 | 0 |
-| hover-storm | 9 975 | 241 916 | 9 975 |
-| scroll | 121 020 | 29 242 | 121 020 |
-| cold-start | 844 | 4 575 | 844 |
-| kitchen-sink | 114 169 | 171 683 | 114 169 |
-
-A hover storm culls twenty-four primitives for every one it emits. Per frame, that is
-`hover.primitives_emitted` at **41.56 primitives**, against a count ceiling of 200
-(`docs/performance.md`); the stated reason for the ceiling is that "two rows changed, so a frame
-that emits the table is the defect". A scroll is the other shape: it emits far more than it culls,
-because a scroll moves nearly everything on the screen.
-
-`bounds_tree_inserts` equals `primitives_emitted` in every scenario. Draw-order assignment is
-proportional to what a frame emits, never to the size of the document.
+`read_extent_of` and `cull_rect` call the same `read_extent` function as the expansion, so the region
+read and the region repainted always agree.
 
 ## Recording and replay
 
-The second memoisation is per fragment. A paint record owns an `Arc<ChunkPrims>`: a complete,
-rebased copy of the primitives that fragment encoded. It does not point into a previous frame. The
-scene has no retained previous-frame operation log.
+Besides the paint-style cache, paint keeps one record per fragment. A paint record owns an
+`Arc<ChunkPrims>`: a self-contained copy of the primitives that fragment encoded. Records are kept
+across frames whether or not a frame visits the fragment.
 
-The capture happens before clip culling and draw-order insertion. Replay therefore starts with the
-complete painting and pushes it through the current frame's ordinary clip, cull, and ordering
-path. A fragment can stay replayable while it is outside a scrollport, then reappear without a
-special partial-record rule.
-
-The record stays with the fragment across frames, including frames that do not visit it. Layout
-reports fragment retirement explicitly. A generational fragment key prevents a retired record from
-being assigned to a later fragment that reuses its arena slot.
-
-Clip and paint tables also keep a bounded journal of changed slots. A renderer holds a
-`TableVersion` and asks for changes since that version without draining the journal. If the version
-is older than the journal, the answer is `ChangeCoverage::All`; otherwise it is the exact slot list.
-The wgpu backend uses this to keep its flattened CPU tables and device buffers across frames.
-Stable scene identifiers therefore provide both replay correctness and incremental GPU updates.
-
-The record owns the holds for every clip, paint, coordinate-system entry, and atlas tile that its
-chunk names. These resources remain valid until the record is retired or evicted.
-
-### What makes a recording reusable
+Capture happens before clip culling and draw-order insertion. A replay therefore pushes the complete
+painting through the current frame's ordinary clip, cull and ordering path, and a fragment can leave
+a scrollport and come back without a special case. Layout reports fragment retirement explicitly, and
+generational fragment keys stop a retired record from being matched to a fragment that reuses its
+slot.
 
 ```rust
 // crates/zgui-paint/src/walk/replay.rs
 pub enum Reuse { Encode, Replay(Size<DevicePx, Device>) }
-
-pub struct Record {
-    pub prims: Arc<ChunkPrims>,
-    pub revision: u64,
-    pub kind: FragmentKind,
-    pub painted: Painted,
-    pub border_box: Rect<DevicePx, Device>,
-    pub clip_hash: Option<u64>,
-    pub last_selected: u64,
-    pub resources: Vec<AtlasKey>,
-}
 ```
 
-`revision` is unique for each encoding. It gives a persistent GPU copy an identity that changes
-when the fragment re-encodes. A replay offset is always measured from the recorded `border_box`.
-The record does not move its origin after replay, so repeated movements cannot accumulate an error
-from the most recent selection.
+- `Record::revision` is unique per encoding. It gives the renderer's persistent GPU copy an identity
+  that changes when the fragment re-encodes.
+- A replay offset is measured from the recorded border box, so repeated moves do not accumulate
+  error.
+- The record holds references on every clip, paint, shader parameter block, coordinate-system entry
+  and atlas tile its chunk names (each atlas key once). They stay valid until the record is retired
+  or evicted.
 
-A vector item can replay when its encoded device-space curves did not move. Movement re-encodes the
-item; an unchanged drawing does not enter the vector encoder again.
+The record cache has a 64 MiB budget (`PAINT_CHUNK_BYTES`). Records selected this frame are pinned,
+and the coldest others are evicted first. An evicted fragment's pixels stay in the composed target
+until its next damaged visit re-encodes it.
 
-### What invalidates a recording
+### What invalidates a record
 
-`Painted` is the whole comparison. It is `Copy` and `Eq`, and every field is there because nothing
-else in the record moves when that thing changes.
+`Painted` is the whole comparison: a `Copy + Eq` struct whose fields cover everything that can change
+the painting without changing anything else in the record.
 
-```rust
-pub struct Painted {
-    pub style: PaintStyleRef,
-    pub clip: ClipId,
-    pub transform: SpatialId,
-    pub transform_hash: u64,
-    pub custom: u64,
-    pub content: u64,
-    pub scale: u32,
-    pub decorations: u64,
-    pub text_fill: u64,
-    pub anim: u64,
-    pub alpha: u32,        // f32 bits, because the record is compared for Eq
-    pub highlights: u64,
-}
-```
-
-| Field | The bug it prevents |
+| Field | Detects |
 |---|---|
-| `transform_hash` | The `SpatialId` is the same name on the first frame of a movement and the last. Without the hash of the matrix it resolved to, nothing moves. |
-| `custom` | A custom element changed its primitives without changing its node or geometry. |
-| `content` | An image source or vector source changed behind a stable node identity. |
-| `scale` | Device-scale-dependent bytes replay after a display-scale change. |
-| `decorations` | Text decorations come from boxes *above* the fragment. Without this, changing `text-decoration` on a paragraph replays every line inside it unchanged. |
-| `text_fill` | Same route: the ramp painting a heading's letters is declared on the heading, and the line boxes belong to an anonymous box under it. |
-| `anim` | A lowered style is shared and does not move while an animation runs. Without this, the first frame of every animation is replayed for the animation's whole length. |
-| `alpha` | An ancestor's folded opacity. Without this, a panel fading out is a panel whose contents never fade. |
-| `highlights` | A blinking caret moves nothing else about a line. Without this, the caret freezes in whichever phase it was first encoded in. |
+| `style`, `clip`, `transform` | A new lowered style, clip chain or coordinate system. |
+| `transform_hash` | A change of scale or rotation under the same `SpatialId`. Translation is excluded: the renderer places instances through the matrix, so a recording replays under any translation of its space. |
+| `custom` | A custom element repainting in place. |
+| `pointer` | An effect that reads the pointer position. Zero for every other box. |
+| `content` | An image or drawing source changing behind a stable node. |
+| `cut` | A line's cut or ellipsis moving inside an unmoved line box. |
+| `scale` | Device-scale-dependent bytes after a display-scale change. |
+| `decorations`, `text_fill` | `text-decoration` or a text gradient set on an ancestor. |
+| `anim` | Animations overriding a shared lowered style. Without it, the first frame of an animation would replay for its whole length. |
+| `alpha` | An ancestor's folded opacity. Stored as `f32` bits so the struct is `Eq`. |
+| `subpixel` | Whether text runs keep per-channel coverage. Opening a group target or panning by a fraction of a pixel changes it without moving any other field. |
+| `corners` | Corner radii, which the lowered style does not hold. |
+| `highlights` | Caret and selection bands on a line. Without it, a blinking caret freezes. |
 
-`Record::resources` is how a replayed chunk keeps its atlas tiles alive. A replay re-emits instances
-that already carry their texture rectangle, so nothing on that path consults the glyph cache. The
-keys are **distinct**, each held once: a hold that counted repetitions would need exactly as many
-releases, and one miscount is either a tile that can never be freed or one freed while it is being
-drawn.
-
-The cache has a 64 MiB soft budget. Chunks selected in the current frame are pinned. Budget
-enforcement evicts the coldest other records by `last_selected`. The composed target keeps its
-existing pixels; the next damaged visit re-encodes the missing chunk.
-
-### What replay does
+### Replaying a chunk
 
 ```rust
-pub fn replay(&mut self, chunk: &ChunkPrims, by: Size<DevicePx, Device>);
+pub fn replay_chunk(&mut self, chunk: &ChunkPrims, by: Size<DevicePx, Device>, source: u64) -> Range<u32>;
 ```
 
-- **Draw order is not replayed.** Every re-emitted primitive goes through the ordinary push path, so
-  it is ordered against *this* frame's neighbours. Order depends on what else is on the surface, and
-  carrying a stale one forward would put a row underneath something newly drawn over it.
-- Bounds are translated by `by`. Shadows translate their `element_bounds`; backdrops translate
-  both `bounds` and `source`.
-- Vector items replay at zero offset. A moved vector is re-encoded because its curves are already
-  in device coordinates.
+- **One order query per chunk.** The chunk's members were ordered against each other at capture and
+  have moved rigidly since, so the tree is asked once where the chunk sits and each member keeps its
+  offset.
+- **Bounds are translated by `by`.** Shadows translate their element and shape rectangles, backdrops
+  translate bounds and source, and marks move their origin. Clips the encoding created are
+  re-interned at the moved position under the same id.
+- **The offset is recorded.** `Scene::chunk_offsets` records each replayed chunk's offset, so a
+  renderer that keeps the chunk resident applies the offset in the shader and uploads nothing (see
+  [GPU tables and buffers](/docs/architecture/renderer#gpu-tables-and-buffers)). The frame arrays
+  still hold the translated bytes for a renderer that does not.
+- **Vector items replay at any offset.** A moved item keeps its path and moves its placement and
+  ink, so the rasteriser's encoding stays valid (`VectorReplaysMoved`).
+
+## SVG drawings and inherited paint
+
+`zgui-svg` reads SVG into a flat list of `Shape`s (path, fill, stroke, clips), expressed in `kurbo`,
+`peniko` and zgui's `Color`. Group transforms are applied to geometry, group opacity is folded into
+paint, and clip paths are carried per shape, so a consumer walks a list instead of a tree.
+Unsupported features (text, images, masks, filters, blend modes, patterns) are counted in
+`Unsupported`, not silently dropped. Because group opacity is folded per shape, overlapping children
+of a translucent group show through each other.
+
+To tell an icon from a logo, the parser reads the document twice with two different root `color`
+values. A paint that changes with the root colour uses `currentColor` and becomes `Ink::Inherited`.
+Anything else keeps its own colour. If the two parses do not line up, the first is used unchanged:
+an icon may stop following its element's colour, but a logo never loses its colours.
+
+Inherited paint comes from the element, not from `fill`, because the SVG paint properties are not
+part of zgui's cascade:
+
+| Source | Meaning |
+|---|---|
+| `color` | The default fill, so `.icon:hover { color: … }` themes an icon with no extra mechanism. |
+| `--zgui-fill`, `--zgui-stroke`, `--zgui-stroke-width` | Inherited overrides for fill, stroke and stroke width. |
+
+## Vector routes
+
+Vector content (an icon, an SVG document, a canvas scene) can always be drawn by the general GPU path
+rasteriser. That rasteriser is expensive to build and needs a scratch pass per batch, so paint tries
+cheaper routes first and keeps the general route for what nothing else can draw. The application
+side is in [Vector and canvas](/docs/building/vector-and-canvas); how the general route is rasterised
+is in [the renderer](/docs/architecture/renderer#vector-rasterisers).
+
+Paint chooses a route per shape (`crates/zgui-paint/src/emit/vector/document.rs`), trying the routes
+in the order of this table. The first route that accepts the shape wins. Before that, the CPU layer
+route may take a whole drawing at once.
+
+| Route | Becomes | Takes | Counter |
+|---|---|---|---|
+| **CPU layer** (per drawing) | One `ColorSprite` from the image pool, or one per 512-pixel tile | A drawing with no series whose gradients or clips would otherwise need the general route, under a positive axis-aligned scale | `vector_route_layer` |
+| **Analytic** | `Quad`s | Parts made of circles, axis-aligned ellipses, rectangles, rounded rectangles or straight strokes, at most 256 shapes, kept two device pixels apart, under an axis-aligned uniform scale | `vector_route_analytic` |
+| **Marks** | One `MarkItem` per part | The same shapes in any number (up to 2²²), overlapping or not, under any affine transform | `vector_route_marks` |
+| **Path glyphs** | One glyph mark per part | Many copies of a few small repeated outlines (a scatter of triangles or stars) | `vector_route_path_glyphs` |
+| **Atlas mask** | One `MonoSprite` per part | Small solid shapes with no clip of their own, under a scale, mirror or quarter turn | `vector_route_mask` |
+| **General** | `VectorItem`s | Everything else | `vector_route_general` |
+
+When recognition fails on a large path (64 or more elements), the route remembers the decline for a
+few frames, so the same path is not analysed again every frame. `VectorTierChanges` counts parts
+that switch between the mask route and a decline.
+
+### Path-space retention
+
+Every route reads the shape **in its own space**. The fit that places it in the fragment (a canvas
+view transform, a view-box fit) travels beside it:
+
+- **Shared parsed drawings.** A source text is parsed once for every element that draws it, and the
+  same `Arc` paths are returned while the text stays the same (`content/vectors/mod.rs`). A new box
+  is a new fit, never a new path.
+- **General items in path space.** `VectorItem::path` is the source path and `VectorItem::placement`
+  is the fit. A scroll, a move or a new fit changes only the affine, so the rasteriser's
+  [content-keyed encoding](/docs/architecture/renderer#vello-and-coverage-rasterisers) stays valid.
+  Equal drawings share one encoding.
+- **Recognition caches.** Analytic and marks recognition run on the source path under any uniform
+  fit and are cached by path, so a pan or zoom recognises nothing again. A rotation or stretch places
+  the path and recognises it again.
+- **Payloads in source units.** A mark payload stays in the units it was recognised in, and the item
+  maps it with `axes` and `origin`. A pan or zoom keeps the same payload allocation and uploads
+  nothing.
+
+### Analytic shapes
+
+A part whose subpaths are all recognised as rectangles, rounded rectangles, circles, axis-aligned
+ellipses or straight strokes is drawn as quads with no raster at all. The quad shader antialiases the
+edges.
+
+- **Shapes must be two device pixels apart.** A path paints each pixel once however many subpaths
+  cover it; quads painted one by one do not.
+- **The transform must be axis-aligned with the same scale on both axes** (at least 0.75), because
+  the quad shader measures one pixel as the larger of its two axis steps.
+- **A shape clip is accepted only if it lowers to the quad's inline clip tests.**
+
+### Marks
+
+A mark is one item over a shared payload. It has one draw order, one clip, one paint and one ink
+rectangle, so a hundred thousand circles are one primitive.
+
+```rust
+// crates/zgui-scene/src/prim/marks.rs
+pub struct MarkPayload {
+    pub discs: Vec<[f32; 4]>,     // [cx, cy, outer radius, inner radius]
+    pub boxes: Vec<MarkBox>,      // rounded, bordered rectangles
+    pub vertices: Vec<[f32; 2]>,  // polylines; NaN separates runs
+    pub glyphs: Vec<[u32; 4]>,    // a tile table, then one instance per glyph
+}
+```
+
+- **Mapping.** Payload coordinates map to local space by `MarkItem::axes`, then `origin`. A replay
+  that moves the item adds to `origin` and leaves the payload untouched, so every copy shares it.
+  Payloads are shared by identity (`Arc`) and uploaded once per allocation.
+- **Separate or unioned.** Shapes at least two device pixels apart are painted one by one. When they
+  come closer, the item is flagged `MarkFlags::UNION`: the renderer sums their coverage into a bin
+  and paints through the sum once, which matches the union a path paints. A part where an overlap
+  could be a hole is declined, because a union would fill it.
+- **Partial draws.** `MarkItem::first` lets an item draw part of a large payload. A long canvas
+  series uses this to draw only the chunks near the view.
+
+**Union bins** are planned in `zgui-scene` (`crates/zgui-scene/src/pass/marks.rs`), like vector
+passes, and the renderer executes the plan:
+
+```rust
+pub struct MarkPlan {
+    pub bins: Vec<MarkBin>,       // one per union item that reaches the damage
+    pub pages: u32,
+    pub extent: Size<i32, Device>,
+    pub overflow: Vec<MarkBin>,   // items that share the spare page
+    pub full_damage: bool,
+}
+```
+
+Bins are shelf-packed onto single-channel pages no larger than the surface, up to `MAX_PAGES = 8`.
+Items past that take turns on one spare page. A bin outside every group holds only the damaged part
+of its item. A renderer that widens a frame to full damage plans the bins again with
+`Scene::plan_marks`. `MarksUnionBins` counts planned bins and `MarksPayloadBytes` counts payload
+uploads. [How marks are drawn](/docs/architecture/renderer#drawing-marks) covers the renderer side.
+
+Canvas **series** (line and scatter plots over data arrays) are lowered to marks too. Their payloads
+are built once per data allocation, on a worker thread for large series, and reduced per device
+column on request. See [Vector and canvas](/docs/building/vector-and-canvas) for the API.
+
+### Path glyphs
+
+A shape made of many copies of a few small outlines is drawn like text. Each distinct outline is
+rasterised once per device scale into the `Mono` atlas, as a sheet of sixteen quarter-pixel phase
+cells (`PHASES = 16`). Each copy draws the cell nearest its own position, so a pan rasterises nothing
+and a position is off by at most an eighth of a pixel. The result is a mark whose payload holds a
+tile table and one anchor per copy. Copies that overlap are unioned like any mark.
+
+| Requirement | Limit |
+|---|---|
+| Subpaths | At least 8. |
+| Distinct outlines | At most 16 among the first 64, and at most one eighth of all, never more than 64. |
+| Cell size | At most 64 device pixels. |
+| Paint | Solid, with no clip or dash. |
+| Transform | Keeps the axes. |
+| Per frame | At most 64 new sheets covering 1 Mi texels. |
+
+Overlapping copies under the even-odd rule, copies that wind both ways, and outlines that cross
+themselves take another route, because an overlap could be a hole. `PathGlyphTilesRasterised`
+counts phase cells.
+
+### Atlas masks
+
+A small solid shape is rasterised on the CPU into a monochrome atlas tile and drawn as a
+`MonoSprite`. A mask must be at most 1024 × 256 pixels and 64 KiB of texels. The shape must have no
+clip of its own and no gradient, and the transform must keep the axes (any scale, mirror or quarter
+turn; a stroke needs equal scales). The tile is keyed by geometry, not colour, so recolouring or
+moving an icon reuses it.
+
+Two rules stop the route from thrashing (`crates/zgui-paint/src/content/vectors/mask.rs`):
+
+- **Volatility.** A shape whose mask request changed in three of the last four frames is
+  *volatile*. Once the general rasteriser is built, volatile shapes are declined, because a raster
+  per frame costs more than the GPU route. While it is not built, only volatile shapes with more
+  than 4096 segments are declined, because declining one builds it.
+- **Per-frame budgets.** With the general rasteriser built, a frame rasterises at most 32 new masks
+  covering 128 Ki texels, and the rest are declined. While it is not built, volatile shapes may
+  rasterise up to 256 new masks covering 1 Mi texels per frame. Cache hits cost nothing.
+  `VectorMaskMisses` and `VectorMaskBudgetOverflow` count misses and refusals.
+
+### CPU layers
+
+A drawing that would need the general route only because of a gradient or a clip can be rasterised
+whole on the CPU into one premultiplied tile of the image pool and drawn as one `ColorSprite`
+(`crates/zgui-paint/src/content/vectors/layer.rs`). The sprite takes the box's clip, transform and
+opacity like an image, so a scroll or a move costs nothing, and a static page of such drawings never
+builds the general rasteriser.
+
+- **Scale.** The transform must be a scale with two positive axes. A tile is exact for one scale and
+  one sixteenth-pixel phase. During a zoom, the tile of the nearest scale (from half to twice) is
+  stretched as a **provisional** sprite, and the drawing is rasterised again three frames after it
+  holds still. Two scales of a source are kept.
+- **Budget.** New rasters are budgeted by estimated cost: about 8 ms per frame while the general
+  rasteriser is not built. Once it exists, at most three new layers in about 2 ms per frame, and a
+  new drawing waits for two stable frames unless it is cheap. A drawing that does not fit is
+  deferred at most two frames. A drawing rasterised three times in 30 frames is drawn shape by shape
+  for the next 30.
+- **Tiles.** A layer larger than 2048 pixels on a side or 4 MiB is cut into tiles of 512 pixels, one
+  sprite each. Only the tiles a frame redraws are rasterised, plus neighbours while budget remains,
+  so an edit of one canvas shape re-rasterises only the tiles it touches.
+- **Memory.** Layers are budgeted at four surfaces of RGBA8, between 16 and 128 MiB per window
+  (`VectorLayersBudget`).
+
+A deferred or provisional layer owes a frame: the window absorbs its rectangle into the next frame's
+damage and requests that frame. Counters: `vector_layers_rasterised`, `vector_layers_provisional`,
+`vector_layers_deferred`, `vector_layers_demoted`, `vector_layer_tiles_rasterised` and
+`vector_layer_bytes_live`.
+
+### The general route
+
+Everything else becomes `VectorItem`s: the source path, its placement, fill and stroke paints, the
+clip chain, any document clip paths, and two inks. `ink` is the device rectangle (transform applied),
+which the pass planner and the rasteriser use. `local_ink` is in the subtree's own space, which the
+clip cull reads. Fully transparent items, and items under a transform with no area, are dropped
+before planning, so they never build the rasteriser.
+
+A path rasteriser interpolates gradient stops in sRGB. A gradient on vector content in another
+interpolation space is therefore resolved into sRGB stops, close enough that the straight segments
+stay within one 8-bit step of the true curve.
+
+## Vector passes
+
+A path rasteriser cannot draw into the middle of a frame: it submits its own commands and clears
+whatever it targets. General items are therefore rasterised into scratch, and one ordinary draw
+composites each pass back at the right point in the batch stream. Those points are decided in
+`zgui-scene`, as a pure function of the display list and the damage, so a pass count is a property
+of the scene that a test can assert without a device.
+
+The rules, from `crates/zgui-scene/src/pass/mod.rs`:
+
+| Rule | |
+|---|---|
+| 0 | An item with a clip the vector scene cannot express (a sampled mask) ends the current pass and gets a pass of its own. This is the only case where a clip costs a pass. |
+| 1 | Drop every item whose ink misses the damage. This is the **only** damage cull on this path. |
+| 2 | Sweep the remaining items in emission order into the current pass. The pass clip is the deepest chain all its items share; each item's remainder is its residual clip. |
+| 3 | Start a new pass when a non-vector primitive emitted *after* an item already in the pass overlaps *that item's own ink*. |
+| 4 | A group boundary ends the pass, because a composite is recorded into whichever target is open. |
+| 5 | If a finished pass's single composite cannot sit above all its items and below everything painted over any of them, it becomes one pass per item. |
+
+All rectangles are compared **on the device**. A vector item's device ink is recomputed from
+`local_ink` under the matrices this frame draws with, and every other primitive's ink is placed
+through its own space, so a replayed item inside a moved subtree is planned where it now is. The
+overlap tests use a 64-pixel grid over the pass's inks (`pass/cells.rs`), so planning stays close to
+linear in the number of items.
+
+```rust
+pub struct PlannedPass {
+    pub items: Range<usize>,
+    pub region: Rect<i32, Device>,   // 16-pixel aligned, clamped to the surface
+    pub clip: ClipId,                // the deepest chain every item applies
+    pub instanced: bool,             // true only if no two items overlap
+    pub composite_order: DrawOrder,  // the highest order among the items
+    pub clamped: bool,               // the region was cut to the damage
+    pub overhangs: bool,             // the items' ink goes past the surface edge
+}
+```
+
+- `composite_order` is the **highest** order in the pass, not the last item's, because draw order
+  comes from overlap and does not rise with emission order.
+- `instanced` is decided over whole-pixel inks, because two items that are disjoint only within a
+  pixel would still blend that pixel twice.
+- **Cut to damage.** A pass outside every group has its region cut to the damage's bounding box, so
+  a pass the damage only partly reaches rasterises only that part. A pass inside a group keeps its
+  whole region, because a group target is drawn whole. If the frame has a backdrop filter (which
+  widens what the renderer redraws), passes are not cut. A renderer that widens a frame draws the
+  passes from `Scene::plan_uncut_passes`.
+- `clamped` and `overhangs` tell the rasteriser to clip the pass to its region, because passes share
+  scratch layers.
+
+### Overlap policies
+
+`Overlap` selects how rule 3 is read:
+
+```rust
+pub enum Overlap { PerItemInk /* default */, BoundingBox, BoundingBoxOrderBlind, Never }
+```
+
+The default is exact. The weaker readings are kept as selectable policies so the difference stays
+measurable. The last column is the pass count on a test dashboard of twenty charts, each with a
+legend drawn over it:
+
+| Policy | Tests a new primitive against | Passes on the dashboard |
+|---|---|---|
+| `PerItemInk` | The ink of each earlier item in the pass | 1 |
+| `BoundingBox` | The bounding box of the items accumulated before it | 4 |
+| `BoundingBoxOrderBlind` | The bounding box of the whole pass, ignoring emission order | 20 |
+| `Never` | Nothing. Measures per-item compositing only; not a valid policy. | |
+
+`PerItemInk` is exact rather than conservative: the scratch is cleared to transparent, and
+compositing a transparent texel leaves the destination unchanged.
+
+`VelloPasses` and `VectorClipLayers` count passes and residual clip layers. `ScenePassPlan::warning`
+fires at `PassWarning::THRESHOLD = 4` passes on a partial frame. How a rasteriser packs passes into
+scratch and splits a large frame into rounds is on
+[the renderer page](/docs/architecture/renderer#packing-passes-into-scratch-and-rounds).
+
+<Callout type="warn">
+A renderer must not re-derive any of this. It executes the plan: one `VectorPass` per
+`PlannedPass`, in order. A plan that dropped a pass would draw every later composite from the wrong
+pass.
+</Callout>
 
 ## Batching
 
-`Scene::finish(&damage)` closes the frame in two steps.
-
-**Sort the remap.** Primitive arrays stay in insertion order. The scene sorts one remap list per
-primitive kind by `(order, tie1, tie2)`:
+`Scene::finish(&damage)` plans the vector passes and mark bins, then sorts one remap list per kind.
+The primitive arrays stay in insertion order; the renderer reads them through the sorted remap lists.
 
 | Arrays | Sort key |
 |---|---|
-| quads, shadows, decorations, externals, backdrops | `(order, 0, 0)` |
-| all three sprite arrays | `(order, tile.texture, tile.tile)` |
+| quads, shadows, decorations, marks, externals, backdrops | `(order, 0, 0)` |
+| shaded rectangles | `(order, shader, parameter block)` |
+| the three sprite arrays | `(order, tile.texture, tile.tile)` |
 | groups | `(order, u32::from(!is_start), 0)` |
-| vectors | unsorted — they keep emission order, which the pass policy sweeps in |
+| vectors | unsorted; the pass plan orders their composites |
 
-The sprite tie-break is free, because equal order already implies no overlap. Spending it on
-clustering by texture is what lets a batch run until the texture genuinely changes. Group start and
-end at the same order — a degenerate empty group — must come out in that sequence.
+The sprite tie-break is free because equal order implies no overlap. Clustering by texture lets a
+batch run until the texture actually changes. The group key sorts a start before an end at the
+same order, so a degenerate empty group comes out start-first.
 
-**Plan the vector passes**, which the next section covers.
-
-Then `Scene::batches()` yields the draw calls. It panics if `finish` has not run.
+`Scene::batches()` then yields one `Batch` per draw call. It panics if `finish` has not run.
 
 ```rust
 // crates/zgui-scene/src/batch/mod.rs
 pub enum Batch {
     Quads(Range<usize>),
+    Shaded { shader: ShaderId, params: ShaderParamsSlot, range: Range<usize> },
     Shadows(Range<usize>),
     Decorations(Range<usize>),
     MonoSprites { texture: u32, range: Range<usize> },
     SubpixelSprites { texture: u32, range: Range<usize> },
     ColorSprites { texture: u32, range: Range<usize> },
-    Vector(usize),     // an index into the pass plan, not into the vectors array
+    Marks(Range<usize>),
+    Vector(usize),     // an index into the pass plan
     External(usize),
     Backdrop(usize),
     Group(usize),
 }
 ```
 
-A batch is a contiguous range of **sorted remap positions**. The six instanced pipelines resolve
-those positions to entries in their persistent GPU arenas; the source array itself is not sorted.
-The iterator merges the eleven kinds by
-`(DrawOrder, PrimitiveKind)` and yields the longest run it can take from one of them before another
-kind's next primitive would have to come first. Finding the two lowest waiting keys is a scan and
-not a sort: eleven candidates is small enough that one pass beats sorting, and the second lowest is
-exactly the bound the winning run may not cross.
+A batch is a range of **sorted remap positions**, which the renderer resolves to its persistent
+arenas. The iterator merges the thirteen kinds by `(DrawOrder, PrimitiveKind)` and yields the longest
+run it can take from one kind before another kind's next primitive must come first. Finding the two
+lowest waiting keys is a linear scan; the second lowest is the bound the run may not cross.
 
-What breaks a batch:
-
-| Cause | Why |
+| What ends a batch | Why |
 |---|---|
-| Another array's next primitive sorts lower | Order is a total order and a batch is a maximal run inside it. |
-| A sprite's texture changes | A draw call binds one texture. |
-| A `Vector`, `External` or `Backdrop` | Each is one draw with its own binding. |
-| A `Group` marker | Never merged. A renderer changes target at exactly that point, and a marker swallowed into a batch is a target switched at the wrong moment. |
-
-## Vector passes
-
-Some content is not a rectangle. An arbitrary Bézier outline cannot be drawn by the quad pipeline,
-and the path rasterisers this framework ships cannot draw into the middle of a frame: each has one
-entry point, submits a command encoder of its own, and clears everything it is pointed at. So a
-batch of paths is rasterised into a scratch texture, and one ordinary draw composites the scratch
-back at exactly the right point in the batch stream.
-
-Small solid paths can avoid this pass plan. An eligible fill or stroke has no local clip and its
-coverage mask uses at most 64 KiB of texels, with width at most 1024 and height at most 256. Paint
-rasterizes one monochrome mask into the shared atlas and emits a `MonoSprite`. The mask identity
-excludes colour, translation, mirrors, and quarter turns. It includes the raster density needed for
-scale. A recoloured, moved, mirrored, or quarter-turned icon can therefore reuse a tile; a new scale
-rasterizes only when the required density changes. Arbitrary rotations and shears use the general
-path, as does a non-uniformly scaled stroke.
-
-**Where those points are is decided in `zgui-scene`, never behind the rasteriser.** It is a pure
-function of the display list, the bounds tree and the damage set, so a pass count is an assertion
-about the scene and is checkable with no device at all. Behind the rasteriser it would be a number
-only a real renderer could produce, and a test asserting it was zero would pass under a renderer
-that drew nothing.
-
-The rules, in order, from `crates/zgui-scene/src/pass/mod.rs`:
-
-<Steps>
-
-<Step>
-
-**Rule 0.** An item carrying a clip the vector scene cannot express — a sampled raster mask — ends
-the current pass and gets one of its own, bound to its own clip. This is the only case where a clip
-costs a pass.
-
-</Step>
-
-<Step>
-
-**Rule 1.** Drop every item whose ink misses the damage set. This is the **only** damage cull on
-this path; a rasteriser must not perform another, or two owners can disagree about what survived.
-
-</Step>
-
-<Step>
-
-**Rule 2.** Sweep the survivors in emission order, accumulating into the current pass, keeping the
-pass's clip as the deepest chain its items share and each item's residual as the rest.
-
-</Step>
-
-<Step>
-
-**Rule 3.** Start a new pass when a non-vector primitive emitted *after* some already-accumulated
-item overlaps *that item's own ink*.
-
-</Step>
-
-<Step>
-
-**Rule 4.** End a pass where the target does. A group boundary starts a new one, because a composite
-is recorded into whichever target is open where it lands.
-
-</Step>
-
-<Step>
-
-**Rule 5.** A finished pass whose one composite cannot be placed both above every item of it and
-below everything painted over any of them is recorded as one pass per item instead.
-
-</Step>
-
-</Steps>
-
-```rust
-pub struct PlannedPass {
-    pub items: Range<usize>,
-    pub region: Rect<i32, Device>,   // tile-aligned outwards, clamped to the viewport
-    pub clip: ClipId,                // the deepest chain every item applies
-    pub instanced: bool,             // true only if no two items overlap
-    pub composite_order: DrawOrder,  // the highest order among the pass's items
-}
-```
-
-`composite_order` is the **highest** order and not the last item's. Draw order is allocated from
-overlap and does not rise with emission order: two side-by-side panels each restart immediately
-above the page beneath them. `instanced` is decided over whole-pixel inks (`region::covering`), not the float
-ones, because two items disjoint only in fractions of a pixel would still share a pixel column and
-blend it twice. `region::TILE` is 16, and a region is rounded outwards to it and clamped to the
-surface.
-
-Both adjectives in rule 3 carry weight, and `Overlap` keeps the weaker readings alive as selectable
-policy so the difference stays a measurement:
-
-```rust
-pub enum Overlap { PerItemInk /* the default */, BoundingBox, BoundingBoxOrderBlind, Never }
-```
-
-The documentation of that type gives the shape of the difference: on a twenty-region dashboard with
-a legend drawn over each chart, the three readings cost twenty, four and one pass. `PerItemInk` is
-the policy, is O(items in the pass) per candidate, and is exactly sound rather than conservative —
-the scratch is cleared to transparent, and compositing a fully transparent premultiplied texel
-leaves the destination bit-identical. `Never` is not a legal policy for a whole-pass composite; it
-exists to measure what per-item compositing would cost.
-
-`ScenePassPlan::warning` reports when the count gets high. `PassWarning::THRESHOLD` is 4.
-
-The rasterizer assigns passes to layers by overlap, then shelf-packs the disjoint regions in each
-layer into compact scratch coordinates. `VectorPass::region` remains the surface-space region used
-for composition. `VectorPass::raster_region` is its location in scratch. Two small passes at
-opposite sides of a large surface therefore do not reserve the empty pixels between them.
-
-<Callout type="warn">
-A `Renderer` may not re-derive any of this. It executes the plan: one `VectorPass` per
-`PlannedPass`, in the same order. A plan that dropped a pass would draw every *later* composite from
-the wrong pass. [The renderer](/docs/architecture/renderer) has the contract in full.
-</Callout>
-
-## Drawings: SVG into paths and paints
-
-`zgui-svg` is a reader. It draws nothing, holds no device and names no rasteriser. It turns a
-document into a flat list of outlines with paints, stroke styles and clips attached, expressed in
-`kurbo`, `peniko` and this framework's `Color`.
-
-```rust
-// crates/zgui-svg/src/lib.rs
-pub fn parse(source: &str) -> Result<Document, Error>;
-
-pub struct Shape {
-    pub path: Arc<kurbo::BezPath>,
-    pub fill: Option<Fill>,
-    pub stroke: Option<Stroke>,
-    pub clips: Vec<Clip>,
-}
-
-pub enum Paint { Solid(Ink), Gradient(Gradient) }
-pub enum Ink { Inherited { alpha: f32 }, Solid(Color) }
-```
-
-A `Shape` is **flat**. Every group transform above it is applied to its geometry, every group
-opacity folded into its paint, and every clip it is inside carried in its own list. A consumer draws
-a document by walking a list rather than by implementing a tree. `Document::view_box` is always
-rooted at the origin, because the `viewBox` offset and `preserveAspectRatio` are already applied —
-so one parse serves every size the document is ever drawn at.
-
-### Telling an icon from a logo
-
-An icon writes `currentColor` and expects to take the colour of whatever it sits next to. A logo
-writes its own colours and expects to keep them. The parser this crate wraps resolves `currentColor`
-while building its tree, so reading its output alone, `fill="currentColor"` and `fill="black"` are
-the same document.
-
-The scheme, in `crates/zgui-svg/src/parse/inherit.rs`: parse **twice**, injecting two different root
-`color` values through a style sheet rule.
-
-```rust
-const FIRST:  (u8, u8, u8) = (0x1f, 0x0d, 0x3b);
-const SECOND: (u8, u8, u8) = (0xc4, 0xf2, 0x0e);
-```
-
-A paint that came out `FIRST` in the first parse **and** `SECOND` in the second asked for
-`currentColor`, and becomes `Ink::Inherited`. Anything else is a colour the document wrote, and
-becomes `Ink::Solid`. A literal fill that happens to equal one sentinel comes out as itself in the
-other parse, which a one-sentinel scheme cannot manage. If the two parses ever fail to line up, the
-first is taken unchanged: the failure mode is an icon that stops following its element, never a logo
-whose own colours are thrown away.
-
-What is read: outlines with fills and strokes, fill and clip rules, stroke widths, caps, joins,
-miter limits and dashes; groups with transforms, opacity and clip paths; linear and radial gradients
-with all three spread methods. What is not read is **counted** rather than silently dropped:
-
-```rust
-pub struct Unsupported {
-    pub text: u32, pub images: u32, pub masks: u32,
-    pub filters: u32, pub blend_modes: u32, pub patterns: u32,
-}
-```
-
-<Callout type="info">
-One stated deviation: group opacity is folded into the alpha of the shapes inside the group rather
-than composited as a layer. Overlapping children of a translucent group therefore show through one
-another.
-</Callout>
-
-### How paint uses it
-
-The emit walk is a pure reader with no document in it, so drawings arrive through a seam:
-
-```rust
-// crates/zgui-paint/src/content/vectors/mod.rs
-pub struct Drawing { pub shapes: Vec<zgui_svg::Shape> }
-
-pub struct Placement {
-    pub content_box: Rect<DevicePx, Device>,
-    pub scale: f32,
-}
-
-pub trait VectorSource {
-    fn drawing(&self, node: NodeKey, placement: Placement) -> Option<Drawing>;
-}
-```
-
-The placement is passed **into** the source rather than applied afterwards, because the fit is part
-of what is cached. A rasteriser keeps its encoding of an outline under the identity of the `Arc`, so
-a drawing re-placed into the same box must hand back last frame's allocation. `Document::placed` is
-a whole-shape operation for the same reason: outlines move, clips move with them, ramps move with
-the shapes they paint, and stroke widths and dash lengths scale.
-
-Plain path notation is the degenerate case of the same thing. `parse` reads one outline per
-non-blank line and drops a line that does not parse rather than failing the list. `outlines` gives
-every shape `Paint::Solid(Ink::Inherited { alpha: 1.0 })` and a non-zero fill rule.
-
-### Where a shape's colour comes from
-
-Not from `fill`. The SVG paint longhands are gated to a different engine in this build and are
-discarded while the style sheet is parsed, so no cascade result ever holds a value for one.
-
-```rust
-// crates/zgui-paint/src/emit/vector/mod.rs
-pub struct ShapePaint { pub fill: Color, pub stroke: Option<Color>, pub stroke_width: f32 }
-
-pub const FILL: &str = "zgui-fill";
-pub const STROKE: &str = "zgui-stroke";
-pub const STROKE_WIDTH: &str = "zgui-stroke-width";
-```
-
-The default is the element's own computed `color`. That makes the `currentColor` icon the default
-rather than a keyword, and it means a rule like `.icon:hover { color: … }` themes an icon with no
-new mechanism and no new invalidation. The override is three inheriting custom properties, written
-`--zgui-fill`, `--zgui-stroke` and `--zgui-stroke-width`. They inherit, so setting one on an
-ancestor themes every drawing below it.
-
-One thing is resolved differently here. A path rasteriser interpolates between the stops it is
-given, in sRGB, and cannot be told to walk a ramp in Oklab. So a gradient painting vector content
-has its ramp resolved into sRGB stops close enough together that the straight lines between them
-stay within an eight-bit step of the true curve.
-
-## What it costs
-
-Every number below was written by `cargo xtask perf` into `docs/performance.md` on the maintainer's
-machine, except where another file is named.
-
-| Measurement | Value | What it is |
-|---|---:|---|
-| `hover.primitives_emitted` | 41.56 prims | Primitives one frame of a hover storm emits, against a ceiling of 200. |
-| `hover.crossing` | 207.78 µs | One pointer crossing, whole frame, budget 500 µs. |
-| `scroll.translation` | 44.18 µs | One scroll frame that shifts pixels already composed and draws the exposed band. |
-| `scroll.recycle` | 1021.42 µs | One scroll frame that brings a new row in. |
-| `kitchen.click` | 11.34 µs | One class toggled on one element at 1 851 boxes. |
-| `idle.frames` | 0.00 frames | A still document draws nothing at all. |
-
-Two structural facts sit under those:
-
-- **Draw-order assignment is proportional to what is emitted.** `bounds_tree_inserts` equals
-  `primitives_emitted` in every scenario of the table above, because `Scene::begin_frame` clears the
-  bounds tree. `docs/perf/pipeline.md` measures the refill at 14.4 % of the self time of a resize
-  frame — a frame that legitimately redraws everything — and states that "a correctly scissored
-  frame pays almost nothing".
-- **A scroll frame's remaining cost is the port, not the document.** `docs/performance.md` records
-  that one row shift rebuilds 8 boxes and relays out 29 nodes, and emits 404 primitives, which
-  is what is on the screen.
-
-Two counters are worth knowing by name when reading a profile. `Counter::PrimitivesEmitted` is
-bumped in `Scene::push_*`; `Counter::PrimitivesCulled` is bumped both by the clip refusal and by
-each skipped subtree. `PaintReport` carries the same figures for one walk:
-
-```rust
-pub struct PaintReport {
-    pub primitives: usize,
-    pub emitted: Vec<FragKey>,
-    pub groups: usize,
-    pub skipped_subtrees: usize,
-    pub recorded: bool,
-}
-```
-
-`PaintReport::assert_emission_complete` is the oracle: it fails naming the first fragment the damage
-reaches that nothing emitted for. It panics outright when `PaintInput::record_emitted` was off,
-because an oracle run against a list nobody filled would pass over every document there is.
+| Another kind's next primitive sorts lower. | Draw order is a total order. |
+| A sprite reaches a different texture. | A draw call binds one texture. |
+| A shaded rectangle reaches a different effect or parameter block. | A draw binds one pipeline and one block. |
+| A group marker. | The renderer changes target exactly there. |
+| A vector composite, an external quad or a backdrop. | Each has its own bindings. |
+
+## Measured costs
+
+From `docs/performance.md`, written by `cargo xtask perf`:
+
+| Scenario | Primitives emitted | Primitives culled | Bounds-tree inserts |
+|---|---:|---:|---:|
+| idle | 0 | 0 | 0 |
+| hover-storm | 9 975 | 241 916 | 9 975 |
+| scroll | 50 668 | 21 378 | 50 668 |
+| cold-start | 1 101 | 5 224 | 1 101 |
+| kitchen-sink | 129 834 | 205 348 | 130 194 |
+
+A hover storm culls about twenty-four primitives for each one it emits; `hover.primitives_emitted`
+is 41.56 per frame against a ceiling of 200. Bounds-tree inserts track what a frame emits, not the
+document size. A scroll frame that brings a row into view emits about 404 primitives, which is the
+visible port.
+
+`Counter::PrimitivesEmitted` is incremented in `Scene::push_*`, and `Counter::PrimitivesCulled` by
+clip refusals and skipped subtrees. `PaintReport` carries the same figures for one walk.
+`PaintReport::assert_emission_complete` fails, naming the first fragment the damage reaches that
+nothing was emitted for. It panics if `PaintInput::record_emitted` was off, so it cannot pass
+vacuously.
 
 ## Next
 
@@ -968,21 +812,21 @@ because an oracle run against a list nobody filled would pass over every documen
   <Card
     title="The renderer"
     href="/docs/architecture/renderer"
-    description="The Renderer and VectorRaster contracts, the wgpu pipelines, the persistent target and partial redraw."
+    description="The Renderer and VectorRaster contracts, the wgpu backend, partial redraw and presentation."
   />
   <Card
-    title="Invalidation"
+    title="Invalidation and damage"
     href="/docs/architecture/invalidation"
-    description="The bits, how obligations retire, and how damage rectangles merge."
+    description="The dirty bits, how they are cleared, and where damage comes from."
+  />
+  <Card
+    title="Vector and canvas"
+    href="/docs/building/vector-and-canvas"
+    description="Drawing icons, documents and canvas scenes from an application."
   />
   <Card
     title="Caches"
     href="/docs/performance/caches"
     description="Every cache in the pipeline, what invalidates it, and what a miss costs."
-  />
-  <Card
-    title="Cost model"
-    href="/docs/performance/cost-model"
-    description="What each kind of change costs, measured."
   />
 </Cards>

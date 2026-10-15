@@ -1,283 +1,33 @@
 ---
 title: Context and ownership
-description: What an owner is, when it frees what it holds, and how a value reaches a deep child without being passed through every component in between.
+description: Pass a value to a deep child with context, and how owners decide when reactive values are freed.
 ---
 
-Every reactive value belongs to an **owner**, and the owner is what frees it when the piece of
-interface that made it goes away. Context uses the same tree of owners to hand a value down to a
-distant child. Ownership comes first here, because context is built on it. This page assumes
-[Signals](/docs/learn/signals), [Components](/docs/learn/components) and [Effects and
-lifecycle](/docs/learn/effects-and-lifecycle).
+Context lets a component provide a value once and have any component below it read that value,
+without passing it through every component in between. Context is built on **owners**, the tree of
+scopes that also decides when signals and other reactive values are freed. The first half of this
+page covers context; the second half covers owners.
 
-## What an owner is
+## Pass a value to a deep child
 
-An interface creates state while it is being built and has to destroy that state when the part of
-the interface that created it disappears. A closed panel must not leave its signals, its effects
-and its timers running. Nothing in Rust's own scoping helps here: a signal handle is `Copy` and
-gets moved into closures that outlive the function that made it, so the value it points at cannot be
-dropped by going out of scope.
-
-An owner is the answer. It is a node in a tree of scopes. One owner is **current** at any moment.
-Anything reactive that is created attaches to the owner that is current at that instant, and
-disposing of that owner frees all of it at once.
-
-| What attaches to the current owner | Example |
-|---|---|
-| every arena-backed handle | `RwSignal`, `ReadSignal`, `WriteSignal`, `Memo`, `Signal` |
-| stored values | `StoredValue` |
-| contexts | whatever `provide_context` was given |
-| cleanup closures | whatever `on_cleanup_local` was given |
-| child owners | one per nested component, list row or branch |
-
-Every other `Copy` handle in the reactive API behaves the same way. The reference-counted forms —
-`ArcRwSignal`, `ArcMemo`, `ArcSignal` and the rest — are the exception. They are freed when the last
-handle drops, and they attach to no owner.
-
-A `RenderEffect` is a third case: its lifetime is its handle's, and dropping the handle cancels it
-immediately. The view layer stores that handle in the state it keeps for the node, so the effect
-dies with the node.
-
-### Disposal
-
-Disposing of an owner does three things, in this order, **synchronously**, before the call returns:
-
-<Steps>
-
-<Step>
-
-Its child owners are disposed of, depth first.
-
-</Step>
-
-<Step>
-
-Its cleanup closures run, in the order they were registered.
-
-</Step>
-
-<Step>
-
-Its arena-backed values are dropped.
-
-</Step>
-
-</Steps>
-
-Synchronous is the load-bearing word. A deferred cleanup means one frame in which a removed node's
-timer still fires, its geometry observer still reports and its row still holds a slot in a shared
-table. Reading an arena-backed handle after its owner is disposed of panics, so that frame is not a
-cosmetic problem.
-
-```text
-// Reading a handle after its owner was disposed of:
-thread 'main' panicked:
-Tried to access a reactive value that has already been disposed.
-```
-
-## Where owners come from
-
-You almost never create one. Five things create owners for you.
-
-| Owner | Created by | Disposed when |
-|---|---|---|
-| the application root | the runtime, above every window | the application shuts down |
-| the window root | the runtime, once per open surface | the window closes or the platform suspends it |
-| one per component | the code `#[component]` generates around the call | that component's view is unmounted |
-| one per list row | `for` / `For` | that row's key leaves the collection |
-| one per branch | `if` / `Show` | the condition flips |
-
-That is why a signal created in a component body is freed when the component leaves the interface,
-and why a row's signals are freed when the row is deleted rather than when the whole list is.
-
-`App::with_context` runs in the application root. Use it for state that every window must resolve or
-that must survive suspension. A context provided by a component belongs to that component's window
-and is not visible in another window. On resume, each window root and its view are built again below
-the retained application root.
-
-The runtime provides `Fonts`, `Windows`, and `Clipboards` in that application scope before your
-setup runs. Their hooks resolve those same handles from every window. `App::with_context` can also
-resolve `Fonts` when shared setup needs the application's font collection.
-
-<Callout type="info">
-A listener runs in the scope it was **written** in, not in no scope at all. An event arrives from
-the platform, not from the reactive graph, so the owner current when the `on:` binding was created
-is captured once and made current again for each dispatch
-(`crates/zgui-view/src/event/listener.rs`). Without that, a context lookup inside a click handler
-would answer nothing and a signal created there would belong to nobody.
-</Callout>
-
-### `Mounted`
-
-`Mounted` is the protocol for a scope you own by hand. The runtime uses it for the window root, and
-a test that drives a view outside a window uses it directly.
+Without context, a value a deep child needs is passed as a prop through every component in
+between:
 
 ```rust
-impl Mounted {
-    pub fn new() -> Self;
-    pub fn with<T>(&self, build: impl FnOnce() -> T) -> T;
-    pub fn owner(&self) -> &Owner;
-    pub fn unmount(self);
-}
-```
-
-```rust
-use zgui::prelude::*;
-use zgui::reactive::{Mounted, install};
-
-install().unwrap();          // the runtime does this for you in an application
-let node = Mounted::new();
-let count = node.with(|| RwSignal::new(0));
-
-count.set(1);
-assert_eq!(count.get(), 1);
-
-node.unmount();   // `count` is gone; reading it now would panic
-```
-
-The rules:
-
-- `Mounted::new()` with no current owner is a **root**. Called inside another scope's `with`, it is
-  a **child** and dies with its parent.
-- The type is `#[must_use]`: a scope you drop on the floor frees nothing at the moment you meant.
-- `Drop` disposes as a safety net, including while a panic unwinds. `unmount` is the intended path.
-- A cleanup runs with **no scope current**, on purpose. Cleanups also run when the last handle to an
-  owner is dropped from anywhere, so a rule that held only on the `unmount` path would be a rule
-  nothing could rely on. Everything a cleanup needs must be captured when it is registered.
-- In debug builds, mounting off the UI thread panics.
-
-## When there is no owner
-
-This is the failure mode worth memorising, because it is silent.
-
-Creating an arena-backed handle with no current owner **succeeds**. The handle works, reads and
-writes fine, and is never registered anywhere — so it is never freed and never disposed of. It is a
-permanent leak with no panic, no log and no symptom, in debug builds as well as release.
-
-```rust
-// No owner is current here.
-let count = RwSignal::new(41);
-count.set(42);
-assert_eq!(count.get(), 42);   // it works, and it leaks for the life of the process
-```
-
-Four operations refuse to fail that quietly. Each calls `assert_owner`, which panics in debug
-builds and compiles away to nothing in release:
-
-| Operation | Debug panic message |
-|---|---|
-| `provide_context` | `provide_context requires a current owner: …` |
-| `provide_local_context` | `provide_local_context requires a current owner: …` |
-| `on_cleanup_local` | `on_cleanup_local requires a current owner: …` |
-| `Selector::is_selected` | `Selector::is_selected requires a current owner: …` |
-
-The full text names the fix: *with none, the value it creates is unreachable and never freed. Run
-it inside `Mounted::with`.* The last row belongs to the selector helper that [Stores and
-selectors](/docs/learn/stores-and-selectors) covers; it is listed here because these four are the
-complete set.
-
-<Callout type="error">
-A signal in a `static` never works. A lazily initialised global runs its initialiser at the first
-read, and that read happens either with no owner — in which case the signal leaks and no assertion
-fires — or inside whichever component happened to read it first, in which case the signal is
-disposed of when that unrelated component unmounts and every later read panics. Both outcomes are
-wrong, and which one you get depends on call order. Application state that outlives a component
-belongs in a context provided at the root, which the rest of this page covers.
-</Callout>
-
-Two more debug-only reports exist, at `error` level through `tracing`, that never panic
-(`crates/zgui-reactive/src/executor/assert.rs`):
-
-| Constant | Value | Reported when |
-|---|---|---|
-| `MAX_OWNER_DEPTH` | 4096 | one owner chain is deeper than this: owners are being nested without being disposed of |
-| `MAX_OWNER_CHILDREN` | 1024 | one owner has accumulated more children than this: a generation is not being retired |
-
-## `Scope`: retiring generations
-
-An owner keeps a reference to every child ever created under it and removes none of them when they
-are disposed of. So a long-lived parent with short-lived children — a list that scrolls, a table
-that filters, a route that changes — grows one dead entry per child *ever created*. Disposing of
-that parent eventually costs time proportional to everything it has ever held, not to what it holds
-now.
-
-`Scope` fixes that. It hands out members from a **generation** and retires generations whole.
-
-```rust
-use zgui::reactive::Scope;
-
-impl Scope {
-    pub fn new() -> Self;
-    pub fn mount(&self) -> Mounted;
-    pub fn live(&self) -> usize;
-    pub fn generation_children(&self) -> usize;
-    pub fn generations_created(&self) -> usize;
-}
-```
-
-```rust
-let scope = Scope::new();
-
-// One row stays on screen for the whole scroll, and does not hold the others' storage.
-let pinned = scope.mount();
-
-for _ in 0..10_000 {
-    let row = scope.mount();
-    // ... build the row ...
-    row.unmount();
-}
-
-assert_eq!(scope.live(), 1);
-assert!(scope.generation_children() < 100);
-pinned.unmount();
-```
-
-How it decides: a new generation is added beside the current one when the current one holds more
-dead members than the whole scope holds live ones, with a floor of `RETIRE_AFTER = 64`
-(`crates/zgui-reactive/src/own/scope.rs`). Existing members never move. Generations are **siblings**
-under the scope's own owner, never nested — nesting would make dropping a spent generation dispose
-of the one that replaced it. A generation that is neither the newest nor still occupied is dropped
-whole. Live members therefore never delay retirement, which matters because the case that grows
-fastest is also the case that always has rows on screen. Ten thousand mount-and-unmount cycles leave
-fewer than a hundred entries behind, asserted by the type's own doctest.
-
-You reach for `Scope` when **you** mount and unmount a changing set of sibling scopes yourself. If
-you write your lists with `for`, you never need it: the list keeps generations of its own by the
-same rule.
-
-## Context: the problem
-
-A value needed by a deep child has to reach it. The obvious way is to pass it as a prop through
-every component in between:
-
-```rust
-#[component]
-fn App() -> impl IntoView {
-    let theme = RwSignal::new(false);
-    view! { Page(theme = theme) }
-}
-
 #[component]
 fn Page(theme: RwSignal<bool>) -> impl IntoView {
-    // `Page` does not use `theme`. It only carries it.
+    // `Page` does not use `theme`; it only passes it on.
     view! { Sidebar(theme = theme) }
-}
-
-#[component]
-fn Sidebar(theme: RwSignal<bool>) -> impl IntoView {
-    // Nor does `Sidebar`.
-    view! { ThemeButton(theme = theme) }
 }
 ```
 
-Every intermediate component gains a prop it does not use. Adding one more consumer five levels
-down means editing five files. This gets worse with each shared value: a theme, a locale, a
-selection and a set of keyboard shortcuts turn into four dead props on every component in the
-middle.
-
-**Context** removes the middle. A value is provided in one scope and read in any scope below it,
-however many owners apart they are. The components in between do not mention it.
+With context, you provide the value once and read it anywhere below. The components in between do
+not mention it:
 
 ```rust
+#[derive(Clone, Copy)]
+struct Theme(RwSignal<bool>);
+
 #[component]
 fn App() -> impl IntoView {
     provide_context(Theme(RwSignal::new(false)));
@@ -287,99 +37,46 @@ fn App() -> impl IntoView {
 #[component]
 fn ThemeButton() -> impl IntoView {
     let Theme(dark) = expect_context::<Theme>();
-    // ...
+    view! {
+        control(on:click = move |_| dark.update(|on| *on = !*on)) { "Toggle theme" }
+    }
 }
 ```
 
-## How lookup works
-
-A context is **keyed by its type**. Each owner holds a map from `TypeId` to a boxed value.
-`provide_context` inserts into the current owner's map. A lookup starts at the current owner and
-walks towards the root, stopping at the first owner that holds a value of that type.
-
-That gives three properties:
-
-- **Providing shadows.** A value provided in a nested scope hides an outer value of the same type,
-  for that subtree only. This is how a nested list inside a list gives its rows their own
-  selection.
-- **Providing twice in one scope replaces.** The second value wins.
-- **A lookup never sees sideways or downwards.** A sibling's context is invisible. A child's context
-  is invisible to its parent.
-
-A miss returns `None` rather than a default. That is deliberate: a wrong default is far harder to
-notice than a missing value.
-
-## The functions
-
-All eight are in `zgui::prelude`.
-
-| Function | Signature |
-|---|---|
-| `provide_context` | `fn provide_context<T: Send + Sync + 'static>(value: T)` |
-| `use_context` | `fn use_context<T: Clone + 'static>() -> Option<T>` |
-| `expect_context` | `fn expect_context<T: Clone + 'static>() -> T` |
-| `take_context` | `fn take_context<T: 'static>() -> Option<T>` |
-| `with_context` | `fn with_context<T: 'static, R>(cb: impl FnOnce(&T) -> R) -> Option<R>` |
-| `update_context` | `fn update_context<T: 'static, R>(cb: impl FnOnce(&mut T) -> R) -> Option<R>` |
-| `provide_local_context` | `fn provide_local_context<T: 'static>(value: T)` |
-| `use_local_context` | `fn use_local_context<T: Clone + 'static>() -> Option<T>` |
-
-What each is for:
-
-<TypeTable
-  type={{
-    provide_context: {
-      description: 'Makes a value visible to every scope below the current one. Panics in debug builds with no current owner.',
-      type: 'T: Send + Sync + static',
-    },
-    use_context: {
-      description: 'Clones the nearest value of type T out. None when nothing above provides one.',
-      type: 'Option<T>',
-    },
-    expect_context: {
-      description: 'The same lookup, panicking when it finds nothing. For a component that cannot work outside its parent.',
-      type: 'T',
-    },
-    take_context: {
-      description: 'Removes the value from the scope that holds it and returns it. The only reader for a T that is not Clone. Later lookups find nothing.',
-      type: 'Option<T>',
-    },
-    with_context: {
-      description: 'Runs a closure on a shared borrow of the value. Avoids the clone that use_context makes.',
-      type: 'Option<R>',
-    },
-    update_context: {
-      description: 'Runs a closure on a mutable borrow of the value, in place, in the scope that holds it.',
-      type: 'Option<R>',
-    },
-    provide_local_context: {
-      description: 'Provides a value that is not Send. Panics in debug builds off the UI thread or with no current owner.',
-      type: 'T: static',
-    },
-    use_local_context: {
-      description: 'Reads a value provided with provide_local_context. Panics in any build if the value was provided on another thread.',
-      type: 'Option<T>',
-    },
-  }}
-/>
-
-There is no `expect_local_context` and no `take_local_context`.
+`use_context` returns `Option<T>`; `expect_context` panics when nothing above provides a `T`, which
+suits components that cannot work outside their parent.
 
 <Callout type="warn">
-`update_context` mutates the stored value in place. Nothing is tracked, so nothing re-runs. If a
-context value has to drive the interface, put a **signal inside it** and write the signal. That is
-what every example on this page does.
+A context lookup is not a reactive read, and `update_context` notifies nothing. To make a context
+drive the interface, put a **signal inside it** and write the signal, as every example here does.
 </Callout>
 
-## The newtype rule
+Look a context up once in the component body and keep the result in a local. A lookup walks up the
+tree of owners, so a lookup inside a reactive closure repeats that walk on every run.
 
-A context is keyed by type, and the key space is the whole process. Use a newtype for anything whose
-type is not already specific to your use.
+A listener runs in the scope it was written in, so `use_context` also works inside a click handler,
+and a signal created there belongs to the component.
+
+### How lookup works
+
+A context is **keyed by its type**. `provide_context` stores the value on the current owner. A
+lookup starts at the current owner and walks towards the root, returning the first value of that
+type it finds.
+
+- **A nested provider shadows an outer one** of the same type, for its subtree only.
+- **Providing twice in one scope replaces** the first value.
+- **Lookups only go up.** A sibling's or a child's context is invisible.
+- **A miss returns `None`**, never a default.
+
+### Use a newtype as the key
+
+The key is the type, shared across the whole process. Wrap anything whose type is not specific to
+your use:
 
 ```rust
-// Wrong: two unrelated features now fight over one key.
+// Wrong: the second call replaces the first.
 provide_context(String::from("en-GB"));   // the locale
-provide_context(String::from("dark"));    // the theme, overwriting the locale
+provide_context(String::from("dark"));    // the theme
 
 // Right.
 #[derive(Clone)] struct Locale(String);
@@ -389,52 +86,19 @@ provide_context(Locale("en-GB".into()));
 provide_context(ThemeName("dark".into()));
 ```
 
-The collision is silent. In the wrong version, `use_context::<String>()` in a component asking for
-the locale returns `"dark"`, because the second provide overwrote the first in the same owner's map.
-`bool`, `u32`, `String` and `Rc<str>` are all bad keys for exactly this reason.
+In the wrong version, `use_context::<String>()` returns `"dark"` with no error. Avoid `bool`, `u32`,
+`String` and `Rc<str>` as context types.
 
-## Values that are not `Send`
+## Example: a theme and a selection
 
-`provide_context` requires `T: Send + Sync`. Anything from the view layer is not: a node handle, a
-reference-counted callback, a backend handle. This is the second of the three `Send` escapes
-mentioned in [Signals](/docs/learn/signals).
-
-```rust
-use std::rc::Rc;
-
-#[derive(Clone)]
-struct PanelHandle(Rc<str>);
-
-provide_local_context(PanelHandle("panel".into()));
-let handle = use_local_context::<PanelHandle>();
-```
-
-`provide_local_context` parks the value in a private wrapper that refuses to be touched from any
-thread but the one that created it. Two consequences:
-
-- The key is the wrapper, not `T`, so a local context cannot collide with a
-  `provide_context::<T>` of the same type. You may provide both.
-- `take_context`, `with_context` and `update_context` do **not** see a local context: they look up
-  `T`, and the wrapper is what is stored. Read a local context with `use_local_context` and nothing
-  else.
-
-The framework uses this itself: a window provides its host handle with `provide_local_context`,
-which is how `set_timeout` and `focused_node` are free functions that still find the right window in
-a process with two of them (`crates/zgui-view/src/cx/mod.rs`).
-
-## A worked example
-
-A theme and a selection, provided once at the root and read at two different depths. Built from the
-element vocabulary only.
+A theme and a selection, provided once and read at two different depths:
 
 ```rust
 use zgui::prelude::*;
 
-/// The theme, as a newtype over the signal that drives it.
 #[derive(Clone, Copy)]
 struct Theme(RwSignal<bool>);
 
-/// Which row is selected.
 #[derive(Clone, Copy)]
 struct Selection(RwSignal<Option<u64>>);
 
@@ -455,7 +119,6 @@ fn App() -> impl IntoView {
 
 #[component]
 fn Toolbar() -> impl IntoView {
-    // Two levels from the provider, and `App` passed it nothing.
     let Theme(dark) = expect_context::<Theme>();
 
     view! {
@@ -480,7 +143,7 @@ fn List() -> impl IntoView {
 
 #[component]
 fn Row(id: u64) -> impl IntoView {
-    // Each row reads the same selection and writes it. `List` never mentions it.
+    // `List` never mentions the selection.
     let Selection(selected) = expect_context::<Selection>();
 
     view! {
@@ -495,53 +158,268 @@ fn Row(id: u64) -> impl IntoView {
 }
 ```
 
-Three things this shows:
-
-1. `App` calls `provide_context` in its own body, so its own view sees it as well as everything
-   below.
-2. The context value is `Copy`, because it holds signal handles rather than data. `use_context`
-   clones what it finds, so a cheap value is worth having.
-3. The click handler in `Row` reads `selected`, which it captured when the view was built. A
-   listener could also call `expect_context` itself, because it runs in the scope it was written in.
+- `App` provides in its own body, so its own view can read the context too.
+- The context values are `Copy` because they hold signal handles, not data. `use_context` clones,
+  so cheap values are best.
 
 <Callout type="idea">
-Wrap the provider in a component of your own when the setup is more than one line — a
-`ThemeProvider` taking `children: Children`, calling `provide_context` and returning
-`{children.into_view_once()}`. Everything below it in the view is inside its scope, so everything
-below sees the context.
+When setup takes more than a line, wrap it in a provider component: a `ThemeProvider` that takes
+`children: Children`, calls `provide_context` and returns `{children.into_view_once()}`. Everything
+inside it sees the context.
 </Callout>
 
-## What context costs
+## Share a context across windows
 
-| Operation | Cost |
+A context a component provides belongs to that component's window. Other windows do not see it.
+
+Use `with_context` on the application builder for state every window must see, or that must survive
+a suspend. It runs in the application owner before the first window opens:
+
+```rust
+#[derive(Clone, Copy)]
+struct Count(RwSignal<i32>);
+
+fn main() -> Result<(), zgui::Error> {
+    app()
+        .with_context(|| provide_context(Count(RwSignal::new(0))))
+        .run(|| view! { Counter() })
+}
+```
+
+The runtime provides `Fonts`, `Windows` and `Clipboards` in the application owner, so
+`use_context::<Fonts>()`, `use_windows()` and `use_clipboard()` work from every window. `Fonts` is
+also visible inside `with_context`.
+
+## Provide a value that is not `Send`
+
+`provide_context` requires `T: Send + Sync`. View-layer values such as node handles, `Rc`
+callbacks and backend handles are not. Use the local variants:
+
+```rust
+use std::rc::Rc;
+
+#[derive(Clone)]
+struct PanelHandle(Rc<str>);
+
+provide_local_context(PanelHandle("panel".into()));
+let handle = use_local_context::<PanelHandle>();
+```
+
+- A local context may only be touched on the thread that created it. `use_local_context` panics if
+  the value came from another thread, and in debug builds both functions panic off the UI thread.
+- A local context and a `provide_context::<T>` of the same type do not collide, because the local
+  value is stored under a wrapper type. For the same reason `with_context`, `update_context` and
+  `take_context` cannot see a local context. Read it only with `use_local_context`.
+
+The framework uses this itself: each window provides its host with `provide_local_context`, which is
+how free functions such as `set_timeout` and `focused_node` find the right window.
+
+## Owners
+
+A signal handle is `Copy` and is moved into closures that outlive the function that made it, so
+Rust's scoping cannot free it. Owners do. An owner is a node in a tree of scopes, and one owner is
+**current** at any moment. Reactive values created while it is current attach to it:
+
+| Attaches to the current owner | Example |
 |---|---|
-| `provide_context` | one insert into the current owner's map, keyed by `TypeId`, plus one allocation for the box |
-| `use_context` hit | one hash lookup per owner from the reader up to the provider, then a clone of the value |
-| `use_context` miss | one hash lookup per owner all the way to the root, then `None` |
-| `with_context` | the same walk, without the clone |
+| arena-backed handles | `RwSignal`, `ReadSignal`, `WriteSignal`, `Memo`, `Signal`, `Store` |
+| stored values | `StoredValue` |
+| contexts | values passed to `provide_context` |
+| cleanups | closures passed to `on_cleanup_local` |
+| child owners | one per nested component, list row or branch |
 
-The walk is proportional to **the number of owners between the reader and the provider** — the
-component nesting depth at that point, not the size of the document. Each step is a hash lookup on a
-`TypeId` behind a read lock.
+Two exceptions:
 
-Two rules follow:
+- The reference-counted forms (`ArcRwSignal`, `ArcMemo`, `ArcSignal`, …) attach to no owner. They
+  are freed when the last handle drops.
+- A `RenderEffect` lives as long as its handle. Dropping the handle cancels it. The view layer keeps
+  that handle in the node's state, so the effect goes with the node.
 
-- **Look the context up once, in the component body.** Bind the result to a local and use it. A
-  lookup inside a reactive hole repeats the walk on every run for no gain.
-- **A context lookup is not a reactive read.** It subscribes to nothing and it wakes nothing.
-  Providing a new value of the same type in the same scope does not update anything that already
-  read the old one. Reactivity comes from the signal inside the value, never from the lookup.
+### Owners the framework creates
+
+You rarely create an owner yourself. The framework creates these:
+
+| Owner | Created by | Disposed of when |
+|---|---|---|
+| application | the runtime, above every window | the application ends |
+| window | the runtime, once per open window | the window closes, or the platform suspends it |
+| component | `#[component]`, around each call | the component is unmounted; it is also cleaned before its body re-runs on a rebuild |
+| list row | `for` / `For` | that row's key leaves the collection |
+| branch | `if` / `Show` | the branch is replaced |
+
+So a signal created in a component body is freed when the component leaves the interface, and a
+row's signals are freed when that row is deleted, not when the whole list is.
+
+A branch is replaced only when the condition's **answer** changes. A write the condition reads but
+that leaves the answer the same keeps the branch, and everything it created, alive.
+
+When a window closes, its view is unmounted and every scope it made is disposed of, while the
+application owner is still alive. On resume after a suspend, each window's owner and view are built
+again under the application owner.
+
+### Disposal
+
+Disposing of an owner runs synchronously, before the call returns:
+
+1. Its child owners are disposed of, depth first.
+2. Its cleanups run, in the order they were registered.
+3. Its arena-backed values are dropped.
+
+Because nothing is deferred, a removed node's timers, observers and table slots are gone in the
+same frame. Reading a handle after its owner is disposed of panics:
+
+```text
+At src/main.rs:41:18, you tried to access a reactive value which was defined at
+src/main.rs:12:21, but it has already been disposed.
+```
+
+Use `try_get`, `try_with` or `try_update` when a closure may legitimately outlive the value it
+reads; they return `None` instead.
+
+## Values created with no owner
+
+Creating a signal with no current owner **succeeds**. The handle works, but it is never registered,
+so it is never freed. There is no panic and no log, in any build.
+
+```rust
+// No owner is current here.
+let count = RwSignal::new(41);
+count.set(42);
+assert_eq!(count.get(), 42);   // works, and leaks for the life of the process
+```
+
+Four operations check for an owner, and panic in debug builds when there is none (the check
+compiles away in release):
+
+- `provide_context`
+- `provide_local_context`
+- `on_cleanup_local`
+- `Selector::is_selected` (see [Stores and selectors](/docs/learn/stores-and-selectors))
+
+The message names the fix:
+
+```text
+provide_context requires a current owner: with none, the value it creates is unreachable and
+never freed. Run it inside `Mounted::with`.
+```
+
+<Callout type="error">
+Do not put a signal in a `static` or a lazily initialised global. Its initialiser runs on first
+read: either with no owner, so it leaks silently, or inside whichever component read it first, so it
+is disposed of when that component unmounts and every later read panics. Put shared state in a
+context provided at the root instead.
+</Callout>
+
+Debug builds also log two warnings at `error` level through `tracing` (they never panic):
+
+| Limit | Logged when |
+|---|---|
+| owner depth 4096 | one owner chain is deeper than this: owners are nested and never disposed of |
+| 1024 children | one owner has created more children than this without retiring them (see [`Scope`](#manage-many-short-lived-scopes-with-scope)) |
+
+## Create a scope with `Mounted`
+
+`Mounted` is a scope you create and dispose of yourself. The runtime uses it for window roots;
+tests use it to drive a view outside a window.
+
+```rust
+impl Mounted {
+    pub fn new() -> Self;
+    pub fn with<T>(&self, build: impl FnOnce() -> T) -> T;
+    pub fn owner(&self) -> &Owner;
+    pub fn unmount(self);
+}
+```
+
+```rust
+use zgui::prelude::*;
+use zgui::reactive::{Mounted, install};
+
+install().unwrap();          // an application does this for you
+let node = Mounted::new();
+let count = node.with(|| RwSignal::new(0));
+
+count.set(1);
+assert_eq!(count.get(), 1);
+
+node.unmount();              // `count` is gone; reading it now panics
+```
+
+- `Mounted::new()` with no current owner creates a **root**. Inside another scope's `with`, it
+  creates a **child** that is disposed of with its parent.
+- It is `#[must_use]`. Dropping it also disposes of it (including during a panic), but call
+  `unmount` explicitly.
+- Cleanups run with **no owner current**. Capture everything a cleanup needs when you register it.
+- In debug builds, creating one off the UI thread panics.
+
+## Manage many short-lived scopes with `Scope`
+
+An owner keeps an entry for every child it has ever created, even after the child is disposed of.
+A long-lived parent with short-lived children, such as a scrolling list, grows without bound.
+`Scope` fixes this by grouping children into **generations** and dropping a generation once all its
+members are gone.
+
+Use `Scope` only when you mount and unmount a changing set of sibling scopes yourself. `for` lists
+already do this internally.
+
+```rust
+use zgui::reactive::Scope;
+
+impl Scope {
+    pub fn new() -> Self;
+    pub fn mount(&self) -> Mounted;
+    pub fn live(&self) -> usize;
+    pub fn generation_children(&self) -> usize;
+    pub fn generations_created(&self) -> usize;
+}
+```
+
+```rust
+let scope = Scope::new();
+let pinned = scope.mount();      // stays mounted the whole time
+
+for _ in 0..10_000 {
+    let row = scope.mount();
+    // ... build the row ...
+    row.unmount();
+}
+
+assert_eq!(scope.live(), 1);
+assert!(scope.generation_children() < 100);
+pinned.unmount();
+```
+
+A new generation starts when the current one holds more dead members than the scope holds live
+ones, and at least 64. Existing members never move, so a member that stays mounted does not hold
+back retirement.
+
+## Context functions
+
+All eight are in `zgui::prelude`.
+
+| Function | What it does |
+|---|---|
+| `provide_context<T: Send + Sync + 'static>(value: T)` | Makes `value` visible to every scope below the current one. |
+| `use_context<T: Clone + 'static>() -> Option<T>` | Clones the nearest `T`. `None` if nothing above provides one. |
+| `expect_context<T: Clone + 'static>() -> T` | The same, but panics on a miss. For components that cannot work outside their parent. |
+| `with_context<T: 'static, R>(f: impl FnOnce(&T) -> R) -> Option<R>` | Borrows the nearest `T` without cloning it. |
+| `update_context<T: 'static, R>(f: impl FnOnce(&mut T) -> R) -> Option<R>` | Mutates the nearest `T` in place. Notifies nothing. |
+| `take_context<T: 'static>() -> Option<T>` | Removes the nearest `T` and returns it. The only reader for a `T` that is not `Clone`. |
+| `provide_local_context<T: 'static>(value: T)` | Provides a value that is not `Send`. |
+| `use_local_context<T: Clone + 'static>() -> Option<T>` | Reads a value provided with `provide_local_context`. |
+
+There is no `expect_local_context` and no `take_local_context`.
 
 ## Common mistakes
 
 | Symptom | Cause |
 |---|---|
-| `expect_context` panics naming your type | the consumer is not below the provider, or the provider runs after the consumer was built |
-| A context lookup returns the wrong value | two features share a key type; use a newtype |
-| Providing panics in debug with "requires a current owner" | `provide_context` ran outside any component body |
-| A local context returns `None` when one is clearly provided | it was provided with `provide_context` and read with `use_local_context`, or the reverse |
-| Reading a value panics with "already been disposed" | the owner that created it was disposed of; the handle outlived its scope |
-| Nothing updates when the context value changes | the value was replaced with `provide_context` instead of written through a signal inside it |
+| `expect_context` panics naming your type | The reader is not below the provider. |
+| A lookup returns the wrong value | Two features use the same type as a key. Use a newtype. |
+| "requires a current owner" panic in debug | `provide_context` ran outside any component body. |
+| A local context reads as `None` | It was provided with `provide_context` and read with `use_local_context`, or the reverse. |
+| "already been disposed" panic | A handle outlived the owner that created it. |
+| Nothing updates when the context changes | A new value was provided instead of writing a signal inside the existing one. |
 
 ## Next
 

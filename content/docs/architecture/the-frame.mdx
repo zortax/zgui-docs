@@ -1,18 +1,17 @@
 ---
 title: The frame
-description: The frame loop step by step, what each step reads and writes, when the loop parks, and the exact set of things that wake it again.
+description: The frame loop step by step, what each step reads and writes, the reactive flush, observation delivery, when the loop parks, what wakes it, and the counters to read.
 ---
 
-`zgui-runtime` is the crate that runs the pipeline. This page is one frame in the order it is
-actually implemented, the conditions under which the loop stops, and what starts it again.
+`zgui-runtime` runs the frame loop. It turns platform events, timers and finished work into frames,
+runs each frame's steps in a fixed order, and parks the loop when nothing is owed. The
+[architecture overview](/docs/architecture/overview#one-frame) summarises the phases; this page
+covers each one in implementation order.
 
-It assumes the [architecture overview](/docs/architecture/overview). Nothing here is needed to write
-an application.
+## Platform callbacks
 
-## The loop from outside
-
-A platform backend owns the event loop and drives an object that implements
-`zgui_platform::AppHandler`. `zgui_runtime::Runtime` is the only implementation the framework ships.
+A platform backend owns the event loop and drives an `zgui_platform::AppHandler`.
+`zgui_runtime::Runtime` is the implementation zgui ships.
 
 ```rust
 pub trait AppHandler: 'static {
@@ -28,99 +27,98 @@ pub trait AppHandler: 'static {
 
 | Callback | What `Runtime` does (`crates/zgui-runtime/src/app.rs`) |
 |---|---|
-| `surfaces_available` | Installs the clock and waker, then opens every requested window that has no surface. On resume, this rebuilds all suspended window views. |
-| `surfaces_lost` | Drops every current frame pipeline and surface while retaining the requested window specifications. |
-| `surface_event` | `RedrawRequested` runs a frame if the named window wants one and presentation pacing does not hold it. `CloseRequested` consults close callbacks; an accepted close and `Destroyed` remove that window, then apply the exit policy. Other events are queued only on the named window. |
-| `wake` | Turns surface-scoped reasons into redraw requests, or drains application commands and clipboard requests for `AppWork`. |
-| `idle` | Computes the park. Returns an `IdlePolicy`. |
-| `deadline_reached` | Turns "a deadline arrived" into a redraw request on the surfaces that were parked on it. |
+| `surfaces_available` | Installs the clock and waker, then opens every requested window that has no surface. On resume, rebuilds suspended window views. |
+| `surfaces_lost` | Drops every frame pipeline and surface, keeping the window specifications. |
+| `surface_event` | `RedrawRequested` runs a frame if the window wants one and presentation pacing does not hold it. `CloseRequested` consults close callbacks; an accepted close or `Destroyed` removes the window and applies the exit policy. Other events are queued on the named window. |
+| `wake` | Handles the reason: redraw the named surfaces, drain application commands, route an accessibility action, resolve a clipboard read, and so on. |
+| `idle` | Computes the park and returns an `IdlePolicy`. Runs any maintenance that is already due. |
+| `deadline_reached` | Turns a reached deadline into a redraw request (or a maintenance pass) for the windows parked on it. |
 | `shutting_down` | Closes every window. |
 
-A frame runs from exactly one place: `SurfaceEvent::RedrawRequested`, and only when
-`Window::wants_a_frame(now)` answers true and `Window::holds_a_frame(now)` answers false. Everything
-else — input, a wake, a reached deadline — asks for a redraw and returns.
+**A frame runs from exactly one place**: `SurfaceEvent::RedrawRequested`, and only when
+`Window::wants_a_frame(now)` is true and `Window::holds_a_frame(now)` is false. Everything else
+(input, a wake, a reached deadline) requests a redraw and returns.
 
-## One frame, in order
+## Frame steps
 
 ```rust
 pub fn frame(&mut self, clock: &dyn Clock) -> FrameReport
 ```
 
-`Window::frame` runs the whole body inside the window's own reactive owner
-(`owner.with(|| self.run_frame(clock))`, `crates/zgui-runtime/src/window/frame.rs`). That is what
-makes the free functions a component is written with — `set_timeout`, `focused_node`, observation
-registration — resolve to the right window from a listener body, from an effect, and from a timer
-callback, not only while a view is being built.
+`Window::frame` runs inside the window's own reactive owner
+(`crates/zgui-runtime/src/window/frame.rs`). That is why free functions such as `set_timeout`,
+`focused_node` and observation registration resolve the right window from a listener, an effect or
+a timer callback.
 
-The frame reads the clock **once**, at the top: `clock.now()` for deadlines and `clock.timestamp()`
-for every stamp the frame hands out. No later stage reads it again.
+The frame reads the clock once, at the top: `clock.now()` for deadlines and `clock.timestamp()`
+for every timestamp it hands out. The first column below is the profiling mark each step emits. The
+marks label the `ZGUI_LATENCY` trace and the inspector's Timeline tab.
 
-The names in the first column are the profiling marks the frame emits, which is what the
-`ZGUI_LATENCY` trace is labelled with.
+| Mark | Step | Owner | Writes | Skipped when |
+|---|---|---|---|---|
+| `f.drain` | Dispatch queued events | `zgui-input`, `zgui-runtime` | interaction state, listener writes, commands | nothing was queued |
+| `f.timers` | Fire due callbacks | `zgui-runtime` | whatever the callbacks write | nothing is due |
+| `f.scroll` | Advance running scrolls | `zgui-scroll` | offsets, moved containers | nothing is scrolling |
+| `f.gestures` | Advance held contacts | `zgui-input` | gesture readings, the long-press moment | no contact is held |
+| `f.reconfigure` | Point the renderer at the surface | `zgui-render` | render target, damage (exposed bands or full) | no reconfiguration is owed |
+| `f.device` | Rebuild the media device | `zgui-style` | what the cascade matches against | viewport, scale and scheme did not move |
+| `f.raf` | Run next-frame callbacks | `zgui-runtime`, `zgui-view` | whatever the callbacks write | none pending |
+| `f.animate` | Advance running animations | `zgui-anim`, `zgui-style` | animated values, restyle marks, events | nothing is running |
+| `f.flush` | Run posted closures, then ready tasks | `zgui-reactive` | signals; the document through the `Dom` seam | called re-entrantly |
+| `f.commands` | Carry out what listeners asked for | `zgui-runtime` | focus, selection, pointer capture, sheets | the queue is empty |
+| `f.images` | Settle finished image decodes | `zgui-runtime` | image content, damage | nothing arrived |
+| `f.restyle` | Cascade elements that owe one | `zgui-style` | computed styles, damage bits | nothing owes a restyle |
+| `f.brushes` | Rewrite moved text colours | `zgui-text` | brush slots | no colour moved |
+| `f.boxes` | Patch the box tree | `zgui-layout` | spliced subtrees, rewritten text runs | nothing structural is owed |
+| `f.layout` | Measure, arrange, compose fragments | `zgui-layout`, `zgui-text` | sizes, positions, fragments, hit regions, damage | measuring only; composing always runs |
+| `f.image_demand` | Size pending decodes to laid-out boxes | `zgui-runtime` | decode requests | nothing new to decode |
+| `f.enter` | Enter owed focus traps | `zgui-input` | focus | nothing owes an entry |
+| `f.dispatch_scroll` | Announce containers that moved | `zgui-runtime` | `scroll` events, then a flush | nothing moved |
+| `f.observe` | Deliver settled geometry | `zgui-runtime`, `zgui-view` | observed signals, then a flush and relayout | nothing is observing |
+| `f.rehit` | Re-test under a stationary pointer | `zgui-input` | hover state, crossing events | the hit index did not change |
+| `f.publish_brushes` | Copy brushes into the display list | `zgui-runtime` | `scene.text_paints` | nothing changed |
+| `f.caret` | Plan the caret | `zgui-runtime` | the caret highlight and its damage | nothing editable has focus |
+| `f.embed` | Bind embedded surfaces to their boxes | `zgui-runtime` | attachments, damage | nothing is embedded |
+| `f.paint` | Grow damage, emit, draw and present | `zgui-paint`, renderer | display list, composed target, surface | see below |
+| `f.a11y` | Publish the accessibility tree | `zgui-a11y` | a tree update | nothing is listening or owed |
+| `f.recycle` | Recycle arenas, decide the park | `zgui-runtime` | arena slots, at most one redraw request | — |
 
-| Mark | Step | Owner | Reads | Writes | Skipped when |
-|---|---|---|---|---|---|
-| `f.drain` | Dispatch queued events | `zgui-input`, `zgui-runtime` | last frame's fragments and hit index; the queued events | interaction state, whatever the listeners write, the command queue | nothing was queued |
-| `f.timers` | Fire due callbacks | `zgui-runtime` | the timer heap, `now` | whatever the callbacks write | nothing is due |
-| `f.scroll` | Advance running scroll | `zgui-scroll` | offsets, elapsed time | offsets, and the containers it moved | nothing is scrolling, or no time passed |
-| `f.gestures` | Advance held contacts | `zgui-input` | pointer contacts, `now` | gesture readings, the long-press moment | no contact is held |
-| `f.reconfigure` | Point the renderer at the surface | `zgui-render` | the **surface's** extent, never the event's | the render target, full damage | no reconfiguration is owed |
-| `f.device` | Rebuild the media device | `zgui-style` | the viewport, scale and colour scheme | the device the cascade matches against | the device did not move |
-| `f.raf` | Run next-frame callbacks | `zgui-runtime`, `zgui-view` | the pending callback batch, the frame timestamp | whatever the callbacks write | no callback is pending |
-| `f.animate` | Move every running animation on | `zgui-anim`, `zgui-style` | the frame's timestamp | animated values, restyle marks, lifecycle events | nothing is running |
-| `f.flush` | Run posted UI closures, then reactive tasks | `zgui-reactive` | the UI queue and ready task set | signals and the document, through the `Dom` seam | called re-entrantly |
-| `f.commands` | Carry out what listeners asked for | `zgui-runtime` | the command queue | focus, selection, pointer capture, sheets | the queue is empty |
-| `f.restyle` | Cascade the elements that owe one | `zgui-style` | the document and the sheets | computed styles, and damage bits | no element owes a restyle |
-| `f.brushes` | Rewrite moved text colours | `zgui-text`, `zgui-runtime` | the cascade's paint updates | the brush slots a cached paragraph resolves through | no colour moved |
-| `f.boxes` | Bring the box tree back into agreement | `zgui-layout` | structural obligations | spliced subtrees, rewritten text runs | nothing structural is owed |
-| `f.layout` | Measure, arrange, compose fragments | `zgui-layout`, `zgui-text` | the box tree, the scroll offsets | sizes, positions, fragments, hit regions, damage | the measuring half only: the composing half always runs |
-| `f.enter` | Enter owed focus traps | `zgui-input` | the traps that asked to be entered | focus | nothing owes an entry |
-| `f.dispatch_scroll` | Announce containers that moved | `zgui-runtime` | this frame's scroll deltas | `scroll` events, then a flush of what they wrote | nothing moved |
-| `f.observe` | Deliver settled geometry | `zgui-runtime`, `zgui-view` | fragments, the observation registry | observed signals, then a flush and a relayout | nothing is observing |
-| `f.rehit` | Re-test under a stationary pointer | `zgui-input` | the fragments this frame produced | hover state, crossing events for the next frame | the pointer is over nothing new |
-| `f.publish_brushes` | Copy the brush table into the display list | `zgui-runtime` | the text engine's table | `scene.text_paints`, in `zgui-scene` | no slot was claimed and no colour moved |
-| `f.caret` | Plan the caret rectangle | `zgui-runtime` | the lines this frame produced, `now` | a highlight, and the damage for it | nothing editable has focus |
-| `f.paint` | Grow the damage, emit against it | `zgui-paint` | fragments, styles, the content caches | the display list, batches, draw order | nothing to emit |
-| `p.draw` | Draw and present | `zgui-render` + backend | the display list and the damage | the persistent target, then the surface | the surface is occluded |
-| `f.a11y` | Publish the accessibility tree | `zgui-a11y` | the document and this frame's geometry | a tree update | nothing is listening and nothing is owed |
-| `f.recycle` | Recycle document and box arenas, decide the park | `zgui-runtime` | retired document nodes and boxes, the frame gate, the document's change flag | reusable arena slots and one redraw request, at most | — |
+Inside `f.paint`, `p.expand` grows the damage over fragments that read outside their ink, `p.emit`
+runs the [emit walk](/docs/architecture/paint-and-scene#the-stacking-order-walk), `p.upload` flushes
+atlas uploads, and the renderer's own marks follow:
 
-`p.draw` contains the renderer's own marks. The Timeline tab of the inspector shows each of these
-names in parentheses, after the words for the stage:
-
-| Mark | Work opened by the mark |
+| Mark | Work |
 |---|---|
-| `r.tables` | Consume the scene-table journals and flatten changed clip, paint, stop and coordinate-system slots. |
-| `r.vectors` | Encode the planned vector paths. |
-| `r.plan` | Plan render passes, targets and per-draw parameter blocks. |
-| `r.encoder` | Create the frame command encoder. |
-| `r.shift` | Copy the valid pixels of an accepted scroll shift through the scratch texture. Present only when a composed scrollport is shifted. |
-| `r.buffers` | Update changed table ranges, persistent primitive arenas, transient instances, and remap lists through reusable staging chunks. |
-| `r.record` | Record render passes and draw commands. If the upload belt grew, this mark names how many chunks were allocated. |
-| `acq.in` | Acquire the surface after all scene work has been recorded. |
-| `sub.out` | Finish submission to the device queue. |
-| `pres.out` | Present the acquired surface. |
+| `r.tables` | Read the scene-table journals and flatten changed clip, paint, stop and coordinate-system slots. |
+| `r.vectors` | Plan the general vector passes and rasterise round 0. |
+| `r.plan` | Plan render passes, targets, mark bins and per-draw blocks. |
+| `r.encoder` | Create the frame's command encoder. |
+| `r.shift` | Copy the valid pixels of an accepted scroll shift. Only present when one was accepted. |
+| `r.buffers` | Upload changed table ranges, arena contents, transient instances and remaps. |
+| `r.record` | Record passes, submitting between vector rounds. Notes how many upload chunks were allocated, if any. |
+| `acq.in`, `sub.out`, `pres.out` | Acquire the surface, submit, present. |
 
-A long `r.tables` interval is CPU preparation. A long `r.buffers` interval with
-`upload_chunks_allocated == 0` contains copying and possible destination-buffer growth, but no
-staging allocation. A non-zero allocation count identifies a larger staging working set or GPU
-backlog that prevented reuse.
+A long `r.tables` is CPU preparation. A long `r.buffers` with no chunk allocation is copying and
+buffer growth; a non-zero allocation count means the staging working set grew or the GPU is behind.
+See [the renderer](/docs/architecture/renderer#present) for the full order inside `draw`.
 
-`f.raf` drains its pending batch before it calls anything. A callback that requests another frame
-therefore runs in the next frame. A pending batch uses the same display cadence as CSS animation,
-and callbacks run before `f.animate` and `f.flush`, so their writes settle in the frame they receive.
+Rules for the early steps:
 
-Two of those steps exist for one defect each, and the source says so
-(`crates/zgui-runtime/src/window/frame.rs`):
-
-> **Delivering geometry before painting** is what stops a menu appearing for one frame in the wrong
-> corner. **Re-hit testing under a stationary pointer** is what stops a dropdown that opens under
-> the cursor from never being hovered.
+- **Pointer moves are coalesced on arrival.** A move queued behind a move of the same pointer
+  replaces it. The earlier positions are kept as `PointerSample` values for handlers that want the
+  whole path. Any other event is a barrier, so dispatch order never changes.
+  `PointerMovesCoalesced` counts folds.
+- **`f.raf` takes its whole batch before calling any callback**, so a callback that requests another frame
+  runs next frame. Callbacks run before `f.animate` and `f.flush`, so their writes settle in the
+  frame that received them.
+- **Geometry is delivered before painting**, so a popover that measures itself and moves is painted
+  in its final place in the frame it opens.
+- **The re-hit test runs only when the hit index changed.** A dropdown that opens under a stationary
+  cursor is still hovered, and a frame that moved nothing tests nothing (`HitRetests`).
 
 The frame returns what it did:
 
 ```rust
-#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FrameReport {
     pub outcome: FrameOutcome,
     pub needs_another_frame: bool,
@@ -130,105 +128,82 @@ pub struct FrameReport {
 }
 ```
 
-`FrameOutcome` comes from `zgui-render`: `Presented(FrameStats)`, `Skipped(SkipReason)` or
-`Recovered`. `outcome.retires_damage()` is false for `SkipReason::Unconfigured` and
-`SkipReason::DeviceUnavailable`, because neither records work. A frame that composed everything and
-then failed to acquire a surface has still written the target it draws into, so its damage is
-retired.
+`outcome.retires_damage()` decides whether the window's damage is cleared. It is false only when
+nothing was recorded (`Unconfigured`, `Unacquired`, `DeviceUnavailable`). A frame that composed
+everything and then failed to acquire a surface has still written the persistent target, so its
+damage is retired. See [What a frame reports](/docs/architecture/renderer#what-a-frame-reports).
 
-## Where the flush sits, and why
+## The reactive flush
 
-The flush is the reactive layer's only chance to run. `zgui_reactive::flush()` first drains the
-closures sent through `Ui::post`. It then polls every ready task to a stall. A posted closure can
-write signals, and those writes settle during the task poll that follows. Writing a signal outside
-the flush only marks observers.
+The flush is the only point where the reactive layer runs. `zgui_reactive::flush()` first drains closures
+posted with `Ui::post`, then polls ready tasks until they stall. Writing a signal outside a flush only
+marks observers.
 
-The order around it is three lines of `run_frame` and each is load-bearing.
+Three calls in `run_frame` decide which work the flush answers:
 
-<Steps>
+1. **`self.gate.requests_serviced()`**, immediately before the flush. Anything that asked for a frame
+   up to here (a listener in this frame's dispatch, a timer callback, a task that finished) is
+   answered by this flush. Placing it after the flush would lose requests that arrive in between.
+2. **`zgui_reactive::flush()`.** Effects run and mutate the document through the `Dom` seam.
+3. **`document.changes_serviced()`**, after commands and image settling. Everything above produces
+   changes; everything below consumes them. Without this call, a change made during this frame's
+   own dispatch would still be flagged at the end and cause a second frame that damages nothing.
 
-<Step>
+The restyle runs after that call, so a listener's write is styled, laid out and painted in the same
+frame that dispatched the event. A click (move, press, release) is shown by one frame per event, not
+two (`a_click_runs_one_frame_for_each_event_and_not_two`, `crates/zgui/tests/wall_clock.rs`).
 
-**`self.gate.requests_serviced()`**, immediately before the flush. It clears "another frame is
-owed". Anything that asked for a frame up to this line — a listener that ran in this frame's own
-dispatch, a timer callback, a task that finished while the frame was starting — is answered by the
-flush that follows and owes nothing more. Placing it *after* the flush would lose whatever arrived
-in between.
+### Other flush points
 
-</Step>
-
-<Step>
-
-**`let flush = zgui_reactive::flush();`** Effects run here, and this is where they mutate the
-document through the same `Dom` seam a view builds through.
-
-</Step>
-
-<Step>
-
-**`self.document.borrow().changes_serviced();`** — the produce and consume line. Everything above it
-produces changes: events dispatched, timers fired, the graph flushed, commands carried out.
-Everything below it consumes them. Without this line the change a listener made during a frame's own
-dispatch would still be flagged at the end of that frame and buy a second frame that damages
-nothing.
-
-</Step>
-
-</Steps>
-
-The restyle is below that line, so a listener's write is styled, laid out and painted by the frame
-that dispatched the event. That is what makes an interaction cost one frame rather than two, and it
-is asserted:
-
-> a click delivers three events — move, press, release — and each is shown by one frame
-
-(`a_click_runs_one_frame_for_each_event_and_not_two`, `crates/zgui/tests/wall_clock.rs`).
-
-### The four places a frame flushes
-
-The main flush is not the only one. Each of the others exists because a listener's writes must
-settle before something later in the same frame reads the document.
+Each extra flush exists because something later in the same frame reads the document.
 
 | Site | Why | Bound |
 |---|---|---|
-| `settle_between_events` (`window/input.rs`) | A press that opens a dialog must have built it before the Escape in the same batch is routed. | Once per queued event except the last |
+| `settle_between_events` (`window/input.rs`) | A press that opens a dialog must have built it before the next queued key is routed. | Once per queued event except the last |
 | `run_frame` | The frame's own reactive work. | Once |
 | `dispatch_scroll` (`window/scroll/mod.rs`) | A virtualised list must not render the rows it had before the scroll. | Once |
-| `deliver_observations` (`window/observe.rs`) | A popover measures itself, then moves; the move must be painted in the frame it opened in. | `MAX_PASSES: u8 = 2`, then a warning |
+| `deliver_observations` (`window/observe.rs`) | A popover measures itself, then moves; the move must be painted in the same frame. | Two passes |
 
-A flush called from inside an effect is a no-op returning `FlushOutcome::default()`, so none of
-these can nest.
+The scroll and observation flushes call `requests_serviced()` first, so wakes raised by the handlers
+they run are answered by that flush instead of causing another frame; the observation pass also marks
+the document changes it made as serviced. A flush called from inside an effect is a no-op.
 
-## The iteration budget
+### Iteration limits
 
-Polling "until nothing is ready" does not terminate when two effects write each other's sources.
-Each write makes the other ready again, inside one poll, with no frame presented.
+Polling until nothing is ready never terminates when two effects write each other's sources.
+`zgui-reactive` bounds it in two ways:
 
-```rust
-// crates/zgui-reactive/src/executor/budget.rs
-pub(crate) const BUDGET: u32 = if cfg!(debug_assertions) { 32 } else { 8 };
-```
+- **Per task** (`executor/budget.rs`): `BUDGET` is 32 polls per task per flush in debug builds and 8
+  in release. A task that reaches it is set aside with its waker kept, the cycle is logged once at
+  `error` level naming the spawn site, and the task is re-woken after the flush, which sets
+  `FlushOutcome::needs_another_frame`.
+- **Per flush** (`executor/frame.rs`): the pool is polled up to `MAX_ROUNDS = 3` times, to catch a
+  wake that lands between a stall and the poll's return. A wake still arriving after the third round
+  is left to the next frame.
 
-The budget caps how many times **one task** may be polled within **one flush**. Each flush
-increments a generation counter, and a task's poll count resets when it sees a new generation.
+A dependency cycle therefore costs a logged error and a presented frame, repeated each frame, not a
+hang. An ordinary task is polled once or twice per flush.
 
-When a task reaches the cap:
+## Observation delivery
 
-1. it is set aside, and its waker is kept;
-2. the cycle is reported once, at `error` level through `tracing`, naming the spawn site when
-   `#[track_caller]` recorded one;
-3. `FlushOutcome::budget_exhausted` is set;
-4. the kept wakers are woken after `flush()` returns, which re-queues the tasks in the pool and sets
-   `FlushOutcome::needs_another_frame`.
+`deliver_observations` is the only path from layout back into views. Popovers, virtualised lists and
+scroll thumbs need it: they read a measurement, and what they do in response (move, resize, render
+other rows) changes that measurement.
 
-So a dependency cycle costs a logged error and a presented frame, repeated every frame, rather than
-a hang. Debug builds allow more polls because a chatty dependency chain should be diagnosed rather
-than truncated while it is being investigated; release builds cut sooner because the frame still has
-to present. An ordinary task is polled once or twice per flush.
+- **Skipped whole when nothing observes.** One emptiness test on the registry, not a walk.
+- **Only changed values are delivered, each on its own.** A view watching the border box, the border
+  size (`NodeRef::observe_border_size`, size only), the content size or the scroll position is told
+  only when *that* quantity changed. Re-delivering an equal value would re-run effects and stop a
+  document with a popover from ever settling.
+- **At most two passes.** Each pass delivers, flushes, then restyles and lays out again. After the
+  second pass, the runtime measures once more **without delivering**. If a watched value still moved,
+  it logs a warning, bumps `ObservationsTruncated`, and asks for another frame, which delivers the
+  remainder. A chain that settles in exactly two passes owes nothing. `ObservationPasses` counts
+  passes.
 
-## When the loop parks
+## Parking
 
-Parking means the loop blocks in the windowing system and consumes nothing. The whole decision is
+Parking means the loop blocks in the windowing system and uses no CPU. The decision is
 `Runtime::idle`:
 
 ```rust
@@ -236,155 +211,133 @@ fn idle(&mut self, cx: &dyn PlatformCx) -> IdlePolicy {
     let now = cx.clock().now();
     let mut policy = IdlePolicy::Block;
     self.parked.clear();
-    for window in &self.windows {
-        let Some(deadline) = window.merged_deadline(now) else { continue };
-        if deadline > now {
-            self.parked.push((window.surface().id(), deadline));
-            policy = policy.merge(IdlePolicy::BlockUntil(deadline));
+    for window in &mut self.windows {
+        let Some(deadline) = window.scheduled_deadline(now) else { continue };
+        if deadline.at > now {
+            self.parked.push((window.surface().id(), deadline.at, deadline.kind));
+            policy = policy.merge(IdlePolicy::BlockUntil(deadline.at));
         } else {
-            window.request_frame();
+            match deadline.kind {
+                DeadlineKind::Render => window.request_frame(),
+                DeadlineKind::Maintenance => window.maintain(cx.clock().timestamp()),
+            }
         }
     }
     policy
 }
 ```
 
-Three outcomes, and no fourth:
+| Condition | Policy |
+|---|---|
+| No window has a deadline | `IdlePolicy::Block`: wait for the windowing system. |
+| Some deadline is in the future | `IdlePolicy::BlockUntil(earliest)`. |
+| A deadline has already passed | Run it now (request the frame, or do the maintenance) instead of installing it. |
 
-| Condition | Policy | Effect |
+The runtime never returns `IdlePolicy::Spin`.
+
+The park logic prevents two failures. Both look the same from outside: nothing on screen changes.
+
+- **A stall.** A deadline wakes the loop but nothing turns it into a redraw.
+  `Runtime::deadline_reached` prevents this. It reads `self.parked` instead of recomputing the
+  deadlines, because recomputing would return the *next* deadline and find nothing reached.
+- **A spin.** An already-passed deadline is installed; the platform finds no time remaining,
+  reports it reached, and repeats without running a frame. The `else` branch above prevents this.
+
+The headless backend asserts `resumes <= frames + 1` after every turn
+(`Harness::assert_park_invariant`, `crates/zgui-platform-headless/src/harness.rs`).
+
+A settled application costs nothing: in `docs/performance.md`, `idle.frames` is 0.00 and
+`idle.turn` is 0.07 µs. The regression test is `a_settled_application_runs_no_frames_at_all`.
+
+### Deadline sources
+
+`Window::scheduled_deadline` merges seven render sources and one maintenance source; the earliest
+wins.
+
+| Source | Where it comes from | Dropped while occluded or starved |
 |---|---|---|
-| No window has a merged deadline | `IdlePolicy::Block` | Block on the windowing system alone |
-| At least one deadline is strictly in the future | `IdlePolicy::BlockUntil(min)` | Block until the earliest of them |
-| A deadline has already passed | The frame is asked for now, and the park is on nothing | — |
+| Next animation tick, or the first pending frame callback | `AnimationCadence::due()` | yes |
+| Earliest scheduled callback | `Timers::peek_for(document, now)` | no |
+| A held contact becoming a long press | `Window::gesture_deadline()` | no |
+| A deferred configure becoming worth answering | `ResizePace::due(interval)` | no |
+| Next caret blink | `Carets::next_flip(now)` | yes |
+| Release of a presentation-paced frame | `PresentPace::due()` | no |
+| A renderer-requested retry, or the starvation probe | `retry_after` | while occluded only |
+| **Idle maintenance** | `maintenance_due` | no |
 
-`IdlePolicy::Spin` exists in the contract and the runtime never returns it.
+**Every source is a fixed moment, never "now plus an interval".** `scheduled_deadline` is called on
+every loop turn, so a relative deadline would be pushed back by every unrelated wake. The animation
+moment comes from the phase the last frame left, the resize moment from the last answered configure,
+the blink from the caret's own origin.
 
-### The two failure modes
+While a reconfiguration is owed but not yet visible, `wants_a_frame` refuses **every** frame; while
+presentation pacing holds a frame, `holds_a_frame` does the same. So render deadlines are floored to
+those gates: a wake before them would be refused, recomputed and repeated.
 
-The module doc of `crates/zgui-runtime/src/app.rs` names both, because they look identical from
-outside — nothing happens.
+A display-paced surface paces through blocking swap-chain acquisition, and `PresentPace` uses the
+measured wait to release later work near the next refresh. A platform-paced surface (native Wayland)
+uses compositor frame callbacks and normally has no acquisition wait. The surface's measured
+presentation interval, when known, takes precedence over its reported refresh rate.
 
-- **The stall.** A deadline is installed, the loop is woken when it arrives, and nothing turns
-  "the deadline arrived" into a request to draw. `Runtime::deadline_reached` is the edge that closes
-  it.
-- **The spin.** A deadline that has already passed is installed anyway. The platform recomputes the
-  time remaining on every turn, finds none, reports it reached again, and the loop runs no frames
-  while burning a core. The `else` branch above closes it.
+### Idle maintenance
 
-`deadline_reached` reads `self.parked` and never recomputes a deadline. Recomputing would find the
-*next* moment each window owes and conclude that nothing had been reached.
+At the end of every normal frame, `maintenance_due` is set to two seconds later
+(`MAINTENANCE_DELAY`). A later frame pushes it back, so an active window never trims and a parked
+window gets exactly **one** maintenance wake. That wake runs `Window::maintain`, which does not lay
+out, paint, draw or present:
 
-The headless backend asserts the difference after every turn:
+- `Renderer::release_idle_resources()` frees unused group targets, scroll scratch, completed upload
+  chunks, persistent arenas, retained remap and table buffers, and the vector rasteriser's
+  reproducible scratch;
+- paint records are re-noted, so the next drawn frame restores GPU residency in one pass instead of
+  uploading each chunk transiently;
+- embedded surfaces trim their working memory.
 
-```rust
-pub fn assert_park_invariant(&self);   // resumes <= frames + 1
-```
+A test that asserts a silent loop must step past this one wake.
 
-One resume per frame, plus the one whose frame has not run yet, is the whole budget
-(`crates/zgui-platform-headless/src/harness.rs`).
+## Wake sources
 
-### What a window is parked on
+If a wake route is missing, the window does not crash; it silently stops responding to one kind of
+event. These are the routes:
 
-```rust
-pub fn merged_deadline(&self, now: Instant) -> Option<Instant>
-```
+| Source | Route |
+|---|---|
+| Input and surface events | `Runtime::surface_event` → `Window::queue` → `Window::request_frame` |
+| A document change during a frame | `Document::end_frame`, `FrameGate`, the frame's own end-of-frame request |
+| Work finishing elsewhere (tasks, decodes, cross-thread signal writes) | `RuntimeWaker::wake` → `Waker::wake` → `WakeReason::ReactiveWork` |
+| A deadline (timer, animation, gesture, resize, caret, present hold, retry, maintenance) | `IdlePolicy::BlockUntil` → `Runtime::deadline_reached` |
+| A frame owing more (unfinished reactive work, undelivered observations, deferred CPU vector layers, new image demand) | `request_frame` at the end of the frame |
+| Application and desktop requests | The other `WakeReason` variants, below |
 
-Eight sources are merged, and the earliest wins. Maintenance remains a distinct deadline kind
-because it must not request a normal frame.
-
-| Source | Where it comes from | Dropped while occluded |
-|---|---|---|
-| The next animation tick or first pending frame callback | `AnimationCadence::due()` or the callback's registration time | yes |
-| The earliest scheduled callback | `Timers::peek_for(document, now)` | no |
-| The moment a held contact becomes a long press | `Window::gesture_deadline()` | no |
-| The moment a deferred configure becomes worth answering | `ResizePace::due(interval)` | no |
-| The next caret blink | `Carets::next_flip(now)` | yes |
-| The release time of a presentation-paced frame | `PresentPace::due()` | no |
-| The renderer-requested retry time | `retry_after` | yes |
-| Idle-memory maintenance | `maintenance_due` | no |
-
-The seven render-producing deadlines are stable moments. `merged_deadline` is asked on every turn
-of the loop, so a source that answered "an interval from now" would be pushed forward by every
-unrelated wake. The animation's moment comes from the phase the last frame left, the resize's from
-the frame that last answered a configure, and the blink's from the caret's own origin. The
-maintenance moment is set once, at the end of a normal frame, to two seconds after that frame. A
-later normal frame replaces it.
-
-A starved surface drops animation, frame-callback, and caret deadlines. Its retry deadline remains
-so the runtime can probe the compositor. Timer and gesture deadlines still run; their work settles
-without turning starvation into a continuous sequence of presentation attempts.
-
-When maintenance wins, the runtime releases reproducible renderer and embedded-surface working
-memory without layout, paint, drawing, or presentation. It clears the maintenance deadline when the
-work is complete.
-
-The resize and presentation gates then floor the answer. While a reconfiguration is owed and could
-not yet be seen, `Window::wants_a_frame` refuses **every** frame whatever asked for it. While
-presentation pacing holds a frame, `Window::holds_a_frame` does the same. A moment before either
-gate is not an early frame but no frame at all: wake, ask, be refused, recompute, wake again.
-
-The platform and graphics waits are separate. A display-paced surface uses blocking swap-chain
-acquisition, and `PresentPace` uses that measured wait to release later work near the next refresh.
-A platform-paced surface, such as native Wayland, uses compositor frame callbacks and normally has
-no acquisition wait; the acquisition-based hold therefore converges to zero. The surface's measured
-presentation interval, when available, takes precedence over its last reported output rate for
-animation, resize, and deadline calculations.
-
-## What wakes the loop
-
-Four things, and the list in `crates/zgui-runtime/src/lib.rs` is exhaustive on purpose, because a
-missing entry is not a crash but a window that quietly stops answering one class of event.
-
-| Asker | Route | Type involved |
-|---|---|---|
-| A change to the document | The reactive write that caused it, or the frame's own end-of-frame flag | `Document::end_frame`, `FrameGate` |
-| Input | `Runtime::surface_event` calls `Window::queue`, then `Window::request_frame` | `SurfaceEvent` |
-| Work finishing somewhere else | `RuntimeWaker::wake` to `Waker::wake` to `Runtime::wake` | `WakeReason::ReactiveWork` |
-| A deadline arriving | The platform reports it; `Runtime::deadline_reached` turns it into a request | `IdlePolicy::BlockUntil` |
-
-### The gate
+### `FrameGate`
 
 ```rust
 pub struct FrameGate { /* AtomicBool in_frame, AtomicBool another_frame */ }
 
 impl FrameGate {
-    pub fn in_frame(&self) -> bool;
-    pub fn needs_another_frame(&self) -> bool;
-    pub fn request(&self) -> bool;      // true means deferred rather than forwarded
+    pub fn request(&self) -> bool;      // true means deferred into the running frame
     pub fn requests_serviced(&self);
     pub fn begin_frame(&self);
-    pub fn end_frame(&self) -> bool;    // swaps `another_frame` out
+    pub fn end_frame(&self) -> bool;    // takes `another_frame`
+    // in_frame(), needs_another_frame()
 }
 ```
 
-Two atomics, read from arbitrary threads, because a wake arrives from wherever the work finished.
-A wake raised from **outside** a frame goes to the platform. A wake raised from **inside** one sets
-`another_frame` and returns. A unit test asserts that a thousand in-frame wakes become exactly one
-owed frame (`crates/zgui-runtime/src/wake.rs`).
+Two atomics, because wakes arrive from any thread. A wake raised outside a frame goes to the platform.
+A wake raised inside one sets `another_frame` and returns; a thousand in-frame wakes become one owed
+frame (`crates/zgui-runtime/src/wake.rs`).
 
-### The waker
+### `RuntimeWaker`
 
-```rust
-impl FrameWaker for RuntimeWaker {
-    fn wake(&self) {
-        if self.gate.request() { return; }
-        let surfaces = /* the surfaces this waker owns */;
-        if surfaces.is_empty() { return; }
-        self.platform.wake(WakeReason::ReactiveWork { surfaces: surfaces.into_boxed_slice() });
-    }
-}
-```
-
-`RuntimeWaker` holds an `Arc<dyn zgui_platform::Waker>`, the shared `FrameGate` and the set of
-`SurfaceId` it speaks for. The surfaces are named rather than left implicit, because an image
-decoding for one window is not a reason to redraw another. `Runtime::open_live_window` calls
-`waker.owns(surface.id())` **before** the view is built; `close_window` calls `disowns`, so a later
-wake naming a closed window goes nowhere.
+`RuntimeWaker` holds an `Arc<dyn zgui_platform::Waker>`, the shared `FrameGate`, and the set of
+`SurfaceId`s it wakes. Wakes are scoped to surfaces so that an image decoding for one window does
+not redraw another. `Runtime::open_live_window` calls `waker.owns(surface.id())` **before** the view is
+built; closing a window calls `disowns`, so later wakes for it go nowhere.
 
 `zgui_platform::Waker` is the only object in the platform contract that crosses threads. A signal
-written on a worker thread reaches it synchronously, inside the write, on the writing thread.
+written on a worker reaches it synchronously, inside the write.
 
-### The other wake reasons
+### Wake reasons
 
 ```rust
 #[non_exhaustive]
@@ -396,20 +349,26 @@ pub enum WakeReason {
     AppWork,
     DeviceLost,
     ColorSchemeChanged,
+    App(AppEvent),
+    SurfaceStateChanged(SurfaceId),
 }
 ```
 
-`AppWork` tells the runtime to process deferred open, close, quit, and clipboard requests. It does
-not name a surface because the work belongs to the application and can create or remove a surface.
+| Reason | What the runtime does |
+|---|---|
+| `ReactiveWork` | Requests frames on the named surfaces. |
+| `A11yTreeRequested` | Builds the full accessibility tree; nothing is dirty for a dirty check to notice. |
+| `A11yAction` | Offers the action to each window until one owns the node. |
+| `ClipboardRead` | Runs the callback stored under the serial; it may queue another clipboard operation, which is drained in the same turn. |
+| `AppWork` | Carries out deferred window opens and closes, quits, and clipboard requests. Not surface-scoped, because it creates and destroys surfaces. |
+| `DeviceLost` | Requests frames so each renderer can rebuild. |
+| `ColorSchemeChanged` | Reads `cx.color_scheme()` and pushes it into every window before requesting frames; a frame alone would rebuild an identical media device. |
+| `App(AppEvent)` | Desktop requests for the whole application: `Reopen`, an application-menu `Menu` action, or a menu `Role` replayed as its shortcut into the focused window. |
+| `SurfaceStateChanged` | Re-reads a window's state once the desktop finishes a change such as leaving full screen. |
 
-`ColorSchemeChanged` is the one that is more than a redraw. `Runtime::wake` reads
-`cx.color_scheme()` and pushes it into every window before requesting a frame: a frame alone changes
-nothing, because the device the cascade is matched against is rebuilt from the window's own state.
-`ClipboardRead` resolves the callback stored under its `ClipboardSerial`. That callback runs on the
-UI thread and can queue another clipboard operation; the runtime drains it before the handler turn
-ends.
+### Frame requests
 
-### Requesting a frame is idempotent
+Requesting a frame is idempotent:
 
 ```rust
 pub fn request_frame(&self) {
@@ -420,26 +379,25 @@ pub fn request_frame(&self) {
 }
 ```
 
-Asking twice for the same frame is not wrong, but it is indistinguishable from two things each
-having a reason to ask. The flag is cleared by `frame_started()` at the top of a frame, and by
-`declined_a_frame()` when one is refused — refusing a frame and forgetting that one was asked for
-have to be the same act, or the request left standing is one nothing can renew and the window stops
-redrawing.
+The flag is cleared by `frame_started()` and by `declined_a_frame()`. A refused frame must also clear
+the request; otherwise the flag stays set, no later request reaches the platform, and the window
+stops redrawing.
 
 <Callout type="info">
-A frame that ends occluded is excluded from the end-of-frame request:
-`if needs_another_frame && outcome != FrameOutcome::Skipped(SkipReason::Occluded)`. Honouring it
-there is a hidden window running the whole pipeline at full rate for ever.
+An occluded frame never requests another at its end
+(`if needs_another_frame && outcome != Skipped(Occluded)`). Honouring it would run a hidden window's
+whole pipeline at full rate.
 </Callout>
 
-## Timers, deadlines and the clock
+After a timed-out acquisition the window is **starved**: animation, frame-callback and caret
+deadlines stop, and a probe is scheduled after 1 second, doubling to 16 seconds. Input, focus gain,
+resize, a scale change or becoming visible clears it. A presented frame resets the backoff.
 
-There is no timer thread. A single-threaded loop that already computes when to wake up gets
-scheduled callbacks for nothing.
+## Timers and the clock
+
+There is no timer thread. Timers are one more deadline source for the park.
 
 ```rust
-pub struct Timers { /* BinaryHeap<Reverse<Entry>>, next: u64, cancelled: FxHashSet<TimerId> */ }
-
 impl Timers {
     pub fn schedule(&mut self, document: DocumentId, now: Instant, after: Duration,
                     repeat: Repeat, callback: Rc<dyn Fn()>) -> TimerId;
@@ -451,53 +409,38 @@ impl Timers {
 }
 ```
 
-- **One heap is shared by every window**, and each entry carries its `DocumentId`. A window's frame
-  takes only that document's due callbacks. Due callbacks for another window remain scheduled for
-  its own frame and reactive scope.
-- **Ordering is deadline, then `TimerId`.** Two entries due at the same instant fire in registration
-  order.
-- **Cancellation is lazy.** A binary heap has no cheap removal, and a tooltip scheduled and cancelled
-  on every pointer move would otherwise cost a rebuild each time. `peek` drops cancelled entries from
-  the front.
-- **A repeating entry re-arms from `now`, not from the deadline it missed.** A loop blocked for a
-  second fires a 16 ms interval once, not sixty times.
-- **A pending entry marks no invalidation on any node.** It is a deadline the loop owes, not work the
-  document owes, so a callback that writes nothing costs a frame that skips every stage from the
-  restyle onwards.
+- **One heap serves every window**; entries carry their `DocumentId`, and a window's frame takes only
+  its own.
+- **Ordered by deadline, then `TimerId`**, so simultaneous entries fire in registration order.
+- **Cancellation is lazy.** `peek` drops cancelled entries from the front, so a tooltip timer
+  scheduled and cancelled on every pointer move costs no heap rebuild.
+- **A repeating entry re-arms from `now`**, not from the missed deadline: a loop blocked for a second
+  fires a 16 ms interval once, not sixty times.
+- **A pending entry marks no node.** A callback that writes nothing costs a frame that skips every
+  stage from the restyle on.
 
 Callbacks fire at `f.timers`, before the flush, each inside
-`zgui_reactive::enter_non_reactive_zone()` — a callback that reads a signal is reading it, not
-subscribing whatever scope happens to be current.
-
-### The Clock seam
+`zgui_reactive::enter_non_reactive_zone()`, so reading a signal does not subscribe the current scope.
 
 ```rust
 pub trait Clock: Send + Sync + 'static {
     fn now(&self) -> Instant;
     fn origin(&self) -> Instant;
-    fn timestamp(&self) -> Timestamp {
-        Timestamp::from_origin(self.now().saturating_duration_since(self.origin()))
-    }
+    fn timestamp(&self) -> Timestamp { /* now - origin */ }
 }
 ```
 
-Nothing in the framework calls the system clock directly, and that is the whole reason the trait
-exists. Timers, animations and the park all ask the platform what time it is, so a test backend can
-hand them a clock it moves by hand: a five-second animation is exercisable in a microsecond, with no
-sleeping and no flakiness. `zgui_platform::VirtualClock` is the one manual implementation, and both
-the headless backend and `zgui-testkit-scene` re-export it rather than writing a second one.
+Nothing in zgui calls the system clock directly. Timers, animations and the park ask the platform, so a
+test backend can move a `zgui_platform::VirtualClock` by hand and run a five-second animation in a
+microsecond. `PlatformCx::clock()` returns `Arc<dyn Clock>` rather than a reading, so a caller that
+keeps it always reads the current time.
 
-`PlatformCx::clock()` returns `Arc<dyn Clock>` rather than a borrow, because a held *reading* is a
-frozen clock and deadlines computed against it never arrive.
+## Animation pacing
 
-## Animation, pacing and the refresh rate
-
-An animating window asks for no frame of its own. Doing so would be a spin at whatever rate the
-machine can manage. What brings the loop back is the deadline the frame leaves behind.
+An animating window does not request frames itself, because that would run frames as fast as the
+machine allows. Instead, each frame leaves a deadline, and the park wakes the loop at that moment.
 
 ```rust
-pub struct AnimationCadence { /* due: Option<Instant> */ }
-
 impl AnimationCadence {
     pub const fn parked() -> Self;
     pub const fn due(&self) -> Option<Instant>;
@@ -506,96 +449,124 @@ impl AnimationCadence {
 }
 ```
 
-The moment is a **phase**, not a delay. The next frame is owed one refresh interval after the moment
-the last one was *due*, not one interval after whatever else last happened to the window. A deadline
-recomputed as "now plus an interval" is pushed a full interval into the future by every unrelated
-wake — a compositor re-stating a size, a pointer sample, a task finishing elsewhere. Two of those per
-interval halve the frame rate, and nothing about the animation looks wrong while it happens: the
-values are interpolated against the clock, so every frame that does run holds the right value, and
-the only symptom is a motion made of half as many steps.
-
-Two degradations are part of the definition:
+The deadline is a **phase**: one refresh interval after the moment the last frame was *due*, not
+after the last time the loop woke. "Now plus an interval" would be pushed back by every unrelated wake;
+two such wakes per interval halve the frame rate with no visible error except a choppier motion.
 
 - **A late frame catches up without bursting.** `advance` steps the phase by whole intervals until it
-  is in the future again. One deadline, on the original phase, however many were missed.
-- **A window that fell far behind starts again.** `const MAX_CATCH_UP: u128 = 8;` — past eight missed
-  intervals the phase describes a rate nothing was running at, and the window is anchored where it
-  is.
+  is in the future.
+- **A window far behind re-anchors.** Past `MAX_CATCH_UP = 8` missed intervals, the phase restarts
+  from now.
 
-`pace_animations(now)` runs at the end of the frame, against the moment the frame was *for* rather
-than the moment it ended, and after the cascade — because the cascade is what starts a keyframe
-animation. A window that is occluded or no longer animating calls `park()` and leaves no deadline
-at all.
+`pace_animations(now)` runs at the end of the frame, against the moment the frame was for, after the
+cascade (which starts keyframe animations). An occluded or settled window calls `park()` and leaves
+no deadline.
 
-The interval itself is read from the surface, not assumed:
+The interval comes from the surface's output, falling back to 60 Hz when the rate is unknown or zero
+(`zgui_platform::monitor::refresh_interval`). A window dragged to another output is paced by that
+output from the next frame.
 
-```rust
-// crates/zgui-platform/src/monitor.rs
-pub fn refresh_interval(millihertz: Option<u32>) -> std::time::Duration {
-    const FALLBACK_MILLIHERTZ: u32 = 60_000;
-    let rate = millihertz.filter(|rate| *rate > 0).unwrap_or(FALLBACK_MILLIHERTZ);
-    std::time::Duration::from_secs_f64(1_000.0 / f64::from(rate))
-}
-```
+### Cadence tests
 
-A rate of zero is treated as no rate at all rather than as an infinitely fast display. A window
-dragged onto another output is paced by that output from the next frame onwards.
+`cargo xtask cadence` runs `anim_cadence` and `scroll_cadence` in `crates/zgui-runtime/tests/`. Each
+mounts a real window on the headless platform, gives its output a stated refresh rate, and drives a
+virtual clock in exact intervals. `anim_cadence` checks that:
 
-### What the cadence gate proves
+1. an animation gets exactly one frame per refresh at 60, 75 and 240 Hz (the 75 Hz interval is not a
+   whole number of milliseconds, so it catches rounding);
+2. an unrelated wake does not move the next tick;
+3. a finished animation leaves no deadline and draws nothing for ten seconds.
 
-`cargo xtask cadence` is one of the project's standing gates. It runs two headless targets in
-`crates/zgui-runtime/tests/`: `anim_cadence` and `scroll_cadence`. Both mount a real window over the
-headless platform, put its surface on an output with a **stated** refresh rate, and drive a virtual
-clock in exact refresh intervals — so the rate is a real input to the runtime's pacing rather than a
-constant the test also chose, and 240 Hz needs no 240 Hz display.
-
-The `anim_cadence` half proves three things (`xtask/src/cadence/subject.rs`):
-
-1. an animation gets exactly one frame per refresh at 60, 75 and 240 hertz;
-2. an unrelated wake does not move the moment the next tick is owed at;
-3. an animation that finishes leaves no deadline and draws nothing for ten seconds.
-
-Seventy-five hertz is named in the gate's own subject list on purpose: a cadence held by rounding a
-refresh interval to something convenient holds at 60 and at 240 and is lost at 75.
-
-What the gate cannot prove is that those frames reached the device. A frame whose picture is
-identical to the last one damages nothing, and the renderer refuses an undamaged frame rather than
-spending a swap-chain image on pixels the surface already holds. `scroll_cadence` closes most of that
-hole by counting *composed positions that differ* rather than frames. The rest needs a real display
-server, and stays a probe run by hand:
+`scroll_cadence` counts composed positions that differ rather than frames, because an undamaged frame
+is never presented. What reaches a real display is checked by hand:
 
 ```bash
 cargo run --release -p zgui-bench --bin anim-cadence   -- dev.zgui.anim   10
 cargo run --release -p zgui-bench --bin scroll-cadence -- dev.zgui.scroll bottom
 ```
 
+## Cold start
+
+The first frame of a window fills every cache for the first time.
+
+1. **The surface is created hidden.** An accessibility adapter must be attached before a surface is
+   first shown.
+2. **The renderer is built** from the factory against the surface's extent and scale. No adapter
+   means `AppError::GpuUnavailable`, never a silent fallback.
+3. **The waker is told it owns the surface**, before the view is built.
+4. **`Window::open` runs.** It creates the document, layout store, scroller and style engine,
+   installs the application sheet at `SheetOrigin::Author`, opens a `Mounted` scope, calls
+   `zgui_view::provide_host`, and builds and mounts the view. The window starts with full damage and a
+   reconfiguration owed.
+5. **The desktop colour scheme is pushed in**, so the first frame is styled in the right scheme.
+6. **The first frame runs.** Every box is built by the full-build path (`BoxTreeBuilds` counts these),
+   every paragraph is shaped, every glyph rasterised.
+7. **The surface is shown** on the first `Presented` outcome, so the window never flashes empty. A
+   hidden macOS layer may refuse a drawable and report the frame as occluded; the runtime then shows
+   the surface (the target already holds the frame) and requests the presenting frame at once.
+
+`docs/performance.md` gives `cold.first_frame` for the 1 851-box gallery a 250 ms budget. It was
+measured at 102–111 ms headless and 216–247 ms on screen with a device. The headless measurement
+leaves out the graphics device, because pipeline compilation time varies more between drivers than
+everything else combined. That first frame emits 1 101 primitives and culls 5 224.
+
+## Worker threads
+
+Style and layout use worker pools sized to the machine's parallelism. A host that shares the machine,
+such as a game engine, can limit them:
+
+```rust
+let app = zgui::app().with_style_threads(1).with_layout_threads(1);
+```
+
+`0` and `1` run that stage on the frame thread with no pool. `ZGUI_STYLE_THREADS` and
+`ZGUI_LAYOUT_THREADS` override the values.
+
+## More than one window
+
+`Runtime` keeps two sets. `live` holds every window the application still wants, including one that
+temporarily has no surface. `windows` holds the frame pipelines for surfaces that exist now. A
+platform suspension clears the second and keeps the first; resume rebuilds each window from its
+retained view factory.
+
+Opening and closing are deferred. A listener runs inside a borrowed frame where no surface can be
+created, so `use_windows().open` mints a `WindowId`, returns a pending `WindowHandle`, queues the
+specification and wakes the loop with `WakeReason::AppWork`. The next handler turn creates the surface.
+Closing a window unmounts its view and closes the surface the same way.
+
+Everything is scoped to the right window:
+
+- each window has its own `DocumentId`, and timers are keyed by it;
+- `RuntimeWaker` owns the open surfaces and drops one when it closes;
+- `idle` merges one deadline per window, and `deadline_reached` keeps those not yet reached;
+- accessibility actions go to the window that owns the node.
+
+The reactive ready queue is thread-wide, so an effect run in one window's frame can change another
+window's document. After each flush, `sweep_other_windows` compares the other documents' revisions
+and requests frames only for those that were written.
+
+See [Windows](/docs/building/windows) for the public API.
+
 ## FrameProbe
 
-A window's interesting state exists only between the frame that produced it and the next frame that
-overwrites it. A tool cannot ask for it later, and cannot ask for it from inside a view either,
-because a view sees the document and not the frame that painted it.
+A window's per-frame state exists only until the next frame overwrites it. A `FrameProbe` reads it
+after each frame:
 
 ```rust
 pub trait FrameProbe {
-    /// A frame has finished on `window`.
     fn frame_ended(&self, window: &Window);
-
-    /// What to call this probe in a diagnostic rendering of the window's options.
     fn describe(&self) -> &str { "a frame probe" }
 }
 ```
 
-- Called **once, last, on every frame**, with the window exactly as the frame left it: the scene it
-  emitted, the damage it answered, the layout it computed, the renderer's report.
-- `&self`, not `&mut self`, because the window is borrowed for the call. A probe that keeps something
-  writes it through a cell or a signal, which is what lets one probe serve several windows.
-- Installed with `App::with_probe(probe: Rc<dyn FrameProbe>)`, stored in `WindowOptions::probe`.
-  One seam, one occupant: the field is an `Option`, not a list.
-- Nothing in the framework implements it. `zgui-devtools` is the canonical consumer.
+- Called **once, last, on every frame**, with the window as the frame left it: the scene, the damage
+  it answered, the layout, the renderer's report.
+- Takes `&self` because the window is borrowed for the call. A probe keeps state in a cell or a
+  signal, which also lets one probe serve several windows.
+- Installed with `App::with_probe(Rc<dyn FrameProbe>)`. One probe per application.
+- `zgui-devtools` is the main consumer.
 
-The seam is deliberately the narrowest possible: one method, no return value, nothing it can change.
-A probe that mutated the window would change the thing it was measuring, and a probe that could
-refuse a frame would be a second frame loop.
+The probe cannot change the window or refuse a frame, so it cannot disturb what it measures.
 
 ```rust
 use std::cell::Cell;
@@ -622,164 +593,34 @@ fn main() -> Result<(), zgui::Error> {
 
 ## HostBinding
 
-The document carries no scripting language, and the hooks a scripting language needs are frame-loop
-concepts rather than document ones. All three are questions about *when*, and only the loop knows
-when.
+An embedded script engine needs hooks at specific points of the frame:
 
 ```rust
 pub trait HostBinding {
-    /// An event is about to be dispatched, before the first listener on its path.
-    /// Answering `false` means the event is not dispatched at all.
     fn before_dispatch(&mut self, target: Option<NodeId>, event: EventKind) -> bool { true }
-
-    /// The frame's reactive work has settled.
     fn checkpoint(&mut self) { }
-
-    /// Layout has settled and nothing has been emitted yet.
     fn before_paint(&mut self, timestamp: zgui_vocab::Timestamp) { }
-
-    /// The window this binding was installed on is going away.
     fn shutting_down(&mut self) { }
 }
 ```
 
-The three in-frame hooks are called in a fixed order, and the fourth is the teardown:
-
-| Hook | Called at | Why there |
+| Hook | Called at | Use |
 |---|---|---|
-| `before_dispatch` | Inside `f.drain`, once per event, before the first listener | An engine intercepting an event for its own dispatcher |
-| `checkpoint` | Immediately after `zgui_reactive::flush()` | Drain queued engine work here. Direct document changes reach this frame's restyle. Signal writes need a later flush. |
-| `before_paint` | Immediately before `paint_and_draw` | Run work that belongs after layout and observation delivery. Document and signal changes are processed in the next frame. The hook receives the frame's timestamp. |
-| `shutting_down` | First line of `Window::close` | — |
+| `before_dispatch` | In `f.drain`, once per event, before the first listener | Intercept an event for the engine's own dispatcher; `false` cancels dispatch. |
+| `checkpoint` | Right after the frame's flush | Drain queued engine work. Direct document changes reach this frame's restyle; signal writes need a later flush. |
+| `before_paint` | After layout and observation delivery, before emission | Animation-frame callbacks. Changes are processed next frame. |
+| `shutting_down` | First line of `Window::close` | Teardown. |
 
-`NoBinding` implements every default, so a window with no script engine costs three calls that
-compile to nothing.
+`NoBinding` implements every default and compiles to nothing.
 
 <Status kind="partial">Installed, and not surfaced through the umbrella crate.</Status>
 
-```rust
-pub fn install_binding(&mut self, binding: Box<dyn HostBinding>);
-```
+`Window::install_binding` is the only entry point. There is no `App::with_binding`, so reaching it
+means building through `zgui_runtime::App::into_handler` and driving the `Runtime` yourself.
 
-`Window::install_binding` is the only entry point. There is no `App::with_binding`, and
-`zgui::app::Handler` exposes no `Runtime`, so reaching it means building through
-`zgui_runtime::App::into_handler` and driving the `Runtime` yourself. Nothing in the repository
-implements the trait except `NoBinding` and one unit-test type.
+## Example: a click
 
-## Cold start
-
-The very first frame of a window is the only one that does several things, and every one of them is
-a cache that has nothing in it yet.
-
-<Steps>
-
-<Step>
-
-**The surface is created hidden.** That is a rule, not a default: an accessibility adapter has to be
-attached before a surface is first shown, and there is no second chance.
-
-</Step>
-
-<Step>
-
-**The renderer is built** from the factory, against a `RenderTarget` made from the surface's extent
-and scale factor. No adapter means `AppError::GpuUnavailable` and no silent fallback to drawing
-nowhere.
-
-</Step>
-
-<Step>
-
-**The waker is told it owns this surface**, before the view is built, because a view that asks for
-anything while it is being built asks through that waker.
-
-</Step>
-
-<Step>
-
-**`Window::open` runs.** The document, the layout store, the scroller and the style engine are
-created; the application style sheet is parsed and installed at `SheetOrigin::Author`; a
-`zgui_reactive::Mounted` scope is opened; `zgui_view::provide_host` is called inside it; the view
-factory runs and the built anchor is mounted. The window starts with `damage = DamageSet::full()`,
-`reconfigure = true`, `first_frame = true`.
-
-</Step>
-
-<Step>
-
-**The desktop's colour scheme is pushed in before the first frame**, so the document is styled dark
-from the first pixel rather than laid out light and cascaded again.
-
-</Step>
-
-<Step>
-
-**The first frame runs.** `f.reconfigure` configures the renderer and sets full damage.
-`Window::restyle` skips writing the cascade's result onto boxes, because the document has no box
-tree at all yet and every box is about to be built from this same cascade. `build_boxes` takes the
-full-rebuild path, since `layout.root()` is `None`. Every measurement misses, every paragraph is
-shaped for the first time, and every glyph is rasterised into the atlas.
-
-</Step>
-
-<Step>
-
-**The surface is shown**, and only now: `set_visible(true)` runs on the first
-`FrameOutcome::Presented`. A hidden macOS layer can refuse a drawable and report that first frame as
-occluded. In that case, the runtime shows the surface after composing its target and requests the
-presentation frame immediately. Showing before either result would produce a flash of empty window.
-
-</Step>
-
-</Steps>
-
-Measured, on the 1 851-box gallery: **103.31 ms** to the first painted frame, against a band of
-140.00 and a budget of 250.00 (`cold.first_frame`, `docs/performance.md`). The rationale shipped with
-the number reads "measured at 102-111 ms headless; on screen with a device it is 216-247 ms" — the
-difference is the graphics device, which is deliberately outside the measurement: what a driver takes
-to compile a pipeline varies by more than everything else measured put together, and a band around it
-would fire on a driver update (`crates/zgui-bench/src/scenario/cold.rs`).
-
-That first frame emits 844 primitives and culls 4 575 (`docs/performance.md`). It is measured once
-and never repeated: the second start in a process is not cold.
-
-For contrast, a settled application costs `idle.frames = 0.00` and `idle.turn = 0.07 us` from the
-same file. The regression test is `a_settled_application_runs_no_frames_at_all`, whose comment reads
-"The park policy, which has been broken four times".
-
-## More than one window
-
-`Runtime` keeps two sets. `live: Vec<LiveWindow>` holds every window the application still wants,
-including one that temporarily has no surface. `windows: Vec<Window>` holds the frame pipelines for
-the surfaces that exist now. A platform suspension clears the second set and keeps the first. Resume
-builds each live window again from its retained `FnMut` view factory.
-
-Opening and closing are deferred commands. A listener or effect runs inside a borrowed frame, where
-no platform context is available to create a surface. `use_windows().open` therefore mints a stable
-`WindowId`, returns its pending `WindowHandle`, queues the specification, and wakes the loop with
-`WakeReason::AppWork`. The next handler turn creates the surface and document. A programmatic close
-uses the same queue and destroys the named surface.
-
-Every path is scoped to the correct window:
-
-- Each window receives a distinct `DocumentId`.
-- `RuntimeWaker` owns the open `SurfaceId` values and removes one when its surface closes.
-- `idle` merges one deadline per window.
-- `deadline_reached` keeps the deadlines that have not arrived.
-- Timers key entries by `DocumentId`.
-- Accessibility actions are offered to windows until one claims the node.
-
-The reactive ready queue is thread-wide. A frame in one window can run an effect that changes the
-document of another. After each flush, `sweep_other_windows` checks the other document revisions and
-requests frames only for those that were written. This closes the wake that the first frame already
-serviced without redrawing every window.
-
-The public lifecycle and state-sharing rules are in
-[Multiple windows](/docs/building/windows).
-
-## A click, traced
-
-A click is three platform events — move, press, release — and three frames. Take one element:
+A click is three platform events (move, press, release) and three frames. Take one element:
 
 ```rust
 use zgui::prelude::*;
@@ -805,126 +646,53 @@ const SHEET: &str = css!(
 );
 ```
 
-Here is the release frame, which is the one that does the work.
+The release frame does the work:
 
-<Steps>
+1. **The platform reports a pointer release.** `Runtime::surface_event` calls `window.queue(event)`,
+   which queues the input and calls `request_frame`.
+2. **The loop delivers `RedrawRequested`.** No reconfiguration is owed, so `window.frame(clock)` runs.
+3. **`f.drain`.** The router hit-tests the release against the previous frame's hit index and builds
+   the capture, target and bubble path. No listener handles the release, so the framework default
+   `FrameworkDefault::Activate(node)` runs. Only the primary button activates. The synthetic `Click`
+   keeps the release's button and modifiers and travels the same path a real one would. (A second
+   activation of the same element soon after dispatches `double_click` after the second `click`.)
+   The `on:click` body calls `set_picked.update(..)`, which marks observers and runs none of them; its
+   wake is folded by `FrameGate::request` because a frame is in flight.
+4. **`f.timers` through `f.animate`** each return on an emptiness test.
+5. **`requests_serviced()`, then `f.flush`.** The render effect reading `picked` runs once and adds
+   the class through the `Dom` seam, marking the element as owing a restyle.
+6. **`f.commands`, `changes_serviced()`.** No commands. The change is declared answered by this frame.
+7. **`f.restyle`** cascades exactly one element. A background colour is repaint damage, not
+   relayout. The new style is written onto the element's existing box.
+8. **`f.brushes`, `f.boxes`.** Nothing to do.
+9. **`f.layout`.** Measuring is skipped because no size changed. Composing always runs, and the
+   fragment diff puts the swatch's rectangle into the damage.
+10. **`f.enter` through `f.caret`.** Emptiness tests. The hit index did not change, so no re-hit.
+11. **`f.paint`.** The damage is grown over anything that reads outside its ink. The emit walk skips
+    every subtree the damage misses, replays recorded chunks where nothing changed, and re-encodes the
+    swatch. The scene is finished, atlas uploads flushed, and `renderer.draw` scissors to the same
+    rectangle; everything outside keeps last frame's pixels.
+12. **`f.a11y`, `f.recycle`.** Nothing to publish. `document.end_frame()`, `gate.end_frame()` and the
+    flush all report nothing owed.
+13. **The park.** Nothing animates, no timer is set, no caret blinks: only the maintenance deadline
+    remains, two seconds out. After it runs once, `IdlePolicy::Block`.
 
-<Step>
-
-**The platform reports a pointer release.** `Runtime::surface_event` falls into the `other` arm and
-calls `window.queue(event)`. Pointer events are input, so the event is pushed onto `self.queued` and
-`queue` answers true, which asks for a frame. `Window::request_frame` finds `awaiting_frame` clear,
-sets it, and calls `surface.request_redraw()`.
-
-</Step>
-
-<Step>
-
-**The loop delivers `RedrawRequested`.** `wants_a_frame(now)` is true, because no reconfiguration is
-owed. `window.frame(clock)` runs, inside the window's own reactive owner.
-
-</Step>
-
-<Step>
-
-**`f.drain`.** The router hit-tests the release position against the *previous* frame's fragments
-and hit index, and builds the capture, target and bubble path. `HostBinding::before_dispatch` is
-consulted. No listener is registered for a pointer release here, so nothing runs, `default_allowed`
-stays true, and the framework's own default for the event — `FrameworkDefault::Activate(node)` — is
-carried out. That calls `Window::synthesize`, which resolves the path again and dispatches a
-synthetic `Click` **down the same capture, target and bubble path a real one would take**. The
-`on:click` body runs `set_picked.update(..)`, which marks the observers of `picked` and runs none of
-them. The wake this write raises is folded by `FrameGate::request`, because a frame is in flight.
-
-</Step>
-
-<Step>
-
-**`f.timers`, `f.scroll`, `f.gestures`, `f.reconfigure`, `f.device`, `f.animate`.** Each returns on
-an emptiness test. Nothing is due, nothing is moving, no configure is owed, nothing is animating.
-
-</Step>
-
-<Step>
-
-**`gate.requests_serviced()`, then `f.flush`.** The render effect that reads `picked` is polled
-once. It writes the class through the `Dom` seam, which opens a change batch, adds the class, marks
-the element as owing a restyle, and tells its ancestors there is work below them.
-
-</Step>
-
-<Step>
-
-**`f.commands`, then `changes_serviced()`.** No command was issued. The change the flush just made
-is declared answered by this frame.
-
-</Step>
-
-<Step>
-
-**`f.restyle`.** The style engine visits exactly the one element that owes a restyle, cascades it,
-and translates what moved into damage bits. A background colour is repaint damage, not relayout. The
-new computed style is written onto the box the element already has, because a box holds a clone of
-the style it was built with and every stage after layout reads the box's copy.
-
-</Step>
-
-<Step>
-
-**`f.brushes`, `f.boxes`.** No text colour moved. No structural obligation is owed, so the splice
-does nothing and the text rewrite finds no run changed.
-
-</Step>
-
-<Step>
-
-**`f.layout`.** The measuring half is gated and does not run: nothing changed a size. The composing
-half always runs, and the fragment diff puts the swatch's rectangle into the damage set. Skipping it
-here would paint nothing at all for every change that does not move a box.
-
-</Step>
-
-<Step>
-
-**`f.enter` through `f.caret`.** Five emptiness tests: no trap owes an entry, nothing scrolled,
-nothing is observing, the pointer is over nothing new, no slot was claimed, nothing editable has
-focus.
-
-</Step>
-
-<Step>
-
-**`f.paint`.** The damage is clipped to the viewport, then grown by `zgui_paint::expand` over
-anything that reads pixels outside what it writes — a shadow, a blur. The emit walk replays the
-per-fragment recording for everything the damage does not reach and re-emits only what it does. The
-scene is finished against the damage, the atlas uploads are flushed to the device, and
-`renderer.draw(&scene, &damage)` scissors to the same rectangles. Outside them the last frame's
-pixels are still correct and are not touched.
-
-</Step>
-
-<Step>
-
-**`f.a11y`, `f.recycle`.** Nothing is listening to the accessibility tree and no node moved, so
-nothing is published. `document.end_frame()` answers false, `gate.end_frame()` answers false, the
-flush owed nothing, and the drain settled nothing between events.
-
-</Step>
-
-<Step>
-
-**The park.** `needs_another_frame` is false, so no request is made. Nothing is animating, no timer
-is scheduled, no configure is owed, no caret is blinking — `merged_deadline` answers `None`, and
-`Runtime::idle` returns `IdlePolicy::Block`. The loop consumes nothing until the next event.
-
-</Step>
-
-</Steps>
-
-Measured cost of the whole interaction on a 1 851-box document: **11.34 µs** at the median
-(`kitchen.click`, `docs/performance.md`). The click places **0** glyphs and rasterises **0**, because
-the damage reaches one swatch and no text is inside one
+The click places and rasterises **0** glyphs, because the damage reaches one swatch and no text
 (`a_click_rasterises_no_glyph_and_stays_far_inside_one_frame`, `crates/zgui/tests/wall_clock.rs`).
+`kitchen.click` in `docs/performance.md` measures one class toggled on one element of a 1 851-box
+document in tens of microseconds.
+
+## Counters
+
+| Counter | Meaning |
+|---|---|
+| `frames_drawn` | Frames whose work reached the renderer. Stays flat on a still document. |
+| `box_tree_builds` | Whole box-tree builds, including the first. Any after the first means a frame paid for the whole window. |
+| `observation_passes`, `observations_truncated` | Delivery passes, and deliveries still changing when the budget ran out. |
+| `pointer_moves_coalesced` | Pointer moves folded into a later move. |
+| `hit_retests` | Frames that re-tested under a stationary pointer. |
+| `damage_px` | Device pixels redrawn. |
+| `vector_route_*`, `vector_backend_built` | How vector shapes were drawn, and whether the general rasteriser was built (see [vector routes](/docs/architecture/paint-and-scene#vector-routes)). |
 
 ## Next
 

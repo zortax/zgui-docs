@@ -1,18 +1,17 @@
 ---
 title: Stores and selectors
-description: Per-field subscriptions for schema-shaped state, and one subscription per row for a large list.
+description: Per-field subscriptions for struct-shaped state, keyed collections, and a selector that updates two rows instead of all of them.
 ---
 
-A signal holding a struct wakes every reader when any field changes. A signal holding a selection
-wakes every row when the selection moves. Two tools fix those two problems. This page assumes
-[Signals](/docs/learn/signals), [Derived state](/docs/learn/derived-state) and
-[Control flow](/docs/learn/control-flow).
+A signal holding a struct wakes every reader when any field changes, and a signal holding a
+selection wakes every row when the selection moves. A **store** gives each field of a struct its own
+subscription. A **selector** gives each row its own subscription to the selection.
 
-## The problem a store solves
+## Create a store
+
+With a plain signal, both of these holes subscribe to the whole struct:
 
 ```rust
-use zgui::prelude::*;
-
 #[derive(Clone, Debug, PartialEq)]
 struct Settings {
     title: String,
@@ -20,30 +19,17 @@ struct Settings {
 }
 
 let settings = RwSignal::new(Settings { title: "zgui".to_owned(), width: 800 });
-```
 
-Two holes read it, one per field:
-
-```rust
 label {{move || settings.get().title.clone()}}
 text  {{move || settings.get().width.to_string()}}
 ```
 
-Writing the width wakes both, because both subscribed to the whole signal. The title hole re-runs,
-produces the same string, and writes nothing to the document — so the frame is still cheap. But the
-closure ran, the `Settings` was cloned, and the cost grows with the number of readers and the size
-of the struct.
-
-Three separate signals fix it and stop being practical at about six fields, because every function
-that takes "the settings" now takes six arguments.
-
-A **store** is the third answer: one value with the shape of your struct, where each field has its
-own subscription.
-
-## A store
+Writing `width` re-runs both. The title hole changes nothing on screen, but it still runs and clones
+the struct, and that cost grows with the number of readers and the size of the struct. A store keeps
+the struct shape and gives each field its own subscription:
 
 ```rust
-use zgui::reactive::store::reactive_stores;
+use zgui::reactive::store::reactive_stores;   // required, see below
 use zgui::reactive::{Patch, Store};
 
 #[derive(Clone, Debug, PartialEq, Store, Patch)]
@@ -51,34 +37,27 @@ struct Settings {
     title: String,
     width: u32,
 }
-```
 
-<Callout type="error">
-`use zgui::reactive::store::reactive_stores;` is **mandatory in every module that derives `Store`**.
-The derive expands to `reactive_stores::…` paths inside your crate, so without the alias the build
-fails with `error[E0433]: cannot find module or crate 'reactive_stores' in this scope`, repeated
-once per generated path.
-</Callout>
-
-```rust
-let store = Store::new(Settings {
-    title: "zgui".to_owned(),
-    width: 800,
-});
+let store = Store::new(Settings { title: "zgui".to_owned(), width: 800 });
 
 let width = store.width();     // a field handle
 width.set(900);
 assert_eq!(width.get(), 900);
 ```
 
-`#[derive(Store)]` on `Foo` generates a trait `FooStoreFields` with one accessor per field. The
-trait is in scope inside the module that declared the struct; **across a module boundary you have to
-`use` it**.
+<Callout type="error">
+Every module that derives `Store` must contain `use zgui::reactive::store::reactive_stores;`. The
+derive generates `reactive_stores::…` paths in your crate. Without the import, the build fails with
+`error[E0433]: cannot find module or crate 'reactive_stores' in this scope`.
+</Callout>
 
-`Store::new` needs `T: Send + Sync + 'static`. `Store::new_local` is the form for a `T` that is not.
-`Store<T>` is `Copy`.
+- `#[derive(Store)]` on `Foo` generates a trait `FooStoreFields` with one accessor per field. In
+  another module, `use` that trait to call the accessors.
+- `#[store(skip)]` omits the accessor for a field.
+- `Store::new` needs `T: Send + Sync + 'static`. Use `Store::new_local` for a `T` that is not `Send`.
+- `Store<T>` is `Copy` and belongs to the current owner, like a signal.
 
-### In a view
+## Read store fields in a view
 
 ```rust
 #[component]
@@ -96,18 +75,17 @@ fn SettingsPanel(store: Store<Settings>) -> impl IntoView {
 }
 ```
 
-Clicking writes `width`. The title hole did not subscribe to it and does not run.
+Clicking writes `width`. The title hole does not run.
 
 <Callout type="warn">
-**Never hand raw `Store<T>` to a reactive hole.** An observer of the store root, or of any ancestor
-field, re-runs on **any** descendant write. Read a specific field, or pass a `Field<T>` handle. The
-component above is fine because the holes read `title` and `width`, not `store`.
+Do not read the whole store in a reactive hole. A reader of the store, or of any parent field,
+re-runs on **every** write below it. Read the specific field you need.
 </Callout>
 
-### Field handles as props
+### Pass a field as a prop
 
-`Field<T>` and `ArcField<T>` are type-erased field handles. They are what a component prop should be
-when the component needs one field and does not care where it came from.
+When a component needs one field and does not care which store it comes from, take a `Field<T>`
+(or `ArcField<T>`):
 
 ```rust
 #[component]
@@ -119,14 +97,16 @@ fn NumberRow(value: Field<u32>) -> impl IntoView {
         }
     }
 }
+
+// Caller:
+NumberRow(value = store.width().into())
 ```
 
-`Field` converts from `Store`, `Subfield`, `AtKeyed` and the other field kinds, so a caller writes
-`value = store.width().into()`.
+`Field` converts from a store and from every field handle (`Subfield`, `AtKeyed`, …).
 
-## Keyed collections
+## Key a collection field
 
-A collection inside a store is keyed with a field attribute:
+Give a collection field a key, then address its items by key:
 
 ```rust
 #[derive(Clone, Debug, PartialEq, Store, Patch)]
@@ -141,160 +121,114 @@ struct Row {
     id: u64,
     value: f32,
 }
-```
 
-```rust
 let row = store.rows().at_key(1);
 row.value().set(2.0);
 ```
 
-Keyed access gives true per-item isolation: writing one row's `value` does not wake another row's
-observers. A structural change — a push, a remove, a `retain` — invalidates every element observer,
-which is correct, because positions moved.
-
-`#[store(skip)]` suppresses the accessor for a field.
+Writing one row's `value` does not wake another row's readers. A structural change (push, remove,
+`retain`) wakes every item reader, because positions moved.
 
 <Callout type="error">
-**Unkeyed indexing is deliberately not published at the crate root**, and you should not reach for
-it. It fails two ways. It does not isolate siblings: writing `plain[0].x` re-runs the observer of
-`plain[1].x`. And it panics on a stale index — an effect reading `at_unkeyed(0)` panics with
-`index out of bounds: the len is 0 but the index is 0` when the collection later becomes empty,
-because the collection write notifies element observers before any of them are torn down.
-
-Key your collections and address them by key.
+Do not index a collection by position. Unkeyed indexing is deliberately not re-exported: writing
+item 0 also wakes the readers of item 1, and a reader of index 0 panics with `index out of bounds`
+once the collection becomes empty. Key your collections.
 </Callout>
 
-## Patching
+## Replace a whole value with `patch`
 
-`Patch` is a derive and a trait. `store.patch(new_value)` diffs the new value against the old one
-and notifies **only the fields that differ**.
+`store.patch(new_value)` compares the new value with the current one and notifies **only the fields
+that differ**:
 
 ```rust
 store.patch(Settings {
     title: "zgui".to_owned(),   // unchanged: wakes nothing
-    width: 1200,                // changed: wakes the width observers only
-    rows: rows,
+    width: 1200,                // changed: wakes width readers only
+    rows,
 });
 ```
 
-This is the right tool when a whole value arrives at once — from a file, from a network response,
-from an undo step — and you do not want to write every field by hand.
+Use it when a whole value arrives at once, such as a loaded file, a network response or an undo
+step.
 
-## Two limits worth knowing
-
-**Ancestors are always notified.** An observer of a parent field re-runs on any descendant write.
-That is what makes "never expose the root" a rule rather than a preference.
-
-**The trigger map is monotonic.** Entries are never removed. This is right for schema-shaped state
-of bounded size — settings, a theme, a document root. Do not key a store by something with unbounded
-cardinality.
-
-### An ergonomic gap
-
-<Status kind="partial">Option fields in a store</Status>
-
-A store with an `Option<T>` field needs `OptionStoreExt` to call `.unwrap()` or `.map()` on it, and
-that trait is only reachable through the engine alias:
-
-```rust
-use zgui::reactive::store::reactive_stores::OptionStoreExt;
-```
-
-The same applies to `Len`, `DerefField` and `ArcStore`. They work; they are not re-exported at
-the crate root.
-
-## When a store is worth it
+## When to use a store
 
 | Situation | Use |
 |---|---|
-| Two or three independent values. | separate signals |
-| One struct, one reader. | one `RwSignal` |
-| A struct with many fields and many independent readers. | a store |
-| A whole value that arrives at once and should not wake everything. | a store, with `patch` |
-| A collection whose items change independently. | a store with a keyed field |
-| State whose shape is not known ahead of time. | signals; a store needs a schema |
+| Two or three independent values | separate signals |
+| One struct with one reader | one `RwSignal` |
+| A struct with many fields and many independent readers | a store |
+| A whole value that arrives at once | a store, with `patch` |
+| A collection whose items change independently | a store with a keyed field |
+| State whose shape is not known ahead of time | signals |
 
-## The problem a selector solves
+## Store limitations
 
-A list of a thousand rows, one of which is selected. The obvious spelling:
+- **Parents are always notified.** A reader of a parent field re-runs on any write below it.
+- **Field bookkeeping only grows.** Entries are never removed, so a store suits bounded,
+  schema-shaped state (settings, a theme, a document). Do not key a store by something unbounded.
+- **Some helpers are not re-exported.** `OptionStoreExt` (for `.unwrap()` and `.map()` on an
+  `Option` field), `Len`, `DerefField` and `ArcStore` work, but you import them from the engine
+  path:
+
+  ```rust
+  use zgui::reactive::store::reactive_stores::OptionStoreExt;
+  ```
+
+## Track a selection with a selector
+
+When every row in a list reads the same selection signal, moving the selection re-runs every row:
 
 ```rust
 let selected = RwSignal::new(0_usize);
 
-// inside each row
-class:selected = move || selected.get() == row.id
+// inside each of a thousand rows
+class:selected = move || selected.get() == item.id
 ```
 
-Every row read `selected`, so every row subscribed to it. Moving the selection wakes **all thousand
-rows**. Two of them actually change.
-
-## A selector
+Only two rows change, but all thousand re-run. A `Selector<K>` keeps one small signal per watched
+key, and `is_selected(&key)` subscribes the caller to that key only:
 
 ```rust
 use zgui::reactive::Selector;
 
 let selected = RwSignal::new(0_usize);
 let selector = Selector::new(move || selected.get());
-```
 
-`Selector<K>` keeps one small signal **per watched key**. Asking `is_selected` subscribes the caller
-to that key alone.
-
-```rust
 view! {
-    for row in move || rows.get(), key = |row: &Row| row.id {
+    for item in move || items.get(), key = |item: &Item| item.id {
         row(
             class = "row",
-            class:selected = move || selector.is_selected(&row.id),
-            on:click = move |_| selected.set(row.id)
+            class:selected = move || selector.is_selected(&item.id),
+            on:click = move |_| selected.set(item.id)
         ) {
-            text {{row.label.clone()}}
+            text {{item.label.clone()}}
         }
     }
 }
 ```
 
-Moving the selection now notifies exactly two keys: the one that was selected and the one that now
-is. **Two rows re-run instead of a thousand.** The repository asserts this directly: with eight
-rows, eight first runs are followed by exactly two more when the selection moves
-(`only_the_two_affected_rows_re_run`, `crates/zgui-reactive/src/reexport/selector.rs`).
-
-### The API
-
-```rust
-impl<K: Eq + Hash + Clone + Send + Sync + 'static> Selector<K> {
-    pub fn new(source: impl Fn() -> K + Clone + Send + Sync + 'static) -> Self;
-    pub fn new_with_fn(
-        source: impl Fn() -> K + Clone + Send + Sync + 'static,
-        matches: impl Fn(&K, &K) -> bool + Clone + Send + Sync + 'static,
-    ) -> Self;
-    pub fn is_selected(&self, key: &K) -> bool;
-    pub fn watched_keys(&self) -> usize;
-}
-```
+Moving the selection now notifies two keys, the old one and the new one, so **two rows re-run
+instead of a thousand**.
 
 | Method | What it does |
 |---|---|
-| `new(source)` | a selector over a source of keys; two keys match when they are equal |
-| `new_with_fn(source, matches)` | the same, with a comparison of your own instead of equality |
-| `is_selected(key)` | whether this key is the selected one; subscribes the caller to this key alone and registers a cleanup in the current scope |
-| `watched_keys()` | how many keys are watched now; a diagnostic to assert returns to zero after a list has churned |
+| `Selector::new(source)` | A selector over a key source. Keys match when they are equal. |
+| `Selector::new_with_fn(source, matches)` | The same, with your own `Fn(&K, &K) -> bool`, e.g. "is a prefix of". |
+| `is_selected(&key)` | Whether `key` is selected. Subscribes the caller to that key only. |
+| `watched_keys()` | How many keys are watched now. Useful in tests to check a churned list returns to zero. |
 
-`Selector<K>` is `Clone`.
+`K` must be `Eq + Hash + Clone + Send + Sync + 'static`. `Selector<K>` is `Clone`.
 
-### Eviction
+### When watched keys are removed
 
-`is_selected` registers an `on_cleanup_local` in the **current** scope, so unmounting a row removes
-its entry. Reading the same key twice in one scope registers once, and a key watched by two rows
-survives the first one's unmount.
+`is_selected` registers a cleanup on the **current** owner, so unmounting a row removes its entry.
+Reading the same key twice in one scope registers once, and a key watched by two rows stays until
+both are gone. Ten thousand mount and unmount cycles leave `watched_keys()` at zero.
 
-This is why the wrapper exists at all: the underlying engine's selector never evicts, and a list
-that churns would grow one entry per key for ever. The repository asserts that ten thousand mount
-and unmount cycles leave `watched_keys()` at zero.
-
-<Callout type="error">
-Calling `is_selected` with no current owner asserts in debug builds. In release the entry is kept
-and never evicted. Call it inside a row's own scope, which is where you would write it anyway.
+<Callout type="warn">
+Call `is_selected` inside the row's own scope, which is where a binding runs anyway. With no current
+owner it panics in debug builds; in release the entry is never evicted.
 </Callout>
 
 ## Next

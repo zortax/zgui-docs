@@ -1,20 +1,14 @@
 ---
 title: UI tasks and timers
-description: Run futures on the UI thread, cancel them with their scope, schedule callbacks, and show pending views.
+description: Run futures on the UI thread, cancel them, show a placeholder while they load, and schedule timers and frame callbacks.
 ---
 
-zgui runs reactive work on the UI thread. Use a UI task when a future must read signals, write
-signals, or use view state. Use a timer when work must start after a time interval. This page
-assumes [Signals](/docs/learn/signals), [Control flow](/docs/learn/control-flow), and [Effects and
-lifecycle](/docs/learn/effects-and-lifecycle).
+A **UI task** is a future that runs on the UI thread, so it can read and write signals directly.
+Use UI tasks to *wait*: for a response, a channel, or a timer. A **timer** runs a callback after a
+delay or on the next frame. Work that keeps the CPU busy or blocks a thread belongs on a worker
+instead; see [Background work](/docs/learn/background-work).
 
-For work that uses significant CPU time or blocks a thread, see [Background
-work](/docs/learn/background-work).
-
-## Spawn a UI task
-
-`spawn` and `spawn_local` are in the prelude. Both functions queue a future on the UI thread.
-The next reactive flush polls the future.
+## Spawn a task
 
 ```rust
 use zgui::prelude::*;
@@ -36,22 +30,26 @@ pub fn spawn(future: impl Future<Output = ()> + Send + 'static) -> Task;
 pub fn spawn_local(future: impl Future<Output = ()> + 'static) -> Task;
 ```
 
-Use `spawn` when the future is `Send`. Use `spawn_local` when the future holds a node handle,
-callback, or other local value. The `Send` bound does not move a `spawn` task to a worker. Both
-functions run the future on the UI thread.
+Both queue the future on the UI thread. It first runs at the next reactive flush, not during the
+call. The only difference is the bound: use `spawn_local` when the future holds a node handle, a
+callback or another `!Send` value. The `Send` bound on `spawn` does not move the task to a worker.
 
 <Callout type="warn">
-A UI task can wait without blocking the frame. It must not do long CPU work or call a blocking
-function. One slow poll delays the complete frame.
+Waiting in a UI task costs nothing. Working does: one slow poll delays the whole frame. Move long
+CPU work and blocking calls to [`background` or `blocking`](/docs/learn/background-work).
 </Callout>
 
-## Task lifetime and cancellation
+## Cancel a task
 
-A task belongs to the current scope. When the scope is disposed, zgui cancels the task and drops
-its captured values immediately. A task started in a component body or one of its listeners
-therefore stops when the component is unmounted.
+A task belongs to the scope it was spawned in: the component body, or the component a listener
+was written in. Disposing the scope cancels the task and immediately drops what it captured, so a
+component's tasks stop when it unmounts. Closing a window unmounts its view, which cancels every
+task in it.
 
-`spawn` returns a `Task` for early cancellation:
+When a component body rebuilds, the tasks from the previous run are cancelled before the new run
+starts.
+
+To cancel a task earlier, keep the `Task` that `spawn` returns:
 
 ```rust
 let current = RwSignal::new_local(None::<Task>);
@@ -74,45 +72,83 @@ let cancel = move || {
 ```rust
 impl Task {
     pub fn cancel(&self);
-    pub fn is_finished(&self) -> bool;
+    pub fn is_finished(&self) -> bool; // finished or cancelled
 }
 ```
 
-Dropping `Task` does not cancel the task. This permits the common form
-`spawn(async { /* ... */ });`. Keep the handle only when the interface needs a Cancel action or
-must inspect the task state.
+**Dropping a `Task` does not cancel it**, so `spawn(async { … });` works as written. Keep the
+handle only for a Cancel action or to check whether the task is done.
 
-Use `zgui::reactive::spawn_detached` only when work must continue after its scope is disposed. A
-detached task must not depend on state that belongs to that scope.
+`zgui::reactive::spawn_detached` starts a task that outlives its scope, for work such as a final
+save. It must not depend on state owned by that scope.
 
-<Callout type="info">
-Cancellation stops the UI task. It cannot stop work that `background` or `blocking` already sent
-to a worker. zgui discards the worker result when it arrives.
-</Callout>
+When the application ends, zgui polls the remaining tasks once more and then drops them. A
+detached task that is still waiting at that point does not finish.
 
-## Task scheduling
+## Show a placeholder while loading
 
-The reactive flush polls ready tasks. A wake requests the frame that runs the next poll. The task
-does not run at its spawn site.
+`Await` runs one future and builds a view from its output. `Suspense` and `Transition` show a
+fallback while an `Await` below them is pending.
 
-| Rule | Result |
+```rust
+view! {
+    {Suspense::new(
+        || AnyView::new(view! { label {"Loading…"} }),
+        || AnyView::new(Await::new(load_profile(), |profile: Profile| {
+            AnyView::new(view! { label {{profile.name}} })
+        })),
+    )}
+}
+```
+
+| Type | Behavior |
 |---|---|
-| Spawn from the UI thread. | A debug build panics if `spawn` or `spawn_local` runs on another thread. |
-| Each task has a poll budget per flush. | A task that does not stall continues in the next frame. zgui logs its spawn site. |
-| A task panic reaches the frame loop. | zgui does not convert a panic to a task error. |
-| A wake from another thread requests a frame. | The event loop stays parked while no task is ready. |
+| `Await` | Renders nothing until the future resolves, then `children(value)`. The output must be `Clone`. |
+| `Suspense` | Shows the fallback whenever anything below it is pending. |
+| `Transition` | Shows the fallback only before the first result; later loads keep the previous content. |
+| `SuspenseContext` | The pending-operation counter behind a boundary. |
 
-## Timers
+An `Await`'s task belongs to the scope that built it, so removing the view cancels the pending
+future.
 
-The prelude provides two timer functions:
+To make a boundary wait for work that does not use `Await`, call `SuspenseContext::nearest()` in
+the component. Call `expect_one()` before the work starts and `resolve_one()` on the UI thread
+when it ends.
+
+## Async values and actions
+
+`zgui::reactive` (not the prelude) has three types for async state:
+
+| Type | Use |
+|---|---|
+| `AsyncDerived<T>` | An async value recomputed when the signals it reads change. Reads return `None` until the first result arrives. |
+| `Action<I, O>` | An operation started from an input, such as Save or Send. |
+| `AsyncTransition` | Waits for the async derived values read in one operation, keeping the previous values visible meanwhile. |
+
+Read signals in the closure body, on the UI thread, and pass only plain data to `background`:
+
+```rust
+use zgui::reactive::AsyncDerived;
+
+let detail = AsyncDerived::new(move || {
+    let id = selected.get(); // tracked, on the UI thread
+    background(async move { load_detail(id).await })
+});
+```
+
+A signal read inside the `background` future does not subscribe, so the value would never
+recompute.
+
+## Run code after a delay
 
 ```rust
 pub fn set_timeout(after: Duration, callback: impl FnOnce() + 'static) -> TimeoutHandle;
 pub fn set_interval(every: Duration, callback: impl FnMut() + 'static) -> IntervalHandle;
 ```
 
-Dropping the returned handle cancels the timer. Keep the handle in local storage when the
-component must own it.
+Call these in a component body. The timer is cancelled when its handle is dropped or when the
+scope that created it is disposed, so store the handle for as long as the timer should live.
+`TimeoutHandle` and `IntervalHandle` are at `zgui::view`.
 
 ```rust
 use core::time::Duration;
@@ -130,7 +166,7 @@ fn Notice() -> impl IntoView {
     view! {
         if move || shown.get() {
             control(on:click = move |_| {
-                timeout.set_value(None);
+                timeout.set_value(None); // cancel the pending timeout
                 shown.set(false);
             }) {"Dismiss"}
         }
@@ -138,20 +174,19 @@ fn Notice() -> impl IntoView {
 }
 ```
 
-The window clock controls the timer. Tests can advance this clock without waiting for wall time.
-A due callback runs at the start of a frame, before reactive work. Its signal writes settle in the
-same frame.
+- Timers run on the window's clock, not the wall clock. Tests advance that clock by hand.
+- A due callback runs at the start of a frame, before reactive work, so its writes show in that
+  frame.
+- An interval schedules its next run from the current time. After a long stall it does not fire
+  the missed runs.
+- Timers due at the same moment run in registration order.
+- A timer runs only in the window that scheduled it. Closing that window discards its timers.
 
-An interval schedules its next deadline from the current time. It does not run missed callbacks
-after a long pause. Timers with the same deadline run in registration order.
+### Start a timer from a listener
 
-### Schedule from a listener
-
-The free timer functions use the current window scope. A listener does not run in the component
-body's window scope. Obtain `Timers` in the component body and move it into the listener.
-
-In a multi-window application, a timer runs only in the window that scheduled it. Another window's
-frame leaves the callback in the timer heap for its owning window.
+In a listener, use the window's `Timers`. Take it with `Timers::current()` in the component body
+and move it into the listener. A timer created through `Timers` is not tied to a scope: only its
+handle cancels it, so store the handle in the component.
 
 ```rust
 #[component]
@@ -177,89 +212,57 @@ fn Tooltip() -> impl IntoView {
 }
 ```
 
-A timer created through `Timers` does not bind itself to a component scope. Its handle controls
-its lifetime. Store the handle in the component.
+Replacing the stored handle cancels the previous timeout, so moving the pointer in and out quickly
+never opens the tooltip late.
 
 ## Run work on the next frame
 
-Use `request_frame` for one animation step. It runs once during the next frame and supplies that
-frame's `Timestamp`.
+`request_frame` runs a callback once during the next frame and passes that frame's `Timestamp`.
+Use it to drive an animation; use `set_timeout` for elapsed-time work.
 
 ```rust
 pub fn request_frame(callback: impl FnOnce(Timestamp) + 'static) -> FrameHandle;
 ```
 
-The pending callback makes the window animate at the display cadence. Request the next callback
-from the current callback to run once per frame. zgui removes the current batch before it runs, so
-the new request cannot run in the same frame.
+While a request is pending, the window renders at the display's refresh rate. To run every frame,
+request again from inside the callback; the new request always waits for the next frame.
 
 ```rust
+use zgui::view::FrameHandle;
+use zgui::vocab::Timestamp;
+
 fn step(
     timers: Timers,
     position: RwSignal<f32>,
     last: Timestamp,
-    pending: StoredValue<Option<FrameHandle>>,
+    pending: StoredValue<Option<FrameHandle>, LocalStorage>,
 ) {
+    let next = timers.clone();
     pending.set_value(Some(timers.request_frame(move |now| {
-        position.update(|x| *x += seconds_between(last, now) * 120.0);
-        step(timers, position, now, pending);
+        let dt = now.saturating_since(last).as_secs_f32();
+        position.update(|x| *x += dt * 120.0);
+        step(next, position, now, pending);
     })));
 }
 ```
 
-Measure motion from the supplied timestamps. A slow frame then makes one larger step instead of
-slowing the animation.
+Compute motion from the timestamps. A slow frame then takes one larger step instead of slowing the
+animation down.
 
-The free function uses the current window and belongs to the current component scope. Scope
-disposal or dropping its `FrameHandle` cancels it. In a listener, capture `Timers::current()` in
-the component body and call `timers.request_frame(...)`; that request is controlled only by its
-handle, as for the timer methods above.
+The free `request_frame` is cancelled by dropping its `FrameHandle` or by disposing its scope.
+`Timers::request_frame` (for listeners) is cancelled only by its handle. A zero-length
+`set_timeout` also runs on the next frame, but does not keep the window rendering at display rate.
 
-Use `set_timeout` for elapsed-time work. A zero-duration timeout can request another frame, but it
-does not provide display cadence. Use `request_frame` for visual animation.
+## How tasks are scheduled
 
-## Wait inside a view
-
-`Await` runs one future and builds a view from its output. `Suspense` and `Transition` provide a
-fallback for pending `Await` values below them.
-
-```rust
-view! {
-    {Suspense::new(
-        || AnyView::new(view! { label {"Loading…"} }),
-        || AnyView::new(Await::new(load_profile(), |profile: Profile| {
-            AnyView::new(view! { label {{profile.name}} })
-        })),
-    )}
-}
-```
-
-| Type | Behavior |
+| Rule | Consequence |
 |---|---|
-| `Await` | Renders nothing until its future resolves. Then it builds `children(value)`. |
-| `Suspense` | Shows its fallback whenever a child operation is pending. |
-| `Transition` | Shows its fallback only before the first result. It keeps the previous result during later loads. |
-| `SuspenseContext` | Counts the pending operations inside a boundary. |
-
-An `Await` task belongs to the scope that built it. Removing the boundary cancels the pending
-task. Its captured values are dropped during the unmount.
-
-Use `SuspenseContext::nearest()` when a component starts work without `Await`. Call `expect_one`
-before the work starts and `resolve_one` on the UI thread when it finishes.
-
-## Reactive async types
-
-`Action`, `AsyncDerived`, and `AsyncTransition` are available at `zgui::reactive`. They are not in
-the prelude.
-
-| Type | Use |
-|---|---|
-| `Action<I, O>` | Run an operation that starts from an input, such as Save or Send. |
-| `AsyncDerived<T>` | Recompute an async value when its reactive inputs change. |
-| `AsyncTransition` | Wait for the async derived values read in one operation. |
-
-Read all reactive inputs before you call `background`. Reads on a worker do not subscribe to the
-reactive graph.
+| Spawn on the UI thread. | Debug builds panic if `spawn` or `spawn_local` runs on another thread. |
+| Tasks advance only during the flush. | A wake from any thread (worker, channel, timer) requests a frame. Many wakes before that frame cost one frame. With nothing ready, the event loop stays parked. |
+| Posted closures run before tasks. | At the start of a flush, zgui runs closures sent with [`Ui::post`](/docs/learn/background-work#post-to-the-ui-thread), then polls ready tasks, so writes from both show in the same frame. |
+| Writes settle in the same flush. | Effects woken by a task's signal writes run in the same flush, without an extra frame. |
+| A task re-polled too often in one flush is deferred. | Past 32 polls (debug) or 8 (release) in one flush, zgui logs an error with the spawn site and resumes the task next frame. This almost always means a task writes a signal it depends on. |
+| Panics are not caught. | A panicking task propagates to the frame loop. |
 
 ## Next
 

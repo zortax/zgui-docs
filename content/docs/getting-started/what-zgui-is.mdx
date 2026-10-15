@@ -1,161 +1,142 @@
 ---
 title: What zgui is
-description: What a user interface framework has to do, the two ways to do it, and which one zgui picks.
+description: A native Rust UI framework with fine-grained signals, real CSS, and a retained GPU renderer — what it gives you and what it does not try to be.
 ---
 
-This page explains what a user interface framework is for, before any zgui-specific detail. If you
-have written user interfaces before, skim to [The choice zgui makes](#the-choice-zgui-makes).
+zgui is a framework for native desktop applications written in Rust. You build the interface from
+components, keep state in signals, and style everything with CSS. zgui handles layout, text, input,
+and accessibility, and draws every pixel on the GPU.
 
-## The problem a UI framework solves
+```rust
+#[component]
+fn Toggle() -> impl IntoView {
+    let on = RwSignal::new(false);
 
-An application with a window has to answer four questions, over and over, sixty times a second or
-more:
+    view! {
+        control(
+            class = "toggle",
+            state:checked = move || on.get(),
+            on:click = move |_| on.update(|value| *value = !*value)
+        ) {
+            {move || if on.get() { "On" } else { "Off" }}
+        }
+    }
+}
+```
 
-1. **What is on the screen?** A tree of boxes, text, pictures and shapes.
-2. **Where is each thing?** Positions and sizes, computed from the window size and from the content.
-3. **What does each thing look like?** Colours, borders, fonts, shadows.
-4. **What did the user just do, and to which thing?** A click at pixel (412, 96) has to become "the
-   user pressed the Increment button".
+```css
+.toggle { padding: 8px 16px; border-radius: 8px; background-color: #232936; }
+.toggle:checked { background-color: #3b6cf6; }
+```
 
-Doing this by hand means writing a layout algorithm, a text shaper, a hit tester, a damage tracker
-and a GPU submission path before you write any application logic. A UI framework is the code that
-answers those four questions so that you only describe the interface.
+A click writes one signal. zgui re-runs the two closures that read it, one for the label and one
+for the `:checked` state, and redraws the button. Nothing else in the window runs again.
 
-The hard part is not answering them once. It is answering them again after something changes, fast
-enough that the window feels alive, without redoing work that is still correct.
+## Fine-grained reactivity
 
-## Two ways to answer them again
+A component runs once to build its part of the interface. After that, changes flow through
+signals. A signal records which closures read it, and writing it re-runs only those closures. A
+counter in a window with thousands of elements updates one text node.
 
-There are two families of answer, and the choice between them decides almost everything else about
-a framework.
+The reactive core is Leptos' `reactive_graph`, so signals, memos, stores, and async derived values
+work the way they do in Leptos. [Signals](/docs/learn/signals) covers the model from first
+principles.
 
-**Immediate mode.** Every frame, your code walks the whole interface and describes it from scratch:
-"a column, then a label saying 41, then a button". The framework compares nothing and keeps nothing.
-It is simple to reason about — the description is a pure function of your state — and it costs a
-full traversal per frame whether or not anything changed.
+## Real CSS
 
-**Retained mode.** Your code builds a tree of objects once. The framework keeps that tree. When
-state changes, something updates the affected objects in place, and the framework recomputes only
-what those objects invalidated. The tree, the computed styles, the layout and the pixels all
-survive between frames.
+Appearance is CSS, resolved by Stylo, the style engine Firefox uses. Selectors, the cascade, custom
+properties, flexbox, grid, and animations work as you expect. States such as `:hover`, `:focus`, and `:checked` match because zgui tracks the
+pointer, focus, and element state itself.
 
-Retained mode is more work to implement. It is what makes an interface with ten thousand nodes
-cost the same to idle as an interface with ten.
+## Retained rendering
 
-## The choice zgui makes
+In an immediate-mode library, your code describes the whole interface again on every frame. That is
+simple to reason about, but each frame costs a full pass whether or not anything changed.
 
-zgui is retained, all the way down.
-
-Nothing is rebuilt per frame that did not change: not the document, not the computed styles, not
-the box tree, not the shaped paragraphs, not the display list, and not the pixels. Each stage keeps
-its result and is handed a description of what became invalid.
+zgui is retained at every stage. The document, computed styles, layout, shaped text, paint
+recordings, and pixels all survive between frames, and a change redoes only the work it affects.
+An idle window with ten thousand elements costs about as much as one with ten.
 
 <FlowDiagram
   label="How application state becomes a desktop window"
   items={[
     {
       title: 'Components and signals',
-      description: 'The application state and the views that read it.',
-      next: 'Build and update nodes',
+      description: 'Your state and the views that read it.',
+      next: 'Precise node updates',
     },
     {
       title: 'The document',
-      description: 'A retained tree of elements the framework owns.',
-      next: 'Only nodes that owe a restyle move on',
+      description: 'A retained tree of elements.',
+      next: 'Only changed nodes restyle',
     },
     {
-      title: 'The cascade',
-      description: 'CSS in, computed styles out.',
-      next: 'Boxes that owe a relayout or repaint',
+      title: 'Style',
+      description: 'CSS in, computed styles out (Stylo).',
+      next: 'Boxes that need layout or paint',
     },
     {
       title: 'Layout and text',
-      description: 'Positions, sizes, and shaped glyphs.',
-      next: 'Fragments carry geometry, hit regions, and stacking order',
+      description: 'Positions, sizes, and shaped glyphs (Cephal, Parley).',
+      next: 'Geometry, hit regions, stacking order',
     },
     {
       title: 'Paint',
-      description: 'A display list of drawing primitives.',
-      next: 'Primitives plus the damaged rectangles',
+      description: 'Retained drawing recordings.',
+      next: 'A scene plus damaged rectangles',
     },
     {
       title: 'The renderer',
-      description: 'GPU work into a texture kept between frames.',
+      description: 'wgpu draws into a target kept between frames.',
       next: 'Present',
     },
     {
-      title: 'A window on your desktop',
-      description: 'Only the pixels that changed are replaced.',
+      title: 'The window',
+      description: 'Only changed pixels are redrawn.',
     },
   ]}
 />
 
-The arrows go one way. Layout never edits the document. Paint never asks the cascade a question.
-The renderer knows nothing about elements. Every horizontal edge in that diagram is a plain value —
-data you could print, compare or write to a file — which is why almost all of the framework can be
-tested with no window and no graphics device.
+Data flows one way: layout never edits the document, and the renderer knows nothing about
+elements. Each stage passes plain data to the next, so most of the framework can be tested without
+a window or a GPU.
 
-You do not have to hold this diagram in your head to write an application. It is here because it
-explains the rules you will meet: why a component runs once, why writing a signal does not take
-effect until the end of the frame, and why changing a colour costs less than changing a width.
+You do not need to know these stages to write an application. They explain rules you will meet
+later: a component runs once, a signal write takes effect at the end of the frame, and changing a
+colour is cheaper than changing a width. [Under the hood](/docs/architecture/overview) covers each
+stage in detail.
 
-## What updates the tree
+## What zgui includes
 
-If a component runs once, something else has to update the document when state changes. That
-something is a **signal**.
+| Area | What you get |
+|---|---|
+| State | Signals, memos, stores, and async tasks, built on Leptos' `reactive_graph` |
+| Styling | Selectors, the cascade, custom properties, media queries, flexbox, grid, transitions, animations, transforms, filters |
+| Text | Shaping, wrapping, bidirectional text, editing, IME, selection, system or bundled fonts |
+| Graphics | Images, SVG, canvas drawing (including large data series), custom elements, application shaders written in WGSL, embedded wgpu surfaces |
+| Platform | Linux (native Wayland or X11), macOS, Windows, and a headless backend for tests; multiple windows, clipboard, drag and drop, custom window chrome, macOS application menu |
+| Accessibility | An AccessKit tree for screen readers on every desktop platform |
+| Components | `zgui-ui`, an optional themeable library of controls, menus, dialogs, forms, and data views |
 
-A signal is a value that records which pieces of code read it. When you write a new value into it,
-those pieces of code — and only those — run again. In a zgui view they are small closures that
-write one text node or one attribute.
-
-So the cost of a change is proportional to how much of the interface actually depends on it. A
-counter with one number on screen updates one text node, no matter how large the rest of the window
-is. [Signals](/docs/learn/signals) explains this from scratch.
+An experimental backend runs applications directly on a Linux console through DRM/KMS, with no
+display server. It lives in the zgui repository and is not published.
 
 ## What zgui is not
 
-**It is not a browser.** There is no webview, no HTML parser, no JavaScript engine and no DOM
-specification. zgui borrows browser-engine *libraries* where they are the best available — Stylo for
-CSS, Taffy for layout, Parley for text — and drives them itself.
-
-**It is not a wrapper over native widgets.** There is no `NSButton` and no GTK widget underneath.
-zgui draws everything you see onto a GPU surface, so an interface looks the same on every
-platform it runs on.
-
-**It does not implement the web platform.** The CSS support is chosen for application interfaces.
-Selectors, the cascade, flexbox, grid, gradients, shadows, filters and transforms are there.
-Floats, `contenteditable` and forms as a document language defines them are not the target.
-
-## What you write
-
-```rust
-use zgui::prelude::*;
-
-#[component]
-fn Greeting() -> impl IntoView {
-    view! {
-        column(class = "greeting") {
-            text {"Hello"}
-            text {"from a real window"}
-        }
-    }
-}
-```
-
-`#[component]` marks a function as a component. `view!` describes a piece of the document as nested
-calls with blocks of children. `column` and `text` are two of sixteen element names the framework
-defines. `class = "greeting"` is what a CSS rule selects.
-
-That is the whole shape of it. The rest of this guide fills it in.
+- **Not a browser.** There is no webview, HTML parser, JavaScript engine, or DOM specification.
+  zgui uses browser-engine libraries where they fit: Stylo for CSS, Parley for text, and Cephal, a
+  retained incremental layout engine, for block, flex, and grid layout.
+- **Not a wrapper over native widgets.** There is no `NSButton` or GTK widget underneath. zgui draws
+  everything on the GPU, so an interface looks the same on every platform.
+- **Not the web platform.** CSS support targets application interfaces. Floats,
+  `contenteditable`, and HTML forms are not goals.
 
 ## Next
-
-Install the toolchain and get a window on the screen.
 
 <Cards>
   <Card
     title="Installation"
     href="/docs/getting-started/installation"
-    description="Toolchain, system libraries, and the smallest application that opens a window."
+    description="Add zgui to a project, install system libraries, and open a window."
   />
 </Cards>

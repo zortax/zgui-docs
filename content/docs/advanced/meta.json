@@ -2,6 +2,7 @@
   "title": "Advanced topics",
   "pages": [
     "surfaces",
-    "custom-elements"
+    "custom-elements",
+    "custom-shaders"
   ]
 }

@@ -1,14 +1,13 @@
 ---
 title: The document
-description: The node arena, why addresses hold still, how the tree is linked and interned, and the seams a document language of your own plugs into.
+description: The zgui-dom node arena, stable addresses, the two sibling chains, interned names, lock-free parallel reads, the Dom and ViewHost seams, mutation batches, removed nodes, and the document-language seams.
 ---
 
-The document is the retained tree everything below the view layer reads. It is one arena of node
-records in `zgui-dom`, built through a trait called `Dom`, and safe to read from every style worker
-at once while the cascade runs over it. This page assumes [the guide](/docs/learn/views) and the
-[architecture overview](/docs/architecture/overview).
+The document is the retained node tree that every stage below the view layer reads. It lives in
+`zgui-dom`: one arena of node records, written through batched edits, and safe to read from every
+style worker at once while the cascade runs. Views reach it only through the `Dom` trait.
 
-## What a document is
+## Document structure
 
 <TreeDiagram
   label="The Document and its stable backing store"
@@ -19,140 +18,113 @@ at once while the cascade runs over it. This page assumes [the guide](/docs/lear
       children: [
         {
           title: '*mut DocumentStore',
-          description: 'Points to one heap allocation that never moves.',
+          description: 'One heap allocation that never moves.',
           children: [
             {
               title: 'DocumentStore',
               code: 'crates/zgui-dom/src/arena/store.rs',
               children: [
-                { title: 'ChunkArena<NodeInner>', description: 'Node records whose addresses remain stable.' },
-                { title: 'Vec<NodeKey>', description: 'Maps each slot number to the key for its current occupant.' },
-                { title: 'ClassPool', description: 'Splits and interns every class name once.' },
+                { title: 'ChunkArena<NodeInner>', description: 'Node records with stable addresses.' },
+                { title: 'Vec<NodeKey>', description: 'Slot number to the key of its current occupant.' },
+                { title: 'ClassPool', description: 'Every class name, split and interned once.' },
                 { title: 'IdentTable', description: 'Resolves id values to borrowed atoms.' },
-                { title: 'Vec<Namespace>', description: 'One namespace per one-byte handle.' },
-                { title: 'Columns', description: 'Thirteen side tables keyed by NodeKey.' },
+                { title: 'Vec<Namespace>', description: 'Indexed by a one-byte namespace id.' },
+                { title: 'Columns', description: 'Fourteen side tables keyed by NodeKey.' },
                 { title: 'SharedRwLock', description: 'Shared by every sheet in this document.' },
                 { title: 'HostSeams', description: 'The four document-language hooks.' },
               ],
             },
           ],
         },
-        { title: 'Cell<OptIndex> root', description: "Identifies the document's root element." },
-        { title: 'EditState', description: 'Holds the write token, poison flag, and batch scratch.' },
+        { title: 'Cell<OptIndex> root', description: "The document's root element." },
+        { title: 'EditState', description: 'Write token, poison flag, frame flags, batch scratch.' },
       ],
     },
   ]}
 />
 
-`Document` owns the store through a pointer. Moving a document moves the pointer and not the
-allocation, which matters because every record holds a back-pointer to the store that owns it. That
-back-pointer is what lets a node handle be one machine word: `Node<'doc>` is a `&NodeInner` and
-nothing else, and everything a style worker needs — classes, attributes, the shared lock, the host
-hooks — is reached by following it.
+`Document` owns the store through a raw pointer, so moving a `Document` does not move the store.
+This matters because every node record holds a back-pointer to its store. With that back-pointer, a
+node handle can be a single reference: `Node<'doc>` wraps a `&NodeInner`, and everything a style
+worker needs (classes, attributes, the shared lock, the host hooks) is reached through it.
 
-### The four node kinds
+### Node kinds
 
-```rust
-pub enum NodeKind {
-    Document,
-    Element,
-    Text,
-    Marker,
-}
-```
-
-| Kind | What it is | Matches selectors | On the element chain |
+| `NodeKind` | Meaning | Matched by selectors | In element order |
 |---|---|---|---|
-| `Document` | The document node. Always slot zero. Parent of the root element and of nothing else. | no | no |
-| `Element` | The only kind selectors match against. | yes | yes |
-| `Text` | A run of text. Its content lives in a column, not in the record. | no | no |
-| `Marker` | A position holder with no presence of its own. | no | no |
+| `Document` | The document node. Always slot zero; its only child is the root element. | no | no |
+| `Element` | An element. The only kind selectors match. | yes | yes |
+| `Text` | A run of text. The content lives in the `text` column. | no | no |
+| `Marker` | An invisible position holder. | no | no |
 
-A **marker** is how a view says *where* content will go before the content exists. `Show`, `For`,
-`Dynamic` and `Portal` each mount a marker at the place they were written, and re-insert their
-content beside it as it changes. A marker takes part in sibling order and takes no part in element
-order, so a conditional region that appears and disappears never shifts what `:nth-child` or `+`
-matches on its neighbours. `crates/zgui-dom/src/node/kind.rs` says the same thing as a reason to
-refuse the alternative: a hidden *element* would not work, because `display` does not affect selector
-matching.
+A **marker** records where dynamic content goes before that content exists. `Show`, `For`,
+`Dynamic` and `Portal` each mount a marker where they were written and insert their content next to
+it. Markers take part in sibling order but not in element order, so content that appears and
+disappears never changes what `:nth-child` or `+` match on its neighbours. A hidden element would
+not work here: `display` does not affect selector matching.
 
-### What a node carries
+### The node record
 
-The record is `NodeInner` in `crates/zgui-dom/src/node/inner.rs`, declared field by field through a
-macro that gates every field type. It is written in two halves, and the split is measured rather
-than stylistic: the first sixty-four bytes are exactly what selector matching and the ancestor walk
-touch, so they are one cache line. A unit test asserts that the parent link sits at offset 64.
+The record is `NodeInner` (`crates/zgui-dom/src/node/inner.rs`). Its first 64 bytes are exactly the
+fields that selector matching and ancestor walks read, so they fill one cache line. A unit test
+asserts that `parent` sits at offset 64.
 
 | Group | Fields |
 |---|---|
-| Hot set, the first cache line | back-pointer to the store, `NodeKey`, `NodeKind`, `NamespaceId`, `NodeFlags`, `ClassSpan`, local name, `id` handle, the interaction-state word, the invalidation word |
-| Links and ordinals | parent, first and last child, previous and next sibling, previous and next element sibling, first element child, sibling ordinal, child count, two ordinal epochs |
-| Engine bookkeeping | which element children owe work, the engine's selector flags, its bookkeeping bits, the post-order counter, its per-element style data |
+| Hot set (first cache line) | store back-pointer, `NodeKey`, `NodeKind`, `NamespaceId`, `NodeFlags`, `ClassSpan`, local name, `id`, interaction-state word, invalidation word |
+| Links and ordinals | parent, first/last child, previous/next sibling, previous/next element sibling, first element child, sibling ordinal, child count, two ordinal epochs |
+| Engine bookkeeping | dirty-children record, selector flags, bookkeeping bits, post-order counter, per-element style data |
 
-`const _: () = assert!(size_of::<NodeInner>() == 168);` holds the record at 168 bytes in a release
-build (`crates/zgui-dom/src/node/inner.rs`). A field added without noticing stops the build, because
-a field here is paid for on every node of every document.
+`const _: () = assert!(size_of::<NodeInner>() == 168);` fixes the record size in release builds.
+Every field costs memory on every node, so adding one fails this assertion until the size is
+updated deliberately.
 
-Everything about a node that is not `Copy` lives beside it in a **column** — a side table keyed by
-the node's own name. `crates/zgui-dom/src/arena/columns.rs` declares thirteen.
+### Columns
 
-| Column | Shape | Holds |
+Anything about a node that is not `Copy` lives in a **column**: a side table keyed by `NodeKey`.
+`crates/zgui-dom/src/arena/columns.rs` declares fourteen.
+
+| Column | Storage | Holds |
 |---|---|---|
 | `attrs` | sparse | attributes other than `id` and `class` |
 | `inline_style` | sparse | the parsed `style` attribute |
-| `custom_states` | sparse | the author-defined states `:state(name)` matches |
-| `text` | sparse | text content, for text nodes |
-| `boxes` | sparse | the boxes this node generated |
-| `semantics` | sparse | what this node means to an accessibility tree |
-| `listeners` | sparse | which events this node listens for, under which identities |
-| `props` | sparse | imperative properties, which selectors cannot see |
-| `observed` | sparse | which measurements are watched, and what was last delivered |
-| `anim` | sparse | a cheap animation's private values |
-| `state_mask` | sparse | which interaction-state bits any active selector could match on |
+| `custom_states` | sparse | author-defined states matched by `:state(name)` |
+| `text` | sparse | text content of text nodes |
+| `boxes` | sparse | the boxes the node generated |
+| `semantics` | sparse | the node's accessibility description |
+| `listeners` | sparse | listener registrations (event kind and identity) |
+| `props` | sparse | imperative properties, invisible to selectors |
+| `observed` | sparse | which measurements are observed and the last delivered values |
+| `anim` | sparse | private values of a running cheap animation |
+| `state_mask` | sparse | cached interaction-state bits that any active selector could match |
 | `paint_key` | dense | identity of everything the painted appearance depends on |
 | `a11y_key` | dense | identity of everything the accessible description depends on |
+| `readers` | dense | Bloom sets of the custom properties read by the element and its subtree |
 
-Sparse means `PagedVec`: one page of a thousand entries allocated on first write. Dense means
-`SlotVec`: one entry per slot. The split is arithmetic, not taste. A dense attribute column costs
-twenty-four bytes on every node whether or not the node has an attribute, and
-`crates/zgui-dom/tests/memory.rs` asserts that one dense column of the widest sparse value type
-would cost more than twenty times what ten empty sparse ones do.
+**Sparse** is `PagedVec`: pages of 1024 entries, each allocated on first write. **Dense** is
+`SlotVec`: one entry per slot. The choice depends on how many nodes have a value. A dense attribute column would cost its
+value size on every node, and `crates/zgui-dom/tests/memory.rs` asserts that one dense column of the
+widest sparse value type costs more than twenty times as much as ten empty sparse columns.
 
-Two columns deliberately hold less than their names suggest. `listeners` holds registrations and no
-handler closures; `observed` holds a mask and the last delivered values and no delivery channel.
-Both halves that are missing are reference-counted and therefore cannot live in a structure that
-worker threads share.
+`readers` lets a custom-property change skip subtrees that never read the changed name; see
+[the style engine](/docs/architecture/style-engine). Drawn outlines (`path` data, canvas view
+transforms) have no column of their own. `crates/zgui-dom/src/side/drawing.rs` reads them out of the
+`props` column, so every stage asks the same bytes.
 
-## Why addresses hold still
+`listeners` and `observed` hold only registrations and last values. The handler closures and the
+delivery channels are reference-counted, so they cannot live in a structure that worker threads
+share; the view backend keeps them.
 
-`zgui-arena` is the crate underneath, and it makes three promises.
+## Stable addresses
 
-<Steps>
+The document is stored in `zgui-arena`, which makes three guarantees:
 
-<Step>
-
-**An address, once handed out, holds still.** `ChunkArena<T>` stores values in blocks of 512 that
-are allocated whole and never moved or resized (`BLOCK_LEN`, `crates/zgui-arena/src/chunk/block.rs`).
-A `&T` it hands out stays valid while unrelated values are inserted, removed and read.
-
-</Step>
-
-<Step>
-
-**A handle is checked, not trusted.** `Key<T>` packs a slot number, an occupancy counter and the
-identity of the arena that minted it into eight bytes that are never all zero. A key to a value that
-is gone resolves to nothing rather than to whatever moved in.
-
-</Step>
-
-<Step>
-
-**Removal is deferred by a frame.** `ChunkArena::remove` marks a value dead and leaves it in place.
-`ChunkArena::recycle`, called once when a frame ends, drops it and offers the slot back.
-
-</Step>
-
-</Steps>
+1. **Addresses never move.** `ChunkArena<T>` stores values in blocks of 512 (`BLOCK_LEN`) that are
+   never moved or resized. A `&T` stays valid while other values are inserted and removed.
+2. **Keys are checked.** `Key<T>` packs a slot number, a generation and the arena's identity into a
+   non-zero `u64`. A key to a removed value resolves to nothing, never to the slot's new occupant.
+3. **Removal is deferred to the end of the frame.** `ChunkArena::remove` marks a value dead.
+   `ChunkArena::recycle`, called once per frame, drops it and frees the slot.
 
 <BitFieldDiagram
   label="The 64-bit NodeKey layout"
@@ -165,55 +137,46 @@ is gone resolves to nothing rather than to whatever moved in.
   footer="DomainId · bits 63–48"
 />
 
-That layout is why an application never needs a lookup table to relate the two numbering schemes.
-`NodeId`, the opaque handle a view holds, puts the document in its top twelve bits and leaves the
-remaining fifty-two to the backend. A `NodeKey` puts the document in the top twelve bits too, so
-`crates/zgui-view-dom/src/id.rs` converts between them with the identity function.
+`NodeId`, the opaque handle a view holds, also keeps the document in its top twelve bits and leaves
+the other 52 to the backend. `crates/zgui-view-dom/src/id.rs` therefore converts between `NodeKey`
+and `NodeId` without a lookup table: the bits are identical.
 
-### What that buys the cascade
+### Why the cascade needs stable addresses
 
-The cascade is the step that decides one computed style per element by matching every rule against
-it. The style engine runs it in parallel: it hands one element to each worker, and each worker walks
-*outwards* from that element — to the parent for a descendant combinator, back along the sibling
-chain for `+`, down for `:empty`.
+The style engine matches selectors in parallel, one element per worker. Each worker walks outward
+from its element: up to the parent for descendant combinators, back along siblings for `+`, down for
+`:empty`. Each guarantee covers one part of that:
 
-Three consequences follow, and each of them needs a different one of the arena's promises.
+- A worker holds a `&NodeInner` for its whole match while other threads read the document. A
+  growable `Vec` could reallocate and invalidate every such reference.
+- A node removed during a frame stays readable through its key until the frame ends. The
+  accessibility walk, pending observations and the style engine's record map may still name it.
+- A freed slot is not reused until the frame ends, so a slot number cannot change meaning inside a
+  frame. That is what makes `NodeIndex` (four bytes, no generation) safe in per-frame walks.
 
-- A worker holds a `&NodeInner` for the length of its element's match, while other threads keep
-  reading and the document keeps being read around it. A growable vector cannot promise that: it
-  reallocates, and one reallocation invalidates every reference into it at once.
-- A node removed part-way through a frame is still readable through its key for the rest of that
-  frame. The accessibility walk over its boxes, a pending observation asking for its bounds and the
-  style engine's own record map all still hold names into it.
-- A slot number freed during a frame is not handed out again until the frame ends, so a slot number
-  cannot come to mean a different node part-way through one. That is what makes `NodeIndex` — four
-  bytes, no generation — safe to use inside a frame's own walks.
+`crates/zgui-dom/tests/workers.rs` runs eight threads that each walk one document 64 times, and
+checks that the address of a record held by a worker never changes.
 
-`crates/zgui-dom/tests/workers.rs` runs the last of these for real: eight threads walk one document
-sixty-four times each, and one of the tests asserts that the address of a record a worker is holding
-never changes underneath it.
+## Tree links
 
-## How the tree is linked
+Every node is on two child lists:
 
-A node has children in two senses and they are different lists.
+- the **plain** chain, which contains every child (elements, text and markers);
+- the **element** chain, which contains only element children.
 
-| Field | Chain | What reads it |
+| Field | Chain | Used by |
 |---|---|---|
-| `parent` | — | every ancestor walk, and invalidation marking |
-| `first_child`, `last_child` | plain | the style traversal, box-tree construction, text collection |
-| `prev_sibling`, `next_sibling` | plain | insertion and removal, and the paint order |
-| `prev_element`, `next_element` | element only | `+` and `~` |
-| `first_element_child` | element only | `:first-child`, `:empty`, the root election |
-| `sibling_ordinal` | element only | `:nth-child` and its family |
-| `child_count` | plain | how many children of any kind |
+| `parent` | — | ancestor walks, invalidation marking |
+| `first_child`, `last_child` | plain | style traversal, box-tree construction, text collection |
+| `prev_sibling`, `next_sibling` | plain | insertion, removal, paint order |
+| `prev_element`, `next_element` | element | `+` and `~` |
+| `first_element_child` | element | `:first-child`, `:empty`, root election |
+| `sibling_ordinal` | element | `:nth-child` and related selectors |
+| `child_count` | plain | number of children of any kind |
 
-The **plain** chain holds everything: elements, text nodes and markers. The **element-only** chain
-skips everything that is not an element. Both are maintained at insertion, in
-`crates/zgui-dom/src/node/links/`, and nowhere else — they are only correct together.
-
-Deriving the second from the first at match time would turn a constant-time step into a scan past
-however much text happens to be in the way, once per candidate, on the hottest path in the engine.
-So each step of `+` is one pointer hop.
+Both chains are maintained together at insertion and removal, in `crates/zgui-dom/src/node/links/`.
+Deriving the element chain at match time would mean scanning past text nodes for every candidate on
+the hottest path in the engine. With the stored chain, each step of `+` is one pointer read.
 
 ```rust
 use zgui_dom::{Document, NodeKind};
@@ -226,100 +189,84 @@ document.append(root, NodeKind::Text, ElementName::new("#text"));
 let last = document.append(root, NodeKind::Element, ElementName::new("item"));
 document.set_classes(item, &[ClassName::new("selected")]);
 
-// The element-only chain skips the text node, which is what keeps sibling combinators O(1).
+// The element chain skips the text node.
 let store = document.store();
 assert_eq!(store.core(item).next_element(), Some(last));
 ```
 
-### Positions are numbered lazily
+### Sibling positions
 
-`:nth-child` needs a position among element siblings. Recomputing one per insertion makes building
-an *n*-item list quadratic: appending a thousand rows would renumber a thousand times.
+`:nth-child` needs each element's position among its element siblings. Renumbering on every insert
+would make building an *n*-item list quadratic. Instead, a structural change bumps the parent's
+ordinal epoch, and `DocumentStore::ordinal_of` renumbers the child list once, the first time a
+position is read afterwards. Always read positions through `ordinal_of`; the stored number is stale
+after any insertion or removal.
 
-Instead a structural change bumps the parent's `ordinals_epoch`, and `DocumentStore::ordinal_of`
-pays for one pass over the child list the first time anything asks afterwards. Read a position
-through the store and never off the record: the window in which the stored number is stale opens at
-every insertion and every removal.
-
-The numbering runs on a shared borrow, so two readers can be inside it at once. That is sound
-because it is idempotent — both compute the same numbers from the same chain, every store is atomic,
-and the epoch that publishes the numbering is stored last with release ordering.
+Renumbering runs on a shared borrow, so two readers may do it at once. That is safe because it is
+idempotent: both compute the same numbers, every write is atomic, and the epoch that publishes the
+result is stored last with release ordering.
 
 ## Interned names
 
-<Callout type="info">
-**Interning** means keeping one shared copy of a string and handing out a handle to it. Two handles
-holding the same text are the same handle, so comparing them is a pointer test whatever the length
-of the text.
-</Callout>
-
-`zgui-interned` is the vocabulary every layer above the document speaks.
+**Interning** keeps one shared copy of each string and hands out handles to it. Equal strings get
+the same handle, so comparing two names is a pointer comparison regardless of length.
+`zgui-interned` provides the name types every layer above the document uses.
 
 | Type | Names |
 |---|---|
 | `ElementName` | an element's local name |
 | `AttrName` | an attribute's local name |
-| `ClassName` | one entry of an element's class list |
+| `ClassName` | one class in a class list |
 | `Ident` | an identifier written in a style sheet |
-| `CustomPropertyName` | a custom property, stored without its `--` prefix |
-| `NamespaceId` | which namespace a name belongs to, as a one-byte index |
-| `Atom` | the interned string all of the above are newtypes over |
+| `CustomPropertyName` | a custom property, stored without `--` |
+| `NamespaceId` | a namespace, as a one-byte index |
+| `Atom` | the interned string the types above wrap |
 
-Each is eight bytes and `Copy`. `PartialEq` for `Atom` is `core::ptr::eq`. `Hash` deliberately
-hashes the text rather than the address, so a map keyed by names iterates identically on every run
-of the same program.
+Each is eight bytes and `Copy`. `Atom` equality is `core::ptr::eq`. `Hash` hashes the text rather
+than the address, so name-keyed maps iterate in the same order on every run.
 
-Interning is exact and case-sensitive: `ElementName::new("DIV")` and `ElementName::new("div")` are
-different names. A document language whose names are case-insensitive normalises before it interns,
-so matching stays a pointer comparison. Interned strings are never freed, which is correct for a
-vocabulary that is small and effectively fixed and wrong for attacker-controlled text.
+Interning is exact and case-sensitive: `ElementName::new("DIV")` and `ElementName::new("div")`
+differ. A case-insensitive document language should normalise names before interning. Interned
+strings are never freed, which is fine for a small, fixed vocabulary and wrong for untrusted text.
 
-### Where the document keeps each kind of name
+`zgui-interned` does not depend on any style engine. The document converts its names to the style
+engine's atom types at its own boundary, in one place.
 
-| Name | Stored as | Why |
+### Name storage in the document
+
+| Name | Stored as | Reason |
 |---|---|---|
-| local name | `web_atoms::LocalName`, by value in the record | the engine borrows a reference *into* the record rather than rebuilding an atom per selector test |
-| class list | `ClassSpan`, two `u32` into the document's `ClassPool` | eight bytes, `Copy`, and safe to read through a plain cell |
-| `id` | `Ident`, eight bytes, resolved through `IdentTable` | the record needs `Copy`; the engine asks for a *borrowed* atom |
-| every other attribute | a `SmallVec` in the sparse `attrs` column | values are strings, and most nodes have none |
+| local name | a `web_atoms::LocalName` wrapper, by value in the record | the engine borrows it from the record instead of building an atom per selector test |
+| class list | `ClassSpan`: two `u32` offsets into the document's `ClassPool` | eight bytes, `Copy`, readable through a plain cell |
+| `id` | an `Ident`, resolved through `IdentTable` | the record needs `Copy`; the engine wants a borrowed atom |
+| other attributes | a `SmallVec` in the sparse `attrs` column | values are strings, and most nodes have none |
 
-`class="btn btn-primary large"` is one string in the source and three names in the matcher. It is
-split and interned when it is written, in `crates/zgui-dom/src/arena/class_pool.rs`, and a node's
-record holds nothing but the range its names occupy. Selector matching therefore never splits a
-string, never allocates and never compares characters — it compares handles inside a slice.
+`class="btn btn-primary large"` is split and interned when it is written
+(`crates/zgui-dom/src/arena/class_pool.rs`). The record only holds the range of its names in the
+pool, so selector matching never splits strings, allocates or compares characters.
 
-The pool is append-only, so rewriting a node's classes appends a new run. `DocumentStore` keys
-already-interned runs by their contents, which is what stops a state class being toggled on and off
-for an hour from growing the pool without bound. `crates/zgui-dom/tests/memory.rs` pins it: ten
-thousand nodes sharing two class names hold two entries between them.
+The pool is append-only. So that toggling a class on and off does not grow it forever, the store
+keeps an index of every run it has interned and reuses an identical one. `tests/memory.rs` checks that ten
+thousand nodes sharing two class names leave two entries in the pool.
 
-<Callout type="idea">
-`zgui-interned` depends on no style engine at all. A style engine and a document language each have
-an interned-string type of their own, and those types carry their language's vocabulary with them.
-Naming one in a shared signature would spread that vocabulary across every crate that reads a name.
-The one translation happens at the document's own boundary, in one direction, and it is a lookup
-rather than a conversion.
-</Callout>
+Attribute selectors also see `id` and `class`. `Node::attr_text` answers for them from the record
+(the class list joined by single spaces), so `[class*=card]` and `attr(id)` read the same values
+as `.card` and `#id`.
 
-## Thread-safe reads while the cascade runs
+## Parallel reads during the cascade
 
-Every field of the node record obeys a discipline, and the discipline is enforced by the compiler at
-the declaration site rather than by review.
+Every field of `NodeInner` must have one of these shapes, and the compiler checks it:
 
-| Shape | Example | Why it survives |
+| Shape | Examples | Why it is safe |
 |---|---|---|
-| Plain data | the back-pointer, the key, the kind, the local name | written only under an exclusive borrow of the document, so a traversal only ever reads it |
-| `Cell<T>` where `T: Copy + Sync` | the links, the flags, the class span | `get` is a load and `set` a store; two concurrent loads are not a race, and stores happen only between traversals |
-| An atomic | the state word, the selector flags, the sibling ordinal | the fields the engine itself writes from a worker |
-| `RefCell` | — | **forbidden.** `borrow` is a non-atomic read-modify-write of a counter, so two workers reading the same ancestor race on it even though both accesses are logically reads |
+| Plain data | back-pointer, key, kind, local name | written only under `&mut Document`, so a traversal only reads it |
+| `Cell<T>` with `T: Copy + Sync` | links, flags, class span | `get` is a load and `set` a store; stores happen only between traversals |
+| Atomic | state word, selector flags, sibling ordinal | fields the style engine writes from workers |
+| `RefCell` | — | **forbidden**: `borrow` updates a non-atomic counter, so two workers reading the same ancestor would race |
 
-```rust
-pub unsafe trait CellDisciplined {}
-```
-
-`node_inner!` declares the record and emits one `const _` per field that gates its type on that
-trait, so a borrow counter introduced into the record is a compile error on the line that introduces
-it (`crates/zgui-dom/src/node/discipline.rs`). The store makes the matching promise about itself:
+The `node_inner!` macro declares the record and emits one `const` assertion per field requiring the
+`CellDisciplined` marker trait (`crates/zgui-dom/src/node/discipline.rs`). A `RefCell` added to the
+record is a compile error on that line. The store makes the matching check on itself:
 
 ```rust
 pub const fn assert_sync<T: Sync>() {}
@@ -327,131 +274,96 @@ pub const fn assert_sync<T: Sync>() {}
 const _: () = crate::assert_sync::<DocumentStore>();
 ```
 
-That is what makes an `Rc` parked in a column, or a scratch buffer behind a borrow counter parked on
-the store, a build failure rather than a data race. It is exported so that a consumer adding a side
-table of its own can make the same assertion.
+`assert_sync` is public, so code adding its own side table can make the same assertion.
 
-### What the discipline permits
+What this allows:
 
-- The whole of the style engine's DOM surface — seven traits, all implemented on the one `Node`
-  handle in `crates/zgui-dom/src/stylo/` — is callable from every worker at once.
-- Exactly two of those methods write. `insert_selector_flags` records that a selector cared about
-  this element, on the element **and on its parent**, from whichever thread happens to hold the
-  child. The bookkeeping-bit setters are the other. Both go through `fetch_or` for that reason, and
-  `crates/zgui-dom/tests/workers.rs` runs eight threads writing one distinct flag each and asserts
-  that every write survives on both the element and the parent.
-- `Document` is `Send` and `Sync`. A document can be moved between threads, and shared access to one
-  yields shared access to a `Sync` store.
+- The style engine's whole DOM interface (seven traits, all implemented on `Node` in
+  `crates/zgui-dom/src/stylo/`) can be called from every worker at once.
+- Two of those methods write: `insert_selector_flags`, which records on an element **and its
+  parent** that a selector depended on it, and the bookkeeping-bit setters. Both use `fetch_or`.
+  `tests/workers.rs` has eight threads each write a distinct flag and checks that every write
+  survives on both nodes.
+- `Document` is `Send` and `Sync`.
 
-The rule that makes the cells' between-traversals-only stores true rather than hoped for is that no
-exclusive borrow of the document may be held across a style traversal. The frame is what enforces
-it: a view builds and a listener dispatches through a shared reference, and the restyle and the
-end-of-frame recycle take the document exclusively at points where neither is in flight.
+The rule that keeps cell writes out of traversals: no `&mut Document` may be held across a style
+traversal. The frame enforces it. Views build and listeners dispatch through a shared reference; the
+restyle and the end-of-frame recycle take the document exclusively when neither is running.
 
-## The `Dom` seam
+## The view-layer seams
 
-Everything a view does to a tree of nodes goes through one trait, in
-`crates/zgui-view/src/dom/mod.rs`, and nothing in the view layer touches a tree any other way.
+The view layer (`zgui-view`) never touches a node tree directly. It is written against three traits.
 
-```rust
-pub trait Dom {
-    fn create_element(&self, name: ElementName) -> NodeId;
-    fn create_text(&self, data: &str) -> NodeId;
-    fn create_marker(&self) -> NodeId;
+### `Dom`
 
-    fn insert(&self, parent: NodeId, child: NodeId, before: Option<NodeId>);
-    fn detach(&self, node: NodeId);
-    fn parent(&self, node: NodeId) -> Option<NodeId>;
-
-    fn set_classes(&self, el: NodeId, classes: &[ClassName]);
-    fn toggle_class(&self, el: NodeId, class: ClassName, on: bool);
-    fn set_attribute(&self, el: NodeId, name: AttrName, value: Option<&str>);
-    // … twenty-three methods in total
-}
-```
-
-The operations are small and imperative — create a node, put it somewhere, change one thing about
-it — because that is the set a retained view layer issues: roughly ten calls per *changed* node per
-frame.
+`Dom` (`crates/zgui-view/src/dom/mod.rs`) is the node-tree interface. It has 24 small, imperative
+methods: create a node, put it somewhere, change one thing about it.
 
 | Group | Methods |
 |---|---|
 | Create | `create_element`, `create_text`, `create_marker` |
-| Structure | `insert`, `detach`, `parent`, `set_text` |
-| Selector-visible state | `set_attribute`, `set_classes`, `toggle_class`, `set_style_text`, `set_style_property`, `set_custom_property`, `set_ui_state`, `set_custom_state` |
+| Structure | `insert`, `detach`, `parent`, `is_live`, `set_text` |
+| Visible to selectors | `set_attribute`, `set_classes`, `toggle_class`, `set_style_text`, `set_style_property`, `set_custom_property`, `set_ui_state`, `set_custom_state` |
 | Invisible to selectors | `set_property`, `set_semantics` |
 | Listeners | `add_listener`, `remove_listener` |
-| Anchors a view cannot create | `root`, `overlay_root` |
+| Window anchors | `root`, `overlay_root` |
 | Reading back | `text_content`, `observe` |
 
-### What a second implementation has to provide
+An implementation must:
 
-<Accordions>
-<Accordion title="The promises the trait states">
+- return `NodeId`s that carry its own `DocumentId` (a handle from another document is a programming
+  error);
+- **move** an already-attached node on `insert`, never duplicate it;
+- leave a node usable after `detach`, because views detach and reattach subtrees;
+- treat `None` in a setter as "remove";
+- answer `is_live` with whether a node still exists (a detached node exists until the document drops
+  it).
 
-- Every `NodeId` it returns carries its own `DocumentId`. A handle from another document is a
-  programming error it may assert on in debug builds.
-- `insert` **moves** a node that is already in the tree rather than duplicating it.
-- `detach` removes a node from its parent and leaves it usable, because a view detaches and
-  reattaches subtrees as its content changes.
-- A setter with `None` removes the thing rather than setting it to an empty value.
-- `set_ui_state` accepts only the control states that mirror an accessibility property. Hover, focus
-  and activation are computed by the input system, and a view that could assert them would be lying
-  to it.
-- `set_style_property` takes the property as a `&str` rather than an interned name, because the
-  backend has to resolve it against its own engine's property table. An unknown name is dropped with
-  a diagnostic rather than rejected at the seam.
-- `observe` delivers after layout has settled and before anything is painted, so a view that
-  repositions itself from what it observes is painted in its final place in the same frame. Dropping
-  the returned `ObservationHandle` deregisters.
-- `overlay_root` on a backend with no native popup surface answers with the window's own overlay
-  root for that band, which is what keeps a portal expressible everywhere.
+Other contract details:
 
-</Accordion>
-</Accordions>
+- `set_ui_state` accepts only control states that mirror an accessibility property. Hover, focus and
+  active state come from the input system.
+- `set_style_property` takes the property name as `&str` because the backend resolves it against its
+  own property table. Unknown names are dropped with a diagnostic.
+- `observe` delivers after layout and before paint, so a view that repositions itself from an
+  observation is painted in its final place in the same frame. `Observed` is `BorderBox` (device
+  pixels, window-relative), `BorderSize` (size only; a node that only moves delivers nothing),
+  `ContentSize` or `ScrollPosition`. Only quantities that changed are delivered. Dropping the
+  `ObservationHandle` deregisters.
+- `root` exists so a view can listen on the whole document, for example to dismiss a menu on a press
+  outside it. `overlay_root` is described [below](#overlay-roots).
 
-Three implementations exist in the tree, which is what makes this a boundary rather than an
-indirection.
-
-| Implementation | Crate | What it is for |
+| Implementation | Crate | Purpose |
 |---|---|---|
-| `DocumentDom` | `zgui-view-dom` | a real `zgui-dom` document |
-| `StubDom` | `zgui-view` | an in-memory tree, so the view layer's own tests have a backend, and so a new backend has a small complete one to read |
-| `RecordingDom` | `zgui-testkit-view` | a `StubDom` that writes down every change made to it, for asserting on a transcript |
+| `DocumentDom` | `zgui-view-dom` | drives a real `zgui-dom` document |
+| `StubDom` | `zgui-view` | in-memory tree for the view layer's own tests, and a small reference backend |
+| `RecordingDom` | `zgui-testkit-view` | a `StubDom` that records every change, for transcript assertions |
 
-A view holds the installed backend as `DomHandle`, a newtype over `Rc<dyn Dom>` that dereferences to
-the backend. A reactive binding captures one, because a binding re-runs long after the build that
-created it has returned.
+Views hold the backend as `DomHandle`, a newtype over `Rc<dyn Dom>`. Reactive bindings capture one,
+because they re-run long after the build that created them returned.
 
-## `ViewHost` and `EventSink`
+### `ViewHost`
 
-`Dom` is the node tree. Two more traits complete the set a view is described against, and neither
-question is one a node tree can answer.
+`ViewHost` (`crates/zgui-view/src/host/mod.rs`) answers questions that need the laid-out window
+rather than the node tree. Its 28 methods cover:
 
-**`ViewHost`** (`crates/zgui-view/src/host/mod.rs`) is everything a view can ask of, or command in,
-the engine that laid the tree out. Twenty-three methods: resolved geometry (`border_box`,
-`window_box`, `scale`), scrolling, focus, selection, animation counts, timers, and installing or
-removing a style sheet at run time.
+| Area | Methods |
+|---|---|
+| Geometry | `border_box`, `window_box`, `scale` |
+| Scrolling | `scroll_position`, `scroll_to`, `freeze_scrolling` |
+| Tree queries | `contains`, `precedes` |
+| Focus | `focus`, `focused`, `focusables`, `focus_move`, `push_focus_trap`, `pop_focus_trap`, `add_window_shortcut`, `remove_window_shortcut` |
+| Text entry | `is_text_entry`, `selection`, `set_selection`, `select_all`, `set_value` |
+| Animation and time | `running_animations`, `schedule`, `cancel_timer`, `request_frame_callback`, `cancel_frame_callback` |
+| Style sheets | `install_stylesheet`, `remove_stylesheet` |
 
-```rust
-pub trait ViewHost {
-    fn border_box(&self, node: NodeId) -> Option<Rect<DevicePx, Device>>;
-    fn window_box(&self, node: NodeId) -> Option<Rect<DevicePx, Device>>;
-    fn scale(&self) -> f32;
-    fn focused(&self) -> Signal<Option<NodeId>, LocalStorage>;
-    fn install_stylesheet(&self, name: &str, css: &str);
-    // …
-}
-```
+Geometry answers are **from the last completed frame**. Reading fresh layout during a build cannot be
+both correct and cheap; a view that must follow geometry uses `Dom::observe`. Keeping `ViewHost`
+separate from `Dom` lets a new backend bring up its node tree first and add layout later.
 
-Every geometry answer is **as of the last completed frame**. Reading layout in the middle of a build
-cannot be made both correct and cheap. A view that has to react to geometry as it changes registers
-an observation through `Dom::observe` instead.
+### `EventSink`
 
-Splitting `ViewHost` from `Dom` keeps both implementable alone: a backend can bring its node tree up
-first and answer geometry with nothing until it has a layout engine.
-
-**`EventSink`** (`crates/zgui-view/src/event/sink.rs`) is where a listener's commands go.
+`EventSink` (`crates/zgui-view/src/event/sink.rs`) receives the commands a listener issues:
 
 ```rust
 pub trait EventSink {
@@ -462,146 +374,29 @@ pub trait EventSink {
 }
 ```
 
-A listener runs while the document is mid-mutation, so a command that took effect immediately would
-re-enter a mutation that has not finished. Everything a listener asks for is appended here and
-carried out once the dispatch it was issued in has completed. The runtime implements it; a test
-implements it to assert on what a component asked for, and `DiscardCommands` drops every command for
-a test that only cares about signal writes.
+Listeners run while the document may be mid-mutation, so commands are queued and carried out after
+the current dispatch completes. The runtime implements this trait. Tests implement it to assert on
+what a component asked for, or use `DiscardCommands` to ignore commands.
 
-## The four document-language seams
+### Node handles
 
-A document core that carried a markup language would carry a URL loader, a security policy and a
-browsing history with it. `zgui-dom` carries none of them, and these four traits in
-`crates/zgui-dom/src/host/` are why it can afford not to. Each names one decision the core cannot
-make for itself, each requires `Send + Sync + 'static` because it is reachable from a node handle,
-and each has a do-nothing implementation installed by default.
+`NodeRef` (`crates/zgui-view/src/node_ref/mod.rs`) is the `Copy` handle a component uses to reach
+an element it built. It reads `None` before the element is built and after its view is gone, never
+panicking. Points that matter for the document:
 
-| Seam | Consumer inside the tree | Default answer | Installed by |
-|---|---|---|---|
-| `PresentationalHints` | the style engine's legacy-attribute hook, on every restyled element | contributes nothing | `Document::install_presentational_hints` |
-| `LinkResolver` | `Document::refresh_link_state`, on every attribute write | nothing is a link | `Document::install_link_resolver` |
-| `ReplacedContent` | `Document::intrinsic_of`, for every node flagged replaced | no intrinsic size | `Document::install_replaced_content` |
-| `SheetLoader` | the style sheet parser's `@import` arm | every request refused | `Document::install_sheet_loader` |
-
-### `SheetLoader`
-
-```rust
-#[non_exhaustive]
-pub enum SheetRequest {
-    Ready(SharedString),
-    Pending,
-    Rejected,
-}
-
-pub trait SheetLoader: Send + Sync + 'static {
-    fn load(&self, base: &str, href: &str) -> SheetRequest;
-}
-```
-
-`base` and `href` are text rather than a parsed URL type, because resolving one against the other is
-the loader's decision. `Ready` continues the parse in the same call, which is what `@import`
-requires: the imported rules take the position of the `@import`, and a rule set cannot be spliced
-into the middle of a sheet afterwards. `load` runs on the parsing thread and never on a style
-worker. `zgui-style` ships two loaders, `EmbeddedSheets` and `FilesystemSheets`.
-
-### `LinkResolver`
-
-```rust
-pub trait LinkResolver: Send + Sync + 'static {
-    fn is_link(&self, element: Node<'_>) -> bool;
-
-    /// Only asked of elements `is_link` accepted. The default is "no".
-    fn is_visited(&self, element: Node<'_>) -> bool {
-        let _ = element;
-        false
-    }
-}
-```
-
-`:link`, `:visited` and `:any-link` are the only selectors in CSS whose answer depends on a concept
-no document core can define. What counts as a link is a property of the document language; whether
-one has been visited is a property of a browsing history.
-
-The resolver is **not** consulted during matching. It is consulted when a node's attributes change,
-and its answer is folded into that node's interaction-state word — the same word every other state
-pseudo-class is answered from. That is a correctness requirement: the style engine invalidates
-`:link` by comparing state words across a mutation, so an answer that lived only inside the matcher
-would change without invalidating anything and the old style would stay on the screen. It is also
-why `install_link_resolver` re-asks about every element already in the document.
-
-### `ReplacedContent`
-
-A **replaced** node is one whose size and appearance are decided by something the document does not
-own: an image, a video frame, an externally rendered surface. A node is replaced because its record
-carries `NodeFlags::IS_REPLACED`, and nothing else.
-
-```rust
-pub struct Intrinsic {
-    pub size: Option<Size<CssPx, Css>>,
-    pub ratio: Option<f32>,
-    pub baseline: Option<f32>,
-}
-
-pub trait ReplacedContent: Send + Sync + 'static {
-    fn intrinsic(&self, id: ReplacedId) -> Intrinsic;
-}
-```
-
-Every field is optional and they are independent. A decoded image has a size and therefore a ratio.
-A stream can report a ratio before it reports a size. A live surface that has produced no frame can
-have neither. Reporting a guess is worse than reporting nothing, because layout resolves `auto`
-sizing against whichever fields are present.
-
-This seam answers the **sizing** question only. A replaced node's pixels are an atlas sprite or an
-external texture, which belong to the scene rather than to the document; the painting half is a
-separate hook declared beside the scene and keyed by the same `ReplacedId`. The split is not only
-tidiness — this half is consulted from layout workers and so must be shareable across threads, while
-a paint source holds device resources that usually cannot be.
-
-### `PresentationalHints`
-
-A **presentational hint** is a style declaration that a document language derives from an attribute
-that is not `style` — `width`, `bgcolor` and `align` in HTML, for instance. Such declarations
-cascade in an origin of their own, below every author rule and above the user-agent origin.
-
-```rust
-pub trait PresentationalHints: Send + Sync + 'static {
-    fn hints_for(
-        &self,
-        element: Node<'_>,
-        visited: VisitedHandlingMode,
-        out: &mut dyn Push<ApplicableDeclarationBlock>,
-    );
-}
-```
-
-`element` is always an element, because the only caller is the engine's per-element hook. `visited`
-says which half of a link's style is being computed. Push order is cascade order within the origin.
-zgui's own implementation, `NoPresentationalHints`, contributes nothing — and that is the correct
-answer rather than a placeholder, because a document with no markup language on top of it has no
-legacy attributes.
-
-### What is reachable from an application
-
-<Callout type="info">
-The standard app installs a `ReplacedContent` multiplexer. The image loader and the wgpu surface
-host write to separate intrinsic tables, and the multiplexer gives layout one source. The other
-three document-language seams keep their default implementations. In particular, `@import` is
-rejected unless a lower-level host installs a sheet loader.
-</Callout>
-
-<Callout type="info">
-The family has more members that cannot live in `zgui-dom`. The paint half of replaced content is a
-scene concept. `zgui-wgpu` supplies it through the runtime's embed host. Custom elements have
-separate layout and paint sources. The hooks a script engine needs — an animation-frame callback, a
-microtask checkpoint, dispatch interception — are frame-loop concepts and are installed on the
-runtime as `HostBinding`.
-</Callout>
+- When an element is dropped it calls `NodeRef::release(node)`. The handle is unbound only if it
+  still points at that node, so the order in which an old build is dropped and a new one bound does
+  not matter.
+- A handle whose node the document has already dropped reads as unbound (checked with
+  `Dom::is_live`), so no imperative call passes the backend a dead node.
+- `contains(other)` and `is_within(ancestor)` test tree containment through `ViewHost::contains`,
+  and `precedes(other)` tests tree order. An unbound handle answers `false`, which is what an
+  outside-press check on a closed overlay needs.
 
 ## Overlay roots
 
-Every window has six nodes before a single view is built, created in
-`crates/zgui-view-dom/src/dom/build.rs` through the same batch API as everything else.
+Each window starts with six nodes, created in `crates/zgui-view-dom/src/dom/build.rs` through a
+normal edit batch:
 
 <TreeDiagram
   label="The overlay nodes created for every window"
@@ -615,7 +410,7 @@ Every window has six nodes before a single view is built, created in
           children: [
             {
               title: 'overlay_root',
-              code: 'position: fixed; inset: 0; z-index: 1000',
+              code: 'position: fixed · z-index: 1000 · pointer-events: none',
               children: [
                 { title: 'content', code: 'data-layer=content · z-index: 10' },
                 { title: 'popover', code: 'data-layer=popover · z-index: 20' },
@@ -630,21 +425,19 @@ Every window has six nodes before a single view is built, created in
   ]}
 />
 
-They exist up front rather than on demand because the framework's own style sheet is written against
-exactly this shape (`crates/zgui-style/src/sheets/ua.rs`). A layer created when its first portal
-appeared would order the bands by whichever opened first, so a toast raised before a dialog would
-paint beneath it.
+The user-agent sheet (`crates/zgui-style/src/sheets/ua.rs`) is written against this exact shape.
+Creating the layers up front fixes their order: a toast always paints above a dialog, whichever
+opened first.
 
-The overlay root establishes one stacking context at `z-index: 1000`. The four band values order
-content inside it; they do not compete with application chrome outside it. An application can use
-a higher author `z-index` when a surface must intentionally cover all overlays.
+The overlay root is one stacking context at `z-index: 1000`, sized to the window. The band values
+only order content inside it. An application can still cover all overlays with a higher author
+`z-index`. Layers carry `pointer-events: none` and their direct children `pointer-events: auto`, so
+an empty band does not swallow input.
 
-`OverlayLayer` is an ordered enum and its declared order is the paint order, asserted in
-`crates/zgui-view/src/dom/overlay.rs`. `OverlayLayer::Popover` is the default.
+`OverlayLayer` is an ordered enum (`Content`, `Popover`, `Modal`, `Toast`) whose declaration order
+is the paint order. `Popover` is the default.
 
-Portalled content is stored **under a layer node, not under where it was written**. `PortalState`
-holds four things: the marker it left at the written position, the band, the content's own state,
-and the overlay root the content is under once mounted.
+A portal leaves a marker where it was written and mounts its content under the layer node:
 
 ```rust
 impl Anchor for PortalState {
@@ -657,30 +450,18 @@ impl Anchor for PortalState {
 }
 ```
 
-`first_node` answers with the marker and never with the content, so as far as the portal's siblings
-are concerned the content is not there. The layer nodes carry `pointer-events: none` and their
-children carry `pointer-events: auto`, which is what stops an empty overlay band from swallowing
-input across the whole window.
+The portal's `first_node` is the marker, so its siblings never see the content.
 
-`Dom::root` exists for the same reason `overlay_root` does. A view can attach a listener only to a
-node it created, so without it there is no way to hear about a press somewhere else in the
-document — which is exactly what dismissing an open menu by clicking past it requires.
+## Mutation batches
 
-## Mutation batching
+`Document` has two write paths.
 
-`Document` has two ways to write a node, and they are not alternatives.
-
-The **construction** path — `append`, `detached`, `set_classes`, `set_id`, `set_attribute`,
-`set_state` — writes the node directly. It records nothing and marks nothing, because a document
-that is being built has no computed styles to invalidate and nothing downstream that has seen it.
-`DocumentDom` never uses it: even the six nodes a window has before any view exists go through the
-other path.
-
-The **editing** path is for a document something has already looked at. A change there is only half
-of what has to happen; the other half is bookkeeping the style engine cannot do for an embedder, and
-every part of it silently does nothing when it is left out. So it is not a set of setters. It is one
-batch API, and both paths maintain the two child chains through the same code, so the chains cannot
-disagree.
+- **Construction** (`append`, `detached`, `set_classes`, `set_id`, `set_attribute`, `set_state`)
+  writes directly and records nothing. It is for documents nothing has styled yet, such as tests and
+  conformance fixtures. `DocumentDom` never uses it.
+- **Editing** is for a document that has been styled. Every change also owes bookkeeping for the
+  style engine, and leaving any of it out fails silently. So editing is a single batch API rather
+  than a set of setters. Both paths maintain the two child chains with the same code.
 
 ```rust
 pub fn edit<R>(
@@ -690,175 +471,187 @@ pub fn edit<R>(
 ) -> Result<R, Poisoned>;
 ```
 
-It takes a **shared** reference, because every method a view calls holds one — including a listener
-that changes the document from inside a dispatch that is itself running inside a batch. Three
-mechanisms make that sound, all in `crates/zgui-dom/src/mutate/edit/session.rs`.
+`edit` takes `&self` because every caller has only a shared reference, including a listener that
+edits during a dispatch inside another batch. Three mechanisms in
+`crates/zgui-dom/src/mutate/edit/session.rs` make that sound:
 
-| Mechanism | What it does |
+| Mechanism | Effect |
 |---|---|
-| A single-writer token | The first thread to open a batch records itself; another thread's attempt fails rather than proceeding. Released and acquired with the orderings that put one thread's batch entirely before the next thread's. |
-| A depth counter owned by a guard | A batch opened inside an open one **joins** it. End-of-batch work runs once, when the depth returns to zero. The guard is what stops a body that unwinds from stranding the counter. |
-| A poison flag | A batch that unwound left records describing neither the old state nor the new. The document refuses every later change and says so, rather than becoming an interface that accepts input and never updates. |
+| Single-writer token | The first thread to open a batch owns it. Another thread's attempt panics instead of interleaving. |
+| Depth counter held by a guard | A batch opened inside an open one joins it. End-of-batch work runs once, when the outermost batch closes. The guard keeps the counter correct when a body unwinds. |
+| Poison flag | A batch body that panicked leaves records that describe neither the old nor the new state. The document then rejects every later batch with `Poisoned`, instead of silently never updating. |
 
-### What each write records
+Poisoning has two refinements:
 
-An `Edit` method applies one change and everything that change owes.
+- A batch **opened while the thread is already unwinding** (for example by a `Drop` impl running
+  during a panic) does not poison the document when it completes. Only a body that itself panicked
+  does.
+- On a poisoned document, `DocumentDom` turns teardown edits (removing a node, removing a listener)
+  into no-ops instead of panicking. Scopes still dispose their views while a panic unwinds, and a
+  second panic inside that cleanup would abort the process before the first report was printed.
 
-<Steps>
+`Document::guarded` applies the same poisoning to non-batch work, such as a style traversal whose
+worker panics.
 
-<Step>
+### What one write records
 
-**A snapshot, if one is needed.** The engine works out what a change can affect by comparing the
-element as it is now against a record of how it was. Every snapshot carries the previous state word
-and the element's attributes. This also covers a style sheet installed after a state change and
-before traversal: the engine can read the old class list from the existing record. A class,
-identifier, or attribute write marks the corresponding field as changed.
+Each `Edit` method applies a change and the bookkeeping it owes:
 
-One record per element per batch. The *first* change is the one worth recording, and whether a
-record already exists is asked of the element's own bookkeeping word rather than of the map.
+1. **A snapshot**, the first time an element changes in a batch. The style engine finds what a
+   change can affect by comparing the element against its previous state. A snapshot holds the old
+   state word and attributes, and marks which of class, id and attributes changed. Whether a
+   snapshot exists is read from the element's own bookkeeping bits, not from the map.
+2. **Marks on the ancestors.** The traversal only descends where something below has work.
+3. **A restyle hint** saying how much work is needed: re-match this element, re-match its subtree,
+   or skip matching and re-run only the cascade (enough for a custom-property change on the root).
+   Each write records the narrowest hint that is provably sufficient.
+4. **A structural entry** when a child list changes. Inserting or removing a child changes what
+   `:nth-child`, `:empty`, `+` and `~` match on *other* children.
 
-</Step>
+### Closing a batch
 
-<Step>
+`Document::close_batch` runs when the outermost batch closes, in a fixed order:
 
-**A mark on the ancestors.** The engine's traversal descends only where something says there is work
-below, so a hint recorded on an element that nothing leads to is never read.
+1. Expand structural entries into hints for the affected siblings.
+2. Apply every element's hint.
+3. Request a frame.
 
-</Step>
+Structural expansion waits for the close so that each parent's child list is renumbered once per
+batch, not once per change. That keeps a thousand-row reorder linear. An entry tracks up to four
+anchors (the earliest affected child of each change); a fifth anchor degrades it to "every child"
+(`crates/zgui-dom/src/mutate/structure.rs`).
 
-<Step>
+### Style filters
 
-**A restyle hint.** How far the engine has to go: re-match this element, re-match this element and
-its subtree, or skip matching and re-run only the cascade. A theme switch that changes one custom
-property on the root needs no selector matching anywhere in the document. A hint that is too wide is
-slow and a hint that is too narrow is wrong, so every entry is the narrowest hint that is *provably*
-enough.
-
-</Step>
-
-<Step>
-
-**A structural entry, for a change to a child list.** Inserting or removing a child changes what
-`:nth-child`, `:empty`, `+` and `~` match on the *other* children — elements nothing touched, so it
-is not expressible as a record of the changed node.
-
-</Step>
-
-</Steps>
-
-### What the close of a batch does
-
-The order is fixed, in `Document::close_batch`.
-
-1. Expand what the child-list changes imply about the other children.
-2. Hand every element the restyle hint it earned.
-3. Ask for the frame that will show the result.
-
-Step one is deferred to the close for a reason that is measurable. A change invalidates the
-positions of every element sibling under its parent, so asking "which sibling is earliest affected"
-*per change* would renumber the child list per change. One entry per parent per batch pays for one
-renumber however many changes there were, which is the difference between a thousand-row reorder
-being linear and being quadratic. An entry names up to four anchors exactly; the fifth degrades to
-"every child" (`crates/zgui-dom/src/mutate/structure.rs`).
-
-### What a change can skip
-
-`StyleFilter` answers whether a change can affect any computed style at all, and is passed to each
-call rather than installed, because the compiled rule set it is answered from cannot be sent between
+`StyleFilter` tells a batch whether a change can affect any computed style. It is passed to each
+`edit` call rather than stored, because it is answered from a compiled rule set that cannot cross
 threads.
 
-```rust
-pub trait StyleFilter {
-    /// The interaction-state bits any selector that could match `element` depends on.
-    fn states_for(&self, element: Node<'_>) -> ElementState {
-        let _ = element;
-        ElementState::all()
-    }
+| Method | Answers | Default |
+|---|---|---|
+| `states_for(element)` | interaction-state bits any selector that could match `element` depends on | all bits |
+| `names_class(class)` | whether any selector mentions this class | `true` |
+| `names_attr(attr)` | whether any selector mentions this attribute, or matches attributes without naming one | `true` |
+| `is_disabled()` | whether the answers are unusable this frame because the sheet set just changed | `true` |
 
-    /// Whether any selector in the active sheet set mentions this class name.
-    fn names_class(&self, class: ClassName) -> bool {
-        let _ = class;
-        true
-    }
+`EverythingMatters` keeps all defaults: correct, but it filters nothing. A change the filter rejects
+is applied without any bookkeeping and never reaches the style engine.
 
-    /// Whether any selector mentions this attribute, or matches attributes without naming one.
-    fn names_attr(&self, attr: AttrName) -> bool {
-        let _ = attr;
-        true
-    }
+`states_for` is cached per element in the `state_mask` column. A document-wide answer would be
+useless: some rule styles `:hover` somewhere, so every hover would take the slow path. The cache
+depends on the element's identity and is dropped inside the write that changes it (class, id, or a
+move that changes whether it is the root). A sheet-set change drops every cached entry. While
+`is_disabled` holds, the cache is neither read nor written.
 
-    /// Whether the filter's answers are currently unusable: the one frame in which the sheet set
-    /// changed, during which the dependency index still describes the previous set.
-    fn is_disabled(&self) -> bool {
-        true
-    }
-}
-```
-
-Every default answers "this may matter". `EverythingMatters` takes all four, which is correct and
-merely not cheap: a change the filter rejects is applied without recording anything and without
-entering the style engine at all.
-
-`states_for` is cached per element in the `state_mask` column, because a document-wide answer is
-worthless — any real sheet styles `:hover` somewhere, so a document-wide mask has the hover bit set
-and every hover anywhere takes the slow path. The cache depends on the element's own identity, so it
-is dropped **inside** the write that changes it: a class change, an identifier change, a move that
-changes whether the element is the root, and a change to the sheet set, which drops every cached
-answer at once.
-
-### What the style engine sees
+### From a signal write to the restyle
 
 <FlowDiagram
   label="How a signal write reaches the style engine"
   items={[
     {
       title: 'A listener writes a signal',
-      next: 'The flush runs effects, which call Dom methods',
+      next: 'The reactive flush runs effects, which call Dom methods',
     },
     {
       title: 'Document::edit',
-      description: 'A shared reference joins any batch that is already open.',
-      next: 'Record snapshots, ancestor marks, hints, and structural entries',
+      description: 'Joins any batch already open.',
+      next: 'Record snapshots, ancestor marks, hints and structural entries',
     },
     {
       title: 'close_batch',
-      description: 'Runs once, when the outermost call returns.',
-      next: 'Expand changes, apply hints, and request a frame',
+      description: 'Runs once, when the outermost batch closes.',
+      next: 'Expand structural entries, apply hints, request a frame',
     },
     {
       title: 'Document::take_snapshots',
-      description: 'Runs at f.restyle; records are taken rather than borrowed.',
+      description: 'At the restyle stage; the restyle owns the snapshots.',
       next: 'Traverse only the nodes that owe a restyle',
     },
     {
       title: 'SnapshotStore::clear',
-      description: 'Clears the bookkeeping bit on every element that carried a record.',
+      description: 'Clears the snapshot bit on every element that had one.',
     },
   ]}
 />
 
-The records are **taken** rather than borrowed, in `crates/zgui-style/src/driver/snapshots.rs`, so
-the restyle owns them for its whole duration. A change made while a restyle runs belongs to the next
-restyle and starts a fresh set rather than joining the one in flight. They are cleared as soon as
-the restyle finishes, because a record that outlives the change it describes makes the *next* change
-compare against the wrong past.
+The restyle **takes** the snapshots (`crates/zgui-style/src/driver/snapshots.rs`), so a change made
+during the restyle starts a new set for the next one. Snapshots are cleared as soon as the restyle
+finishes; a leftover snapshot would make the next change compare against the wrong previous state.
 
-A frame that changes the document does not cost a second frame. `Document::begin_frame` turns a
-redraw request made during a frame into "another frame is owed", and `changes_serviced` — called at
-the exact line where the stages that produce changes end and the stages that consume them begin
-(`crates/zgui-runtime/src/window/frame.rs`) — clears that. Without it every interaction cost one
-extra frame that damaged nothing.
+### Frame bookkeeping
 
-### Ending the frame
+A change requests a frame through `EditState`. While a frame is running (`Document::begin_frame`), a
+change sets "another frame is owed" instead. The frame calls `Document::changes_serviced` at the
+point where the stages that produce changes (events, timers, reactive flush) end and the stages that
+consume them begin (`crates/zgui-runtime/src/window/frame.rs`). Changes made earlier in the frame are
+shown by that same frame and do not cost a second one. Changes made later, such as an observation
+handler writing a signal, still schedule another frame.
 
-`zgui_dom::arena::end_frame` drops the subtrees that were taken out during the frame and are still
-out, recycles their slots, and compacts every sparse column page that nothing is stored on any more.
-That is narrower than "everything `remove` was called on": a subtree put back before the frame ends
-was never really removed, and a list that moves a row does exactly that.
+### End of frame
 
-`crates/zgui-dom/tests/memory.rs` runs two hundred rounds of mounting and unmounting a hundred rows
-and asserts three things afterwards: the document holds no node from a round that ended, the slot
-high-water mark did not move after the first round, and no column page is still allocated.
+`zgui_dom::arena::end_frame` drops the subtrees that were removed during the frame and are still
+detached, recycles their slots, and frees sparse column pages that no longer hold anything. A subtree
+re-inserted before the frame ends (as a keyed list does when it moves a row) is kept.
+
+`tests/memory.rs` mounts and unmounts a hundred rows two hundred times, then checks that no node from
+an ended round remains, the slot high-water mark stopped growing after the first round, and no column
+page is still allocated.
+
+## Removed nodes
+
+A removed node stays in the arena until `end_frame`, but it is no longer connected. The runtime
+handles such nodes as follows:
+
+| Situation | Behaviour |
+|---|---|
+| An event was queued for an element that has since been removed (for example, a press that triggered a rebuild before its click dispatched) | The dispatch is dropped; the element's listeners belong to a disposed scope. |
+| The focused element is removed | The frame moves focus back to the window, so window shortcuts keep working. |
+| A `NodeRef` is bound to the removed element | The element releases the handle when it is dropped; a handle to a node the document dropped reads as unbound. |
+| The document is poisoned while views are torn down | Node and listener removals are skipped without a second panic. |
+
+## Document-language seams
+
+`zgui-dom` has no markup language, URL loader, security policy or browsing history. Four traits in
+`crates/zgui-dom/src/host/` cover the decisions those would make. Each is `Send + Sync + 'static`
+because it is reached from node handles on worker threads, and each has a do-nothing default.
+
+| Seam | Consulted by | Default | Installed with |
+|---|---|---|---|
+| `PresentationalHints` | the style engine, per restyled element | no hints (`NoPresentationalHints`) | `Document::install_presentational_hints` |
+| `LinkResolver` | `refresh_link_state`, on attribute writes | nothing is a link | `Document::install_link_resolver` |
+| `ReplacedContent` | `Document::intrinsic_of`, for replaced nodes | no intrinsic size | `Document::install_replaced_content` |
+| `SheetLoader` | the sheet parser's `@import` handling | every request rejected | `Document::install_sheet_loader` |
+
+**`SheetLoader`** — `fn load(&self, base: &str, href: &str) -> SheetRequest`, where `SheetRequest` is
+`Ready(SharedString)`, `Pending` or `Rejected`. `Ready` continues parsing in the same call, because
+imported rules must take the position of the `@import`. `load` runs on the parsing thread, never on
+a style worker. `zgui-style` ships `EmbeddedSheets` and `FilesystemSheets`.
+
+**`LinkResolver`** — `is_link(element)` and `is_visited(element)` (default `false`). These decide
+`:link`, `:visited` and `:any-link`. The resolver is consulted when attributes change, not during
+matching, and its answer is folded into the element's interaction-state word. The style engine
+invalidates `:link` by comparing state words, so an answer computed only inside the matcher would
+leave stale styles. `install_link_resolver` re-checks every element already in the document.
+
+**`ReplacedContent`** — `fn intrinsic(&self, id: ReplacedId) -> Intrinsic`. A node is replaced when
+its record has `NodeFlags::IS_REPLACED`. `Intrinsic` has three independent optional fields: `size`
+(CSS pixels), `ratio` and `baseline`. A decoded image has a size; a stream may know its ratio first;
+a surface with no frame yet has neither. Report only what is known, because layout resolves `auto`
+sizes from whichever fields are present. This seam covers sizing only. Painting replaced content is
+a separate scene-side hook keyed by the same `ReplacedId`, because paint sources hold device
+resources that cannot be shared with layout workers.
+
+**`PresentationalHints`** — `hints_for(element, visited, out)` pushes declarations a document
+language derives from attributes other than `style` (HTML's `width`, `bgcolor`, `align`). They
+cascade in their own origin, below author rules and above the user-agent origin. zgui has no markup
+language, so the default contributing nothing is correct.
+
+The standard app installs only one of these: a `ReplacedContent` multiplexer
+(`crates/zgui-runtime/src/window/mod.rs`) that merges the image loader's and the surface host's
+intrinsic tables. The other three keep their defaults, so `@import` is rejected unless a lower-level
+host installs a sheet loader. Hooks that cannot live in `zgui-dom` (painting replaced content, custom
+element layout and paint, script-engine hooks such as animation-frame callbacks) are installed on
+the runtime instead.
 
 ## Next
 
@@ -866,21 +659,21 @@ high-water mark did not move after the first round, and no column page is still 
   <Card
     title="Invalidation"
     href="/docs/architecture/invalidation"
-    description="The bits a node owes, how obligations propagate and retire, and how damage rectangles merge."
+    description="The dirty bits a node carries, how they propagate, and how damage rectangles merge."
   />
   <Card
     title="The style engine"
     href="/docs/architecture/style-engine"
-    description="What the traversal does with the snapshots, the hints and the marks this page produces."
+    description="How the traversal uses the snapshots, hints and marks this page produces."
   />
   <Card
     title="The frame"
     href="/docs/architecture/the-frame"
-    description="Where every stage named here sits in the loop, and what wakes it."
+    description="Where each stage named here runs in the frame loop."
   />
   <Card
     title="Crate map"
     href="/docs/architecture/crate-map"
-    description="Every crate, its layer, and the rule that keeps the arrows pointing one way."
+    description="Every crate, its layer, and the dependency rules between them."
   />
 </Cards>

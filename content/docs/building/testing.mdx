@@ -1,85 +1,34 @@
 ---
 title: Testing
-description: Testing an interface with no window — the component harness, the headless platform, driving input, flushing, goldens and the accessibility tree.
+description: Test components and whole applications without a window — component tests, input, timers, transcripts and golden files, headless application tests, the accessibility tree and the display list.
 ---
 
-Every stage of zgui hands the next stage a plain value: a view builds a document, the document is
-styled and laid out into fragments, the fragments are painted into a display list, and the display
-list goes to a renderer. Each of those values can be read from a test, so an interface is testable
-with no screen, no graphics device and no font files. This page assumes the whole of
-[Learn](/docs/learn/views).
+zgui tests run without a screen, a graphics device or font files. A **component test** builds one
+component into an in-memory tree and sends it input. A **headless application test** runs the whole
+frame loop, including style, layout and paint, and lets you check geometry, the accessibility tree
+and what was drawn.
 
-## Three instruments
+## Write your first component test
 
-| Crate | What runs | What it answers |
-|---|---|---|
-| `zgui-testkit-view` | one component: the view, its listeners, its timers. No document, no style engine, no layout, no window. | What did the view build? What did it ask the runtime for? What did a press reach? |
-| `zgui-platform-headless` | the whole application: real document, cascade, layout, text, paint, frame loop. | Where is it on the screen? What is a screen reader told? What did the display list hold? |
-| `zgui-testkit-scene` | a frame loop you drive yourself, plus the scene transcript, the golden files and the frame counters. | What did one frame draw and how much work did it do? |
-
-None of the three is re-exported by `zgui`. Each is its own crate, and each goes in
-`[dev-dependencies]`.
+Add the view testkit as a dev-dependency:
 
 ```toml title="Cargo.toml"
 [dev-dependencies]
-zgui-testkit-view = { path = "../zgui/crates/zgui-testkit-view" }
-zgui-testkit-scene = { path = "../zgui/crates/zgui-testkit-scene" }
-zgui-platform-headless = { path = "../zgui/crates/zgui-platform-headless" }
+zgui-testkit-view = "0.1"
 ```
 
 <Callout type="warn">
-Take all of them from the same source and the same revision as `zgui` itself. A component test
-passes a `DomHandle` between crates, so two copies of `zgui-view` in one build are a type error,
-not a subtle bug.
+Use the same version (or the same git revision) as `zgui`. A component test passes a `DomHandle`
+between crates, so two copies of `zgui-view` in one build fail to compile.
 </Callout>
 
-Naming `zgui-testkit-view` also turns on the `stub-backend` feature of `zgui-view` for the test
-build. That is where the in-memory tree comes from, and it is off in an ordinary build, so an
-application links none of it.
-
-## Testing one component
-
-`Window` is everything a component test needs, wired together: one tree, one host, one reactive
-scope, one root element, and one transcript that all of them write into.
+A test opens a `zgui_testkit_view::Window`, mounts a view into it, and runs a frame. Building a view
+returns an anchor; mounting attaches its nodes. Put that in a small helper:
 
 ```rust
 use zgui::prelude::*;
 use zgui_testkit_view::Window;
 
-let window = Window::open();
-```
-
-<TypeTable
-  type={{
-    transcript: { description: 'Everything the view asked its backend to do, in order.', type: 'Transcript' },
-    dom: { description: 'The tree the view built.', type: 'Rc<RecordingDom>' },
-    host: { description: 'The runtime the view asks for geometry, focus and time.', type: 'Rc<ScriptedHost>' },
-    dom_handle: { description: 'The handle a view holds on the tree.', type: 'DomHandle' },
-    host_handle: { description: 'The handle a view holds on the host.', type: 'HostHandle' },
-    scope: { description: 'The owner everything built here belongs to.', type: 'Mounted' },
-    cx: { description: 'The context a view is built through.', type: 'BuildCxOwned' },
-    root: { description: "The window's root element.", type: 'NodeId' },
-  }}
-/>
-
-| Method | Does |
-|---|---|
-| `Window::open()` | Opens one. Installs the reactive runtime on this thread. |
-| `Window::for_document(id)` | The same, for a test that needs two documents. |
-| `place(node, x, y, width, height)` | Declares where a node's box is. A scripted press is aimed with it. |
-| `dispatcher()` | A `Dispatcher` aimed into the root's subtree. |
-| `click(x, y)` | Clicks at a point. Returns `Delivered`. |
-| `frame()` | Runs the reactive flush, which is what a frame does at this layer. |
-| `advance(by)` | Moves the clock, fires everything due, then runs a frame. |
-| `now()` | The virtual clock's reading, as a `Duration`. |
-| `bounds_of(node)` | The box the test declared for a node. |
-
-### Mounting a view
-
-Building a view produces an anchor. Mounting it attaches its nodes under a parent. **Hold the
-anchor**: dropping it unmounts the view and takes its nodes, signals and timers with it.
-
-```rust
 /// Builds `view` and mounts it under the window's root.
 fn mount(window: &Window, view: impl IntoView) -> (NodeId, Box<dyn Anchor>) {
     let mut built = window.scope.with(|| view.into_view().build(&mut window.cx.cx()));
@@ -89,9 +38,9 @@ fn mount(window: &Window, view: impl IntoView) -> (NodeId, Box<dyn Anchor>) {
 }
 ```
 
-### A whole test
+**Keep the anchor alive.** Dropping it unmounts the view and drops its nodes, signals and timers.
 
-The component under test, built from the element vocabulary:
+Now test a counter:
 
 ```rust
 #[component]
@@ -110,24 +59,17 @@ fn Counter() -> impl IntoView {
         }
     }
 }
-```
 
-The test mounts it, reads the document, sends a press, flushes, and reads the document again:
-
-```rust
 #[test]
 fn pressing_the_step_control_raises_the_count() {
     let window = Window::open();
     let (root, _held) = mount(&window, view! { Counter() });
     window.frame();
 
-    // The control is the second child of the row. Give it a box, or nothing can be aimed at it.
+    // Give the control a box so a click can hit it.
     let step = window.dom.tree().children(root)[1];
     window.place(step, 0.0, 0.0, 24.0, 24.0);
     assert_eq!(window.dom.tree().text_content(root), "0+");
-
-    // Forget the mount, so what follows is about the interaction.
-    window.transcript.clear();
 
     let delivered = window.click(10.0, 10.0);
     assert_eq!(delivered.target, Some(step));
@@ -138,203 +80,125 @@ fn pressing_the_step_control_raises_the_count() {
 }
 ```
 
-### Reading the tree
+The component test runs your view, listeners and timers, but no document, style, layout or window.
+It checks what the view built and how it reacts to input. The boxes come from `place`, not from
+layout; for real geometry, use a [headless application test](#test-the-whole-application).
 
-`window.dom.tree()` is the tree itself, for the questions a transcript cannot answer.
+## Run a frame after each change
 
-| Question | Read |
+A signal write only marks its subscribers; the next frame runs them. In a component test,
+`window.frame()` is that frame. It flushes, applies any values and selections the view wrote back
+into the tree, and repeats until nothing changes (at most eight rounds).
+
+| Call `frame()` | Why |
 |---|---|
-| What is under this node? | `children(node)` |
-| What does this subtree say? | `text_content(node)` |
-| What classes does it carry? | `classes(node)` |
-| What is one attribute? | `attribute(node, zgui::view::AttrName::new("variant"))` |
-| What inline style does it carry? | `style_property(node, "color")` |
-| Which interaction states does it assert? | `ui_state(node)` |
-| What does it mean to a screen reader? | `semantics(node)` |
-| What is its value? | `property(node, key)` |
-| How large is the tree? | `node_count()`, `listener_count()` |
+| after mounting | the mount's effects have not run yet |
+| after each interaction, or after writing a signal from the test | the handler only wrote a signal |
+| not after `advance()` | `advance` already runs a frame |
 
-`ui_state` is what a sheet selects on with `:hover`, `:disabled` and the rest. `semantics` is what
-the accessibility tree is built from.
+A headless application test has the same rule; its method is `settle`.
 
-## Flushing
+## Read the tree
 
-A signal write never runs anything at the moment of the write. It marks its subscribers, and the
-frame runs them. `window.frame()` is that frame.
+`window.dom.tree()` returns the in-memory tree:
+
+| To read | Call |
+|---|---|
+| children of a node | `children(node)` |
+| text of a subtree | `text_content(node)` |
+| classes | `classes(node)` |
+| one attribute | `attribute(node, zgui::view::AttrName::new("variant"))` |
+| one inline style property | `style_property(node, "color")` |
+| interaction states (`:hover`, `:disabled`, …) | `ui_state(node)` |
+| accessibility description | `semantics(node)` |
+| a `prop:` value | `property(node, key)` |
+| size of the tree | `node_count()`, `listener_count()` |
+
+## Send input
+
+`window.click(x, y)` covers the common case. For anything else, `window.dispatcher()` returns a
+`Dispatcher`, which sends a real event to a point or a node: it builds the capture and bubble path,
+runs the handlers and honours what they ask for.
 
 ```rust
-window.click(10.0, 10.0);   // the handler ran and wrote a signal
-                            // the tree still shows the old value here
-window.frame();             // now the effects have run and the tree has changed
+use zgui::vocab::{EventKind, Key, Modifiers, NamedKey};
+
+window.dispatcher().pointer_at(point, EventKind::PointerDown);
+window.dispatcher().key(field, Key::Named(NamedKey::Enter));
+window.dispatcher().with_modifiers(Modifiers::SHIFT).key(grid, Key::Named(NamedKey::PageUp));
+window.dispatcher().send_to(button, EventKind::Click, payload);
 ```
-
-`frame()` is a bounded loop of at most eight rounds: flush, take the values the host wrote back,
-load them into the tree, repeat until nothing more was written. That is what makes a field echoing
-a keystroke settle inside one call.
-
-| Call `frame()` | Because |
-|---|---|
-| after mounting, before the first assertion | the mount's own effects have not run |
-| after every interaction | the handler wrote a signal and nothing has read it |
-| after writing a signal from the test itself | the same |
-| after `advance()` | already included — `advance` moves the clock and then runs a frame |
-
-The rule for the headless platform is the same idea with a different name: `settle` there, `frame`
-here.
-
-## The transcript
-
-The transcript is one ordered record of everything the view asked its backend to do. The tree, the
-host and the dispatcher all append to it, which is what makes a question about order answerable.
-
-```rust
-window.transcript.clear();
-window.click(10.0, 10.0);
-window.frame();
-
-// One handler run, one text write. A binding that rewrote its text on every frame shows two.
-assert_eq!(window.transcript.len(), 2);
-assert!(window.transcript.to_string().contains("click target"));
-```
-
-Let a golden hold the node numbers rather than writing them by hand.
-
-| Method | Gives |
-|---|---|
-| `to_string()` | one line per operation, the golden format |
-| `ops()` | the operations as `Op` values, for a structural assertion |
-| `len()`, `is_empty()` | how much was recorded |
-| `clear()` | forget everything so far |
-| `assert_matches(path)` | compare against a golden file |
-
-Every clone of a `Transcript` appends to the same list, so passing one around costs nothing.
-
-### The line vocabulary
-
-```text
-create #1 control
-insert #2 into #1                    insert #2 into #1 before #3
-detach #1
-text #2 "hello"
-attr #2 name="value"                 attr #2 name removed
-classes #2 [a b]
-class #2 danger on                   class #2 danger off
-style #2 color="red"                 style #2 color removed
-state #2 hover on
-prop #2 value="x"
-custom-state #2 name on
-semantics #2 button                  semantics #2 cleared
-listen #2 click                      listen #2 click capture
-unlisten #2
-observe #2 scroll-position
-focus #2       scroll #2      trap #2      untrap
-selection #2 0..3     select-all #2     value #2 "x"
-handler #2 click target              handler #2 click capture
-sheet name     unsheet name
-command request-focus #2
-```
-
-A node is written as `#` followed by the number the backend minted. `Show`, `For` and dynamic
-children mint `#marker` nodes, and those appear too.
-
-Two things are deliberately not recorded: reads, and writes that changed nothing. A controlled
-field echoing the user's own keystroke produces no `value` line, and that is the point — a
-component that writes the same class twice per change is visible in a transcript and invisible in
-the finished tree.
-
-## Driving input
-
-A `Dispatcher` aims a real event at a place or at a node, resolves the path down and back up, runs
-the handlers, and honours what each one says.
 
 | Method | Sends |
 |---|---|
 | `click_at(point)` | a click at a point, after a hit test |
 | `pointer_at(point, kind)` | one pointer event of any `EventKind` at a point |
-| `key(node, key)` | one key at a node, plus what a window does about it |
-| `type_text(node, text)` | text as the keyboard produces it |
-| `send_to(node, kind, payload)` | one event straight at a node, with no hit test |
-| `with_modifiers(modifiers)` | the same dispatcher with modifiers held down |
+| `key(node, key)` | a key at a node, plus the window's default handling |
+| `type_text(node, text)` | a `text` event |
+| `send_to(node, kind, payload)` | one event at a node, with no hit test |
+| `with_modifiers(modifiers)` | the same dispatcher with modifiers held |
 | `listener_at(node, kind, position)` | the identity of one registered listener |
 
-```rust
-use zgui::vocab::{EventKind, Key, Modifiers, NamedKey};
+A wheel is `send_to(node, EventKind::Wheel, Payload::Wheel(WheelEvent { … }))`; the `WheelEvent`
+fields are shown under [Send input to the surface](#send-input-to-the-surface).
 
-// A pointer, at a place.
-window.dispatcher().pointer_at(point, EventKind::PointerDown);
+### Keys and typing
 
-// A key, at a node.
-window.dispatcher().key(field, Key::Named(NamedKey::Enter));
+`key` does what a window does. It delivers `key_down`. If no handler prevented the default, it
+offers the key to the editing model of a `field` or `editor`, and otherwise turns `Enter` or `Space`
+into a `click`. A button with no key handling is therefore activated by Space in a test, as on
+screen.
 
-// A shortcut.
-window.dispatcher().with_modifiers(Modifiers::SHIFT).key(grid, Key::Named(NamedKey::PageUp));
-
-// An accessibility action, or anything else aimed at an element rather than a place.
-window.dispatcher().send_to(button, EventKind::Click, payload);
-```
-
-`key` does the two things a window does. It delivers the key event; then, if every handler let the
-framework's own behaviour stand, it offers the key to the editing model, and failing that
-synthesises a click for `Enter` and `Space`. So a button that handles no keys at all is activated
-by the space bar in a test, exactly as it is on screen.
-
-A wheel is an `EventKind::Wheel` with a wheel payload:
+To type into a field, send characters with `key`. The view can also place the caret: a selection
+the view sets with `set_selection` or `select_all` is applied to the testkit's editing model on the
+next `frame()`, after any values, so the next key lands where the view put the caret.
 
 ```rust
-use zgui::geom::{CssPx, Point, Size};
-use zgui::vocab::{
-    Payload, PointerId, PointerKind, ScrollDelta, ScrollPhase, WheelEvent,
-};
-
-window.dispatcher().send_to(
-    list,
-    EventKind::Wheel,
-    Payload::Wheel(WheelEvent {
-        delta: ScrollDelta::Lines { x: 0.0, y: -3.0 },
-        phase: ScrollPhase::Discrete,
-        position: Point::new(CssPx(10.0), CssPx(10.0)),
-        id: PointerId::MOUSE,
-        kind: PointerKind::Mouse,
-    }),
-);
+window.host.set_value(field, "resta");
+window.frame();
+window.host.set_selection(field, 2..2);
+window.frame();
+window.dispatcher().key(field, Key::Character("-".into()));
+assert_eq!(window.dom.tree().text_content(field), "re-sta");
 ```
 
-### What a dispatch reports
+### What a dispatch returns
 
 ```rust
 pub struct Delivered {
     pub target: Option<NodeId>,
     pub path: Vec<NodeId>,          // root first
-    pub ran: Vec<(NodeId, Phase)>,  // which handlers ran, in order
-    pub default: DefaultAction,     // whether the framework's own behaviour survived
+    pub ran: Vec<(NodeId, Phase)>,  // handlers that ran, in order
+    pub default: DefaultAction,     // whether the default action survived
     pub commands: Vec<Command>,     // what the handlers asked for
 }
 ```
 
-`reached_anything()` is `true` when any handler ran. `commands` holds
-`CapturePointer`, `ReleasePointer`, `RequestFocus` and `Synthesize`. The first three are
-**collected, not carried out** — the runtime does the same, and asserting on them is how a test
-says "the handler asked for focus" without a focus system existing. `Synthesize` is the exception:
-the dispatcher carries it out, exactly as a window does, and the handlers those runs reach are
-appended to `ran` and their own commands to `commands`.
+`reached_anything()` is true when any handler ran. `commands` holds `CapturePointer`,
+`ReleasePointer`, `RequestFocus` and `Synthesize`. The first three are recorded but not carried out
+(the runtime also defers them), so assert on them directly. `Synthesize` is carried out: the extra
+dispatch's handlers are appended to `ran` and its commands to `commands`.
 
-### Hit testing in the harness
+An event aimed at an element that has left the tree reaches nothing: `path` and `ran` are empty.
+A real window behaves the same way.
 
-The harness answers "what is under this point" from the boxes the test declared with `place`, under
-three rules:
+### Hit testing
 
-- a node with no declared box is not hit; its descendants still are;
+The testkit hit-tests against the boxes declared with `place`:
+
+- a node without a declared box is not hit, but its descendants can be;
 - a descendant wins over its ancestor;
-- at equal depth, the node later in document order wins.
+- at equal depth, the later node in document order wins.
 
 <Callout type="warn">
-`place` and `bounds_of` are the test's own numbers. Asserting that `bounds_of` returns what you
-placed asserts your own arithmetic. Real geometry comes from the headless platform, below.
+`place` and `bounds_of` return the test's own numbers, so asserting on them only tests your own
+arithmetic. For real geometry, use a [headless application test](#test-the-whole-application).
 </Callout>
 
-## The clock
+## Test timers
 
-The host owns a virtual clock. Nothing waits.
+The host owns a virtual clock, so timers fire without waiting. `window.advance(by)` moves the clock,
+fires due timers, then runs a frame.
 
 ```rust
 let window = Window::open();
@@ -349,39 +213,48 @@ assert!(!shown.get_untracked());
 
 window.advance(Duration::from_millis(1));
 assert!(shown.get_untracked());
-assert_eq!(window.now(), Duration::from_millis(700));
 ```
 
-A seven-hundred-millisecond tooltip delay costs the test a microsecond. Dropping the handle
-`set_timeout` returned cancels the callback, so bind it.
+Dropping the handle `set_timeout` returns cancels the timer, so bind it. Never sleep in a test.
 
-## What the host was asked for
+## Check what the view did with the transcript
 
-`ScriptedHost` answers the questions a view asks the runtime, from what the test declared, and
-records the commands it was given.
+The transcript records every operation the view asked of its backend, in order. The tree, the host
+and the dispatcher all write to it, so it can answer questions about order and about redundant
+work. Clear it after mounting so you assert on the interaction, not the mount:
 
-| Declare | Method |
+```rust
+window.transcript.clear();
+window.click(10.0, 10.0);
+window.frame();
+
+// One handler run and one text write.
+assert_eq!(window.transcript.len(), 2);
+assert!(window.transcript.to_string().contains("click target"));
+```
+
+| Method | Gives |
 |---|---|
-| where a node's box is | `set_border_box(node, rect)` — or `Window::place` |
-| the scale factor | `set_scale(scale)` |
-| what a scroll container's offset is | `set_scroll_position(node, position)` |
-| what is focusable under a root | `set_focusables(root, nodes)` |
-| that one node contains another | `set_contains(ancestor, descendant)` |
-| the document order | `set_tree_order(order)` |
-| how many animations are running on a node | `set_running_animations(node, count)` |
+| `to_string()` | one line per operation (the golden-file format) |
+| `ops()` | the operations as `Op` values |
+| `len()`, `is_empty()` | how much was recorded |
+| `clear()` | forget everything so far |
+| `assert_matches(path)` | compare with a golden file |
 
-| Ask | Method |
-|---|---|
-| what scrolls were requested | `scroll_commands()` |
-| how many focus traps are live | `live_focus_traps()`, `topmost_focus_trap()` |
-| which sheets are installed | `stylesheet(name)`, `stylesheet_names()`, `stylesheet_installs()` |
-| how many timers are pending | `live_timers()` |
-| whether scrolling is frozen | `scrolling_frozen()` |
+All clones of a `Transcript` share one list. Each line names an operation and its node, for
+example `create #1 control`, `insert #2 into #1`, `text #2 "hello"`, `class #2 danger on`,
+`state #2 hover on`, `semantics #2 button`, `listen #2 click`, `selection #2 0..3`,
+`handler #2 click target` or `command request-focus #2`.
 
-## Snapshot testing
+Nodes are written as `#` plus the number the backend assigned. `Show`, `For` and dynamic children
+create marker nodes, which appear too. Writes that change nothing are not recorded. If a component
+writes the same class twice per change, the transcript shows it even though the final tree looks
+right.
 
-The repository does not use `insta`. Snapshots are golden files, and the mechanism is
-`zgui_testkit_scene::dump::golden`, which a transcript reaches through `assert_matches`.
+## Compare against golden files
+
+Snapshots are golden files, compared by `zgui_testkit_scene::dump::golden`. A transcript uses it
+through `assert_matches`.
 
 ```rust
 use std::path::{Path, PathBuf};
@@ -392,55 +265,70 @@ fn golden(name: &str) -> PathBuf {
 
 #[test]
 fn counter_steps() {
-    let window = Window::open();
-    let (root, _held) = mount(&window, view! { Counter() });
-    window.frame();
-    window.place(window.dom.tree().children(root)[1], 0.0, 0.0, 24.0, 24.0);
-
-    // Two presses, so the golden shows the text going 0, 1, 2. A binding that rewrote its text on
-    // every frame rather than on every change looks identical after one.
-    window.click(10.0, 10.0);
-    window.frame();
-    window.click(10.0, 10.0);
-    window.frame();
-
+    // … mount, place, click and frame as above …
     window.transcript.assert_matches(golden("counter_steps.txt"));
 }
 ```
 
-Three rules, all enforced by a panic:
-
-| Situation | What happens |
+| Situation | Result |
 |---|---|
-| The golden is missing. | The test fails and tells you to re-run with `ZGUI_BLESS=1`. A file is never created quietly. |
-| `ZGUI_BLESS=1` and the golden differs or is missing. | The file is written **and the test still fails**, naming what changed. |
-| No `ZGUI_BLESS`, and the rendering matches. | The test passes. |
+| golden missing | the test fails and tells you to re-run with `ZGUI_BLESS=1` |
+| `ZGUI_BLESS=1` and the golden differs or is missing | the file is written **and the test still fails**, showing the change |
+| no `ZGUI_BLESS`, output matches | the test passes |
 
-<Callout type="idea">
-Blessing that also reported success would check nothing, and an author who blessed by reflex would
-have no moment at which to read the diff. The run after the blessing is the one that passes.
-</Callout>
+Blessing always fails so that you read the diff; the next run passes. Any non-empty value other
+than `0` counts as set.
 
-`ZGUI_BLESS` counts as set for any non-empty value other than `"0"`.
+## Answer the view's questions with the scripted host
 
-## The whole application, with no window
+`window.host` is a `ScriptedHost`. It answers the runtime questions a view asks from values the test
+declares, and records the commands it receives.
 
-`zgui-platform-headless` is a platform backend with no windowing system behind it: a clock a test
-moves, scripted input, and a surface that is a buffer. Every stage of the real loop runs — events
-dispatched, reactive work flushed, document restyled, laid out, painted into a display list and
-handed to a renderer. Only the renderer differs.
+| Declare | Method |
+|---|---|
+| a node's box | `set_border_box(node, rect)`, or `Window::place` |
+| the scale factor | `set_scale(scale)` |
+| a scroll container's offset | `set_scroll_position(node, position)` |
+| what is focusable under a root | `set_focusables(root, nodes)` |
+| that one node contains another | `set_contains(ancestor, descendant)` |
+| document order | `set_tree_order(order)` |
+| running animations on a node | `set_running_animations(node, count)` |
 
-Build the application through `zgui::runtime::App` rather than through `app()`, because that is the
-route that hands back a `Runtime` you can keep and ask questions of.
+| Ask | Method |
+|---|---|
+| requested scrolls | `scroll_commands()` |
+| live focus traps | `live_focus_traps()`, `topmost_focus_trap()` |
+| installed sheets | `stylesheet(name)`, `stylesheet_names()`, `stylesheet_count()`, `stylesheet_installs()` |
+| pending timers | `live_timers()` |
+| whether scrolling is frozen | `scrolling_frozen()` |
+
+`focus_is_text_entry()` also works in a component test when called inside `window.scope`. The
+scripted host counts a focused node as a text entry once it holds a selection.
+
+## Test the whole application
+
+`zgui-platform-headless` is a platform backend with no window system: a clock the test moves,
+scripted input, and buffer surfaces. The real frame loop runs (dispatch, reactive flush, restyle,
+layout, paint); only the renderer is replaced. Use it to check geometry, engine-computed states such
+as `:hover`, the accessibility tree and the display list.
+
+```toml title="Cargo.toml"
+[dev-dependencies]
+zgui-platform-headless = "0.1"
+zgui-testkit-scene = "0.1"
+```
+
+Build the app with the normal `app()` builder. `into_handler` does the same wiring as `run`, and
+`Handler::into_runtime` returns the frame loop for the harness to drive.
 
 ```rust
 use std::sync::Arc;
 
+use zgui::geom::{DevicePx, Size};
 use zgui::platform::{Surface, SurfaceEvent};
 use zgui::prelude::*;
-use zgui::geom::{DevicePx, Size};
 use zgui::render::{RenderTarget, Renderer};
-use zgui::runtime::{App, AppError, Runtime};
+use zgui::runtime::{AppError, Runtime};
 use zgui_platform_headless::Harness;
 use zgui_testkit_scene::CaptureRenderer;
 
@@ -451,17 +339,15 @@ fn capture(_surface: &Arc<dyn Surface>, target: RenderTarget) -> Result<Box<dyn 
     Ok(Box::new(renderer))
 }
 
-/// The application, open and driveable.
 fn open() -> Harness<Runtime> {
-    let runtime = App::new()
+    let runtime = app()
         .with_title("test")
         .with_size(400.0, 300.0)
         .with_stylesheet(SHEET)
         .with_renderer(Box::new(capture))
-        .into_handler(|cx: &mut BuildCx<'_>| -> Box<dyn Anchor> {
-            Box::new(view! { Counter() }.into_view().build(cx))
-        })
-        .expect("the reactive runtime installs");
+        .into_handler(|| view! { Counter() })
+        .expect("the reactive runtime installs")
+        .into_runtime();
 
     let mut harness = Harness::new(runtime);
     harness.deliver_to_first(SurfaceEvent::Resized(Size::new(DevicePx(400.0), DevicePx(300.0))));
@@ -470,161 +356,147 @@ fn open() -> Harness<Runtime> {
 }
 ```
 
-<Callout type="warn">
-The argument order differs between the two builders. `zgui::runtime::App::run(view, driver)` takes
-the view first; the umbrella `App::run_on(driver, view)` takes the driver first.
-</Callout>
+### Send input to the surface
 
-`App::new()` installs no text engine and no glyph rasteriser, so text is not shaped. A test that
-asserts on boxes, classes or the accessibility tree needs neither. A test that asserts on text
-geometry or on glyphs supplies both, and the deterministic pair is the right choice — it needs no
-font file on disk, so the test gives the same answer on a machine with a thousand faces installed
-and on one with none.
-
-```rust
-.with_text_engine(Box::new(|| {
-    Box::new(zgui_layout::Paragraphs::new(zgui_testkit_scene::MonoShaper::new()))
-}))
-.with_glyph_raster(Box::new(|| Arc::new(zgui_testkit_scene::MonoRaster::new())))
-```
-
-`MonoShaper` is a fixed 8 by 16 face, and the default metrics source the cascade resolves `ex` and
-`ch` against agrees with it by construction. `zgui-layout` is a separate crate; add it to
-`[dev-dependencies]` for this.
-
-### Driving the loop
-
-| Method | Does |
-|---|---|
-| `deliver(surface, event)` | one platform event to one surface |
-| `deliver_all(surface, events)` | a burst: several events, one park, one chance to draw |
-| `deliver_to_first(event)` | the same, to the first surface the application created |
-| `pump()` | one turn of the loop. Returns how many frames ran |
-| `settle(turns)` | pump until nothing is pending. Panics if work remains after `turns` |
-| `advance(by)` | move the clock, taking the deadline edge if it is crossed |
-| `run_for(total, step)` | advance in steps and pump each time |
-| `suspend()` | remove every surface without closing the requested windows |
-| `resume()` | recreate surfaces and rebuild their window views |
-| `shut_down()` | deliver application shutdown |
-| `app()`, `app_mut()` | the `Runtime`, and through it `windows()` |
-| `platform()` | the `Headless` platform, and through it the offscreen surfaces |
-| `assert_park_invariant()` | resumes are at most frames plus one |
-
-A window system delivers bursts, not a stream. `deliver_all` is what models that; delivering the
-same events one at a time tests a sequence nothing produces.
-
-For a multi-window test, take the surface IDs from `app().windows()` or the offscreen surfaces from
-`platform().offscreens()`, then pass the intended ID to `deliver`. `OffscreenSurface` retains the
-`SurfaceAttributes` that created it, so a test can assert the requested title, size, application
-identifier, decorations, and other initial window state. Use `suspend` followed by `resume` to prove
-that application-scope state survives and each window view is rebuilt.
-
-### Input at the surface
+Input arrives as `SurfaceEvent`s, as it would from a window system:
 
 ```rust
 use zgui::geom::{Css, CssPx, Point};
 use zgui::vocab::{
-    KeyEvent, KeyState, Modifiers, NamedKey, PhysicalKey, PointerAction, PointerEvent,
-    PointerId, PointerKind, ScrollDelta, ScrollPhase, Timestamp, WheelEvent,
+    Modifiers, PointerAction, PointerEvent, PointerId, PointerKind, ScrollDelta, ScrollPhase,
+    Timestamp, WheelEvent,
 };
 
-/// One pointer event at a place.
-fn pointer(action: PointerAction, at: Point<CssPx, Css>) -> SurfaceEvent {
-    SurfaceEvent::Pointer {
-        action,
-        event: PointerEvent::mouse(at),
-        modifiers: Modifiers::NONE,
-        timestamp: Timestamp::ORIGIN,
-    }
+fn pointer(action: PointerAction, at: Point<CssPx, Css>, time: Timestamp) -> SurfaceEvent {
+    let event = PointerEvent::mouse(at);
+    SurfaceEvent::Pointer { action, event, modifiers: Modifiers::NONE, timestamp: time }
 }
 
-/// One wheel notch at a place.
 fn wheel(at: Point<CssPx, Css>, lines: f32) -> SurfaceEvent {
-    SurfaceEvent::Wheel {
-        event: WheelEvent {
-            delta: ScrollDelta::Lines { x: 0.0, y: lines },
-            phase: ScrollPhase::Discrete,
-            position: at,
-            id: PointerId::MOUSE,
-            kind: PointerKind::Mouse,
-        },
-        modifiers: Modifiers::NONE,
-        timestamp: Timestamp::ORIGIN,
-    }
+    let event = WheelEvent {
+        delta: ScrollDelta::Lines { x: 0.0, y: lines },
+        phase: ScrollPhase::Discrete,
+        position: at,
+        id: PointerId::MOUSE,
+        kind: PointerKind::Mouse,
+    };
+    SurfaceEvent::Wheel { event, modifiers: Modifiers::NONE, timestamp: Timestamp::ORIGIN }
 }
 
-/// One key going down.
-fn key(event: KeyEvent) -> SurfaceEvent {
-    SurfaceEvent::Key {
-        state: KeyState::Pressed,
-        event,
-        modifiers: Modifiers::NONE,
-        timestamp: Timestamp::ORIGIN,
+/// A click is `Moved`, `Pressed`, `Released`.
+fn click(harness: &mut Harness<Runtime>, at: Point<CssPx, Css>, time: Timestamp) {
+    for action in [PointerAction::Moved, PointerAction::Pressed, PointerAction::Released] {
+        harness.deliver_to_first(pointer(action, at, time));
     }
+    harness.settle(8);
 }
 ```
 
-A click is three events in order: `PointerAction::Moved`, `Pressed`, `Released`, each settled.
-`KeyEvent::named(NamedKey::Enter, PhysicalKey::Unidentified(0))` and `KeyEvent::character("q")`
-build the two kinds of key.
+Keys are `SurfaceEvent::Key { state: KeyState::Pressed, event, modifiers, timestamp }`, with `event`
+built by `KeyEvent::named(NamedKey::Enter, PhysicalKey::Unidentified(0))` or
+`KeyEvent::character("q")`.
+
+Engine-owned states such as `:hover`, `:active` and `:focus` can only be produced by real input:
+deliver pointer events and settle.
+
+A **double click** is two clicks on the same element within 500 ms and 4 CSS pixels. The window
+dispatches `double_click` after the second `click`; a third click starts a new count. The event
+timestamps decide the interval, so give the clicks distinct times:
 
 ```rust
-let mut harness = open();
-harness.deliver_to_first(pointer(PointerAction::Moved, at));
-harness.deliver_to_first(pointer(PointerAction::Pressed, at));
-harness.deliver_to_first(pointer(PointerAction::Released, at));
-harness.settle(32);
+click(&mut harness, at, Timestamp::ORIGIN);
+click(&mut harness, at, Timestamp::ORIGIN + Duration::from_millis(200)); // double_click fires
 ```
 
-Headless is fast enough to be a unit test: a 1 851-box document reaches its first painted frame in
-103.31 ms headless, against a 250 ms budget (`cold.first_frame`, `docs/performance.md`).
+### Find elements and their boxes
 
-## Asserting on layout geometry
-
-Geometry comes out of the fragment tree, which is where layout wrote it. Read it; never compute it
-from the sheet, because a constant asserts the test's own arithmetic rather than the layout.
+A settled `zgui::runtime::Window` (from `harness.app().windows()`) can find elements and their
+boxes. Use `box_with_class` to aim input without hard-coding coordinates. At the headless default
+scale factor of 1, device pixels equal CSS pixels.
 
 ```rust
-/// The centre of every 34 by 34 box in the window, left to right.
-fn swatch_centres(window: &zgui::runtime::Window) -> Vec<Point<CssPx, Css>> {
-    let layout = window.layout().borrow();
-    let mut found = Vec::new();
-    for key in layout.keys() {
-        for fragment in layout.fragments_of_box(key) {
-            let Some(fragment) = layout.fragment(*fragment) else { continue };
-            let border = fragment.border_box;
-            if (border.size.width.0 - 34.0).abs() < 0.5 && (border.size.height.0 - 34.0).abs() < 0.5 {
-                found.push(Point::new(
-                    CssPx(border.origin.x.0 + border.size.width.0 / 2.0),
-                    CssPx(border.origin.y.0 + border.size.height.0 / 2.0),
-                ));
-            }
-        }
-    }
-    found.sort_by(|a, b| a.x.0.total_cmp(&b.x.0));
-    found
-}
+let window = &harness.app().windows()[0];
+let step = window.box_with_class("counter__step").expect("the control has a box");
+let centre = Point::new(
+    CssPx(step.origin.x.0 + step.size.width.0 / 2.0),
+    CssPx(step.origin.y.0 + step.size.height.0 / 2.0),
+);
+click(&mut harness, centre, Timestamp::ORIGIN);
 ```
 
-`window.chain_at(point)` answers the other direction: the path of elements under a point, the
-document's root first, in absolute device pixels. It is the path an event would travel, so a
-difference three levels above the target is visible in it.
+| Method | Gives |
+|---|---|
+| `nodes_with_class(class)` | every element with that class, in document order |
+| `box_with_class(class)` | the first such element's border box in absolute device pixels, or `None` |
+| `chain_at(point)` | the elements under a device-pixel point, root first: the path an event would take |
+| `pointer_capture(pointer)` | the element holding that pointer's capture, if any |
+| `has_pointer_capture()` | whether any pointer is captured |
 
-## Asserting on the accessibility tree
+For any other geometry, read the fragment tree through `window.layout()`. Do not compute expected
+positions from the style sheet; that tests your arithmetic, not the layout.
 
-Two levels, and they answer different questions.
+### Drive the frame loop
 
-**In a component test**, `semantics(node)` is what the element says it is. That is the input to an
-accessibility tree, and it is where a missing role or a missing label shows up.
+| Method | Does |
+|---|---|
+| `deliver(surface, event)` | one platform event to one surface |
+| `deliver_all(surface, events)` | a burst of events, handled in one turn |
+| `deliver_to_first(event)` | one event to the first surface |
+| `pump()` | one turn of the loop; returns the number of frames run |
+| `settle(turns)` | pump until nothing is pending; panics if work remains after `turns` |
+| `advance(by)` | move the clock |
+| `run_for(total, step)` | advance in steps, pumping each time |
+| `suspend()`, `resume()` | remove all surfaces, then recreate them and rebuild window views |
+| `shut_down()` | deliver application shutdown |
+| `app()`, `app_mut()` | the `Runtime`; `windows()` lists its windows |
+| `platform()` | the `Headless` platform; `offscreens()` lists its surfaces |
+| `assert_park_invariant()` | checks the loop resumed at most once more than it drew |
+
+Real window systems deliver events in bursts. Use `deliver_all` to reproduce one; delivering the
+same events one at a time tests a sequence that does not happen.
+
+For several windows, take surface IDs from `app().windows()` or `platform().offscreens()` and pass
+them to `deliver`. Each `OffscreenSurface` keeps the `SurfaceAttributes` it was created with
+(`requested_attributes()`), so a test can check the requested title, size, decorations and so on.
+
+### Make text machine-independent
+
+`app()` installs the production text engine and rasteriser, so text matches the shipped application
+but depends on the installed fonts. There are two ways to avoid that:
+
+- `app().with_fonts(Fonts::shipped_only())` plus `Fonts::register` for a bundled face. Real shaping,
+  no system fonts.
+- Build with `zgui::runtime::App` and install the fixed test face, where every glyph is 8 × 16, so
+  positions can be computed by hand. Add `zgui-layout` to the dev-dependencies for this.
+
+```rust
+zgui::runtime::App::new()
+    // … title, size, sheet, renderer as above …
+    .with_text_engine(Box::new(|| {
+        Box::new(zgui_layout::Paragraphs::new(zgui_testkit_scene::MonoShaper::new()))
+    }))
+    .with_glyph_raster(Box::new(|| Arc::new(zgui_testkit_scene::MonoRaster::new())))
+    .into_handler(|cx: &mut BuildCx<'_>| -> Box<dyn Anchor> {
+        Box::new(view! { Counter() }.into_view().build(cx))
+    })
+    .expect("the reactive runtime installs");
+```
+
+`zgui::runtime::App::into_handler` returns the `Runtime` directly and takes a build closure instead
+of a view closure.
+
+## Test accessibility
+
+In a component test, `semantics(node)` is what the element declares. This is where a missing role
+or label shows up:
 
 ```rust
 let step = window.dom.tree().children(root)[1];
-let semantics = window.dom.tree().semantics(step).expect("the element says what it is");
+let semantics = window.dom.tree().semantics(step).expect("the element has semantics");
 assert_eq!(semantics.role, Role::Button);
 ```
 
-**In a headless application test**, the update the surface was handed is the real thing: assembled
-by the frame, after paint, out of the whole document.
+In a headless application test, the surface records the real updates each frame published:
 
 ```rust
 fn published(harness: &Harness<Runtime>) -> zgui_a11y::TreeUpdate {
@@ -640,22 +512,23 @@ fn published(harness: &Harness<Runtime>) -> zgui_a11y::TreeUpdate {
 #[test]
 fn the_step_control_is_announced() {
     let harness = open();
-    let update = published(&harness);
-    assert!(zgui_a11y::dump(&update).contains("Increment"));
+    assert!(zgui_a11y::dump(&published(&harness)).contains("Increment"));
 }
 ```
 
-`zgui_a11y::dump` renders an update as stable text, which makes it a golden. `a11y_log()` gives
-every update the surface has ever been handed, in order; an update is a difference, so a claim
-about the whole tree has to apply the sequence. `zgui-a11y` is a separate crate, added the same way.
+`a11y_log()` returns the retained updates, oldest first, and `take_a11y_log()` returns and clears
+them; `a11y_updates()` counts every update ever published. Each update is a difference against the
+earlier ones, so a claim about the whole tree must replay the log. The log keeps at most
+`A11Y_LOG_NODES` (2²⁰) nodes in total and drops the oldest updates beyond that, so a long-running
+test that needs every update should drain it as it goes.
 
-An update carries only what changed. Asserting that a number ticking over produced one node is a
-real assertion: it fails when a parent is re-published for no reason.
+`zgui_a11y::dump` prints an update as stable text for a golden file; add `zgui-a11y` as a
+dev-dependency to use it. See [Accessibility](/docs/building/accessibility#test-accessibility).
 
-## Asserting on the display list
+## Test what was drawn
 
-The display list is a value, and `zgui-testkit-scene` renders it as stable, diffable text. Nothing
-about the text depends on a driver version or on which fonts are installed.
+`zgui-testkit-scene` prints a finished scene (the display list) as stable text that does not depend
+on drivers or installed fonts:
 
 ```rust
 use zgui::bits::DamageSet;
@@ -665,106 +538,86 @@ fn the_counter_draws_what_it_should() {
     let harness = open();
     let window = &harness.app().windows()[0];
     let text = zgui_testkit_scene::transcript::of(window.scene(), &DamageSet::default());
-
     zgui_testkit_scene::dump::golden::assert_matches(&golden("counter_scene.txt"), text.as_str());
 }
 ```
 
-The shape:
-
 ```text
 scene viewport=256x256
 damage full
-passes 1 clip_layers=0 culled=0
-  pass 0 region=rect(32, 32, 64, 48) clip=[…] instanced=true composite_order=5 items=1
 primitives 12 batches=12
-  shadow order=1 bounds=rect(-5, -3, 266, 122) blur=4 color=premul_srgb[0, 0, 0, 0.25]
   quad order=2 bounds=rect(8, 8, 240, 96) fill=linear from=(0, 0) to=(256, 0) in oklab
   mono_sprite order=3 bounds=rect(24, 24, 8, 16) tile=mono:0#0 texels=rect(0, 0, 8, 16)
 ```
 
-Two properties hold, and neither is optional: the same scene writes the same bytes, and every field
-that can regress is written. A field at its default value is omitted, so a diff shows what moved
-rather than a wall of zeroes.
+The same scene always prints the same bytes. Fields at their default value are omitted, so a diff
+shows only what moved. `transcript::of` panics unless the scene is finished, which it is after a
+frame.
 
-`transcript::of` panics unless the scene is finished. A window's scene is finished after a frame.
+The crate also exports `CaptureRenderer` (records the scene, draws nothing), `MonoShaper`,
+`MonoRaster` and `FixedMetrics` (text without font files), and `TreeDump`/`to_text` (the interface
+for tree dumpers).
 
-| Item | Is |
+### Drive your own frame loop
+
+`zgui_testkit_scene::Harness` drives a frame loop over a `Fixture` whose body is a closure taking
+`&mut FrameCx`. It records damage and named subjects (`cx.record_subject("#card", ink)`), which the
+test reads back with `ink_of` and `damage_rects`. This is mainly for framework work: checking what
+one frame drew and what it cost. The harness holds the frame counters exclusively, so a second
+harness on the same thread panics.
+
+## What to test
+
+| Worth testing | Not worth testing |
 |---|---|
-| `transcript::of(scene, damage)` | the display list as text |
-| `Transcript::as_str()`, `lines()`, `line_count()` | reading it |
-| `CaptureRenderer` | a renderer that records the scene and draws nothing |
-| `MonoShaper`, `MonoRaster`, `FixedMetrics` | text with no font file on disk |
-| `TreeDump`, `to_text(tree)` | the seam any tree dumper is written against |
-| `golden::assert_matches(path, text)` | compare against a file, and the blessing rules |
+| what the view builds for a state: classes, attributes, text, semantics | that a view compiles |
+| what an input reaches, and what changed after the flush | exact pixels; assert on the display list |
+| the order of operations, through the transcript | the cascade, layout and shaping themselves |
+| what a listener asked for: focus, scroll, a focus trap | geometry the test declared with `place` |
+| timing on the virtual clock | real elapsed time |
+| geometry read from the window or the fragment tree | hand-written node numbers; let a golden hold them |
+| what a screen reader is told | framework behaviour such as Enter activating a button |
+| that unmounting removes what mounting added | frame counts in a component test |
 
-### A frame loop of your own
+## Check CSS support
 
-`Harness` and `Fixture` drive a frame loop directly, for a test about what one frame drew and what
-it cost. The frame body is a `Pipeline`, and a closure is one.
+The unpublished `zgui-conformance` suite generates `docs/parity.md` in the zgui repository. Of 250
+distinct longhands, 178 are implemented and 72 are parsed and cascaded but not yet implemented. A
+property counts as implemented only when setting it visibly changes layout, hit testing, clipping or
+paint. Check that file before relying on a property: a parsed-but-unimplemented one is accepted and
+then ignored.
 
-```rust
-use zgui_testkit_scene::{Fixture, FrameCx, Harness};
+## Reference
 
-let mut harness = Harness::new(Fixture::new(|cx: &mut FrameCx<'_>| {
-    // build the display list here
-    cx.damage_rect(ink);
-    cx.record_subject("#card", ink);
-}));
+### Test crates
 
-harness.frame();
-assert_eq!(harness.ink_of("#card").size.width, 64);
-assert!(harness.damage_rects().iter().any(|rect| rect.contains_rect(harness.ink_of("#card"))));
-```
+`zgui` does not re-export these. Add them as dev-dependencies.
 
-`ink_of` panics for a name that was never recorded, deliberately: an empty rectangle would make
-every containment assertion hold. `transcript()` panics before the first frame.
+| Crate | Runs | Use it to check |
+|---|---|---|
+| `zgui-testkit-view` | one component: its view, listeners and timers. No document, style, layout or window. | what the view built, what it asked the runtime for, what an input reached |
+| `zgui-platform-headless` | the whole application: document, cascade, layout, text, paint and the frame loop | geometry, the accessibility tree, the display list |
+| `zgui-testkit-scene` | golden files, scene transcripts, a frame loop you drive yourself, frame counters | what one frame drew and how much work it did |
 
-The harness also holds the frame counters, exclusively, for its whole life. Two harnesses on one
-thread panic rather than deadlock. A counter assertion needs a `Control` — a second run in which
-the same counter did move — so an assertion cannot pass because the mechanism it names never ran.
-This is framework machinery; an application rarely needs it.
+`zgui-testkit-view` turns on the `stub-backend` feature of `zgui-view` for the test build. That
+feature provides the in-memory tree; it is off in a normal build.
 
-## What the conformance suite proves
+### `zgui_testkit_view::Window`
 
-`zgui-conformance` is the instrument the framework's CSS support is measured with. It is not
-published, so an application cannot depend on it. What matters to an application author is what it
-publishes.
+Its public fields are `transcript`, `dom` (the `RecordingDom`), `host` (the `ScriptedHost`),
+`dom_handle`, `host_handle`, `scope`, `cx` (the build context) and `root`.
 
-- **Support is a fraction, not a boolean.** `docs/parity.md` is generated by the suite. It reports
-  250 distinct longhands behind the property names the engine generates, of which 176 are
-  implemented and 74 are parsed and cascaded but not yet implemented.
-- **A property counts as implemented only when a probe shows it changes something.** A module has
-  to declare that it reads the value, *and* setting it on a fixture has to visibly change the
-  fragment tree, hit-test answer, clip shape, paint lowering, or timed animation result. A
-  declaration with no observable consequence fails the build unless it is listed with a reason
-  the deterministic harness cannot construct, such as a real window or font collection.
-- **Reference tests are compared as fragment trees, not pixels.** No graphics device, no
-  anti-aliasing tolerance, and a failure that names the box and the edge that moved.
-- **The pass rate may never fall, and it is two numbers.** A run with fewer tests fails however
-  well the survivors did, because deleting or refusing a failing test is the easiest way to raise a
-  pass rate. Nine converted reference tests are committed today, across block flow, sizing,
-  flexbox, float and grid.
-
-Read `docs/parity.md` before you rely on a property. If it is listed as parsed and not implemented,
-your sheet will parse, the declaration will cascade, and nothing will act on it.
-
-## What is worth testing
-
-| Worth a test | Not worth a test |
+| Method | Does |
 |---|---|
-| What the view builds for a given state: classes, attributes, text, semantics. | That a view compiles. A view that compiles and does nothing compiles equally well. |
-| What a press, a key or a wheel reaches, and what changed after the flush. | Exact pixels. The display list is the artifact; a screenshot is not. |
-| The **order** of operations, through the transcript. | The cascade, layout and text shaping themselves. The framework's own suites and the parity suite own those. |
-| What a listener asked the runtime for: focus, scroll, a focus trap. | Geometry the test itself declared with `place`. |
-| Timing, on the virtual clock: a delay, a debounce, an interval. | Real elapsed time. Nothing in a test should sleep. |
-| Geometry the interface computed, read out of the fragment tree. | Node numbers written by hand. Let a golden hold them. |
-| What a screen reader is told, and that every relation resolves. | Frame counts in a component test. There is no frame loop at that layer. |
-| That unmounting removes what mounting added. | Framework behaviour a component does not implement, such as `Enter` activating a button. |
-
-Two habits are worth adopting early. Call `transcript.clear()` after mounting, so an assertion is
-about the interaction and not about the mount. Hold the anchor a mount returns, because dropping it
-unmounts the view and every later assertion then passes against nothing.
+| `Window::open()` | opens a window and installs the reactive runtime on this thread |
+| `Window::for_document(id)` | the same, for a test that needs two documents |
+| `place(node, x, y, width, height)` | declares a node's box, so input can be aimed at it |
+| `dispatcher()` | a `Dispatcher` for the root's subtree |
+| `click(x, y)` | clicks at a point and returns `Delivered` |
+| `frame()` | runs the reactive flush, which is what a frame does at this level |
+| `advance(by)` | moves the virtual clock, fires due timers, then runs a frame |
+| `now()` | the virtual clock, as a `Duration` |
+| `bounds_of(node)` | the box the test declared for a node |
 
 ## Next
 
@@ -772,7 +625,7 @@ unmounts the view and every later assertion then passes against nothing.
   <Card
     title="Shipping"
     href="/docs/building/shipping"
-    description="The release profile, the pinned toolchain downstream, and what to check before shipping."
+    description="Build for release and prepare each platform."
   />
   <Card
     title="Measurements"

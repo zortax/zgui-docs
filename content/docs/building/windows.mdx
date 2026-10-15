@@ -1,16 +1,18 @@
 ---
-title: Multiple windows
-description: Open and control windows, share application state, handle close requests, and choose the application exit policy.
+title: Windows
+description: Open and control windows, share state between them, handle close requests, choose when the application exits, and draw your own title bar.
 ---
 
-Each zgui window owns a document, a view scope, layout state, paint caches, and presentation state.
-Windows in the same application can share reactive state and use the same graphics device.
+An application starts with one window, the **primary window**, which is the one passed to
+`App::run`. You can open more with `use_windows()`, control any window through its `WindowHandle`,
+and share reactive state between them.
 
-The window passed to `App::run` is the **primary window**. Open more windows with `use_windows()`.
+Each window has its own document, view scope, layout state and paint caches. All windows in an
+application share one graphics device.
 
 ## Open a window
 
-Call `use_windows()` in a component body. Capture the returned handle in a listener, effect, timer,
+Call `use_windows()` in a component body, and use the returned handle in a listener, effect, timer
 or other UI-thread callback:
 
 ```rust
@@ -44,20 +46,39 @@ fn Main() -> impl IntoView {
 }
 ```
 
-`open` returns a `WindowHandle` immediately. The platform creates the window on the next event-loop
-turn. `handle.is_open()` is false until that happens. Calls made on a pending or closed handle do
-nothing.
+`open` returns a `WindowHandle` at once. The platform creates the window on the next event-loop
+turn, so `handle.is_open()` is false until then. Calls on a pending or closed handle do nothing.
 
-Because creation is deferred, `open` cannot return a platform error. If an additional window cannot
-open, zgui logs the error under `zgui::app`, leaves its handle unopened, and keeps the other windows
-running. A failure to open the primary window is returned by `App::run`.
+Because creation is deferred, `open` cannot return a platform error. If a window fails to open,
+zgui logs the error under the `zgui::app` target, leaves the handle unopened, and keeps the other
+windows running. A failure to open the primary window is returned by `App::run`.
 
-The view argument is `FnMut`, not `FnOnce`. A platform suspension removes native surfaces. On
-resume, zgui creates the requested windows again and rebuilds their views.
+The view closure is `FnMut`. When the platform suspends, native surfaces go away; on resume, zgui
+recreates the windows and builds their views again.
 
-## Use the current window
+## Configure a window
 
-`use_window()` returns the window in which the calling component runs:
+`WindowOptions` sets a new window's title, size, decorations, position and other properties before
+it opens. The primary window is configured on `app()` with the same methods, from `with_title` to
+`with_theme`. [All `WindowOptions` methods](#windowoptions-methods) are listed at the end of this
+page.
+
+- **Style sheets.** The application style sheet applies to every window. A sheet set with
+  `with_stylesheet` is cascaded after it, so use it for changes local to one window.
+- **Application identifier.** Set it once with `App::with_application_id`. It applies to every
+  window, and the desktop uses it for grouping, icons and window rules.
+- **Transparency.** A window with `with_transparent(true)` is composed as premultiplied colour:
+  pixels nothing paints have zero alpha, so the desktop shows through rounded corners and gaps.
+  Text in a transparent window uses greyscale antialiasing instead of subpixel antialiasing.
+- **Colour scheme.** The `ColorScheme` that `with_theme` takes is `zgui::platform::ColorScheme`;
+  the prelude uses that name for view theming.
+
+`WindowOptions` creates ordinary top-level windows only. Menus, tooltips and dropdowns are drawn
+inside their owner window; see [Overlays and portals](/docs/building/overlays-and-portals).
+
+## Control the current window
+
+`use_window()` returns a handle to the window the calling component runs in:
 
 ```rust
 #[component]
@@ -84,75 +105,35 @@ fn WindowStatus() -> impl IntoView {
 }
 ```
 
-`try_use_window()` returns `None` instead of panicking when no window scope exists.
-`try_use_windows()` does the same for the application scope.
+`try_use_window()` and `try_use_windows()` return `None` instead of panicking outside a window or
+application scope.
 
-### Reactive window state
+A `WindowHandle` has two kinds of methods:
 
-These `WindowHandle` methods return signals:
+- **State signals**, such as `size()`, `focused()` and `maximized()`, that your views can read
+  reactively.
+- **Commands**, such as `set_title`, `request_size` and `close`, that ask the desktop to change the
+  window.
 
-| Method | Value |
-|---|---|
-| `size()` | content size in CSS pixels |
-| `scale()` | device pixels per CSS pixel |
-| `focused()` | whether this window has keyboard focus |
-| `occluded()` | whether the desktop says the whole window is hidden |
-| `maximized()` | whether the window is maximized |
-| `fullscreen()` | the current `FullscreenMode`, if any |
+A command is a request, not a result. To resize, call `request_size`, then read `size()` to see
+what the desktop accepted. Desktops differ: unsupported commands and commands on closed windows do
+nothing. Read `WindowHandle::capabilities()` when you need to hide a command the desktop cannot
+perform. For example, Wayland compositors place windows themselves, so `set_position` does nothing
+there and `position()` returns `None`.
 
-Read a signal with `get()` when the view must update. A size request is not a size result. Call
-`request_size`, then read `size()` to learn what the desktop accepted.
+The signals live as long as the handle, not as long as the component that opened the window. A
+component can open a window, store its handle, and unmount while the window stays open.
 
-### Window commands
+`WindowHandle` belongs to the UI thread. Do not send it to background work; post the action back to
+the UI thread instead.
 
-The handle can change the title, size limits, position, resizability, decorations, maximized state,
-fullscreen mode, stacking level, icon, color scheme, cursor, focus, and attention request. It can
-also minimize or close the window.
-
-Platform support differs. Unsupported operations and operations on closed windows are no-ops. Use
-`WindowHandle::capabilities()` when the interface must hide an unsupported command. For example,
-Wayland compositors choose window positions, so `set_position` does nothing and `position()` returns
-`None` there.
-
-`WindowHandle` is a UI-thread handle. Do not send it to background work. Post the required action
-back to the UI thread.
-
-## Configure a new window
-
-`WindowOptions` configures a window before it opens:
-
-| Method | Sets |
-|---|---|
-| `new`, `with_title` | title |
-| `with_size`, `with_min_size`, `with_max_size` | CSS-pixel size constraints |
-| `with_resizable` | whether the user can resize the window |
-| `with_decorations` | `Decorations::Full`, `None`, or `NoTitleBar` |
-| `with_transparent` | whether the surface can show transparent pixels |
-| `with_position` | requested desktop position |
-| `with_maximized`, `with_fullscreen` | initial display state |
-| `with_level` | requested stacking level |
-| `with_icon` | window icon where the desktop accepts one |
-| `with_theme` | light or dark preference for this window |
-| `with_stylesheet` | a stylesheet for this window only |
-
-The application stylesheet applies to every window. A window stylesheet is cascaded after it. Use
-the application stylesheet for shared components and a window stylesheet for local changes.
-
-The application identifier also applies to every window. Set it once with
-`App::with_application_id`; the desktop uses it for grouping, icons, and window rules.
-
-`ColorScheme` for `with_theme` is available as `zgui::platform::ColorScheme`; the prelude keeps that
-name for view theming.
-
-`WindowOptions` creates toplevel windows only. The low-level platform contract also defines pop-up
-and layer surface roles. The native Wayland backend supports XDG pop-ups and supports layer surfaces
-when the compositor offers wlr layer shell. `Windows::open` and the built-in overlay components do
-not select those roles yet; menus, tooltips, and dropdowns remain inside their owner window.
+[Window state signals](#window-state-signals) and [window commands](#window-commands) are listed in
+full at the end of this page.
 
 ## Share state between windows
 
-A context provided inside a window belongs to that window. Other windows cannot resolve it. Put
-shared state in the application scope with `App::with_context`:
+A context provided inside a window belongs to that window. To share state, provide it in the
+application scope with `App::with_context`:
 
 ```rust
 use zgui::prelude::*;
@@ -170,33 +151,24 @@ fn main() -> Result<(), zgui::Error> {
 Every window is mounted below this scope, so `expect_context::<SharedCount>()` returns the same
 signal in all of them. A write in one window schedules frames for the other windows that read it.
 
-Each window has a separate document identity. A `NodeRef`, node identifier, or document-local
-context from one window cannot address another window. Share model state, not document handles.
+Each window has its own document. A `NodeRef`, a node identifier or a window-local context from one
+window cannot address another window. Share model state, not document handles.
 
-Application-scope state survives platform suspension. State created in a window scope does not;
-the window view is rebuilt after resume.
+Application-scope state survives platform suspension. Window-scope state does not, because the
+window's view is rebuilt on resume.
 
-## List and address windows
+## Find open windows
 
-`use_windows()` returns a `Windows` handle:
-
-| Method | Result |
-|---|---|
-| `open(options, view)` | a handle for the requested window |
-| `all()` | a snapshot of the open windows |
-| `watch()` | a signal containing the open windows |
-| `capabilities()` | the desktop's window capabilities |
-| `quit()` | an explicit application-exit request |
-
-`WindowHandle::id()` is stable for the window's whole requested life, including suspension and
-resume. Compare IDs when a command must exclude the current window.
+`use_windows().all()` returns a snapshot of the open windows, and `watch()` returns a signal
+containing them. `WindowHandle::id()` stays the same for the window's whole life, including
+suspension and resume. Compare ids when a command must skip the current window.
 
 ## Handle close requests
 
-A close request from the user consults every registered callback. If any callback returns
+When the user asks to close a window, zgui runs every registered close callback. If any returns
 `CloseResponse::Veto`, the window stays open.
 
-Register a window-wide callback while opening it:
+Register a callback for the window's whole life when you open it:
 
 ```rust
 use std::{cell::Cell, rc::Rc};
@@ -215,51 +187,183 @@ let editor = windows.open(
 );
 ```
 
-Give the editor another clone of `dirty` so it can clear the flag after a save. The callback in
-`WindowOptions` is retained during suspension. It must not capture state that belongs only to the
-disposed window scope. An application-scope signal from `App::with_context` is also safe.
+Give the editor another clone of `dirty` so it can clear the flag after saving. The callback in
+`WindowOptions` survives suspension, so it must not capture state that belongs to the window scope.
+Application-scope state from `App::with_context` is safe.
 
-Use `on_close_request` inside a component when the question exists only while that component is
-mounted. It returns a `CloseGuard`. Keep the guard in the component's scope; dropping it unregisters
-the callback.
+For a check that applies only while a component is mounted, call `on_close_request` inside the
+component. It returns a `CloseGuard`; dropping the guard unregisters the callback. To keep it for
+the component's life:
 
-`WindowHandle::close()` is different. It is an application command and bypasses close callbacks.
-The application has already decided to close that window.
+```rust
+let guard = on_close_request(move || CloseResponse::Veto);
+on_cleanup_local(move || drop(guard));
+```
+
+`WindowHandle::close()` does not run close callbacks. Use it when the application has already
+decided to close the window.
+
+When a window closes, zgui unmounts its view. Every scope the view created is disposed in tree
+order, so `on_cleanup_local` callbacks and scoped tasks end with the window, while application-scope
+state is still alive.
 
 ## Choose when the application exits
 
-The default is `ExitPolicy::WhenAllWindowsClose`. Set another policy on the application builder:
+The default is `ExitPolicy::WhenAllWindowsClose`. Set another on the application builder with
+`with_exit_policy`:
 
-| Policy | Exit condition |
+| Policy | Exits when |
 |---|---|
-| `WhenAllWindowsClose` | the last requested window closes |
+| `WhenAllWindowsClose` | the last window closes |
 | `WhenPrimaryCloses` | the window passed to `run` closes |
 | `Explicit` | code calls `use_windows().quit()` |
 
-Use `WhenPrimaryCloses` when inspectors or palettes must not outlive the main window. Use `Explicit`
-only when something outside the window set, such as a tray integration, can open a window or quit
-the application.
+Use `WhenPrimaryCloses` when inspectors or palettes should not outlive the main window. Use
+`Explicit` when the application should keep running with no windows, as many macOS applications do.
+To hide a window instead of closing it, veto the close request and call `set_visible(false)`, then
+show it again from `on_reopen` when the user clicks the dock icon.
 
-## Draw custom window decorations
+`on_exit`, `on_reopen` and the macOS application menu (`with_menu`, `on_menu`) are covered in
+[shipping on macOS](/docs/building/shipping#add-an-application-menu).
 
-`Decorations` selects how much chrome the desktop draws:
+## Draw your own title bar
 
-| Value | Desktop result | What the application supplies |
+`Decorations` chooses how much frame the desktop draws:
+
+| Value | The desktop draws | The application supplies |
 |---|---|---|
 | `Full` | title bar and frame | nothing |
-| `None` | no title bar or frame | title bar, move and resize gestures, and window controls |
-| `NoTitleBar` | the macOS frame, shadow, resize edges, and window buttons, without its title bar | a draggable title bar around the desktop buttons |
+| `None` | nothing | title bar, move and resize gestures, window controls |
+| `NoTitleBar` | on macOS: the frame, shadow, resize edges and window buttons, without the title bar | a title bar around the desktop's buttons |
 
-Non-macOS desktops cannot keep only the frame. They treat `NoTitleBar` as `None`.
-Request `NoTitleBar` in `WindowOptions`; macOS cannot apply it after a window opens. A later
-`set_decorations(Decorations::NoTitleBar)` request therefore becomes `Full` there.
+Desktops other than macOS cannot keep the frame without the title bar, so they treat `NoTitleBar`
+as `None`. Request `NoTitleBar` when the window is created; macOS cannot apply it afterwards, so a
+later `set_decorations(Decorations::NoTitleBar)` gives a full frame there.
 
-When the application supplies chrome:
+Use the handle's drag handlers on your own title bar:
 
-- Put `window.move_drag_handler()` on the title bar.
-- Put `window.resize_drag_handler(edge)` on each resize edge or corner.
-- Put `window.no_drag_handler()` on controls inside the draggable title bar.
-- Use `window.maximized()` and `window.fullscreen()` to hide resize grips when they cannot apply.
+```rust
+use zgui::prelude::*;
 
-These handlers ask the desktop to take over the gesture. They also work on Wayland, where an
-application cannot move itself by setting coordinates.
+#[component]
+fn TitleBar() -> impl IntoView {
+    let window = use_window();
+
+    view! {
+        row(class = "titlebar", on:pointer_down = window.move_drag_handler()) {
+            label() {"Notes"}
+            control(
+                class = "close",
+                tabindex = Focus::Sequential,
+                a11y:label = "Close",
+                // Stops the press from reaching the title bar and starting a move.
+                on:pointer_down = window.no_drag_handler(),
+                on:click = {
+                    let window = window.clone();
+                    move |_| window.close()
+                }
+            ) {"✕"}
+        }
+    }
+}
+```
+
+- `move_drag_handler()` starts a desktop-driven move on press. A double press calls
+  `title_bar_double_click()`, which maximizes or restores the window, or on macOS does what the user
+  chose in System Settings.
+- `resize_drag_handler(edge)` starts a resize from a `ResizeEdge`. Put one on each edge and corner
+  strip.
+- `no_drag_handler()` goes on controls inside the title bar.
+- Hide resize strips while `maximized()` or `fullscreen()` says they cannot apply.
+
+The handlers do not borrow the `WindowHandle`, so you can call them directly in `view!` without
+cloning the handle first. They also work on Wayland, where a window cannot move itself by setting
+coordinates. `examples/csd.rs` is a complete client-side-decorated window.
+
+### Place the macOS window buttons
+
+With `NoTitleBar`, macOS still draws its close, minimize and zoom buttons over the top-left of the
+content. `TitleButtons` places them so they line up with your own bar:
+
+```rust
+app()
+    .with_decorations(Decorations::NoTitleBar)
+    // Buttons start 16 px from the left edge, centred in a 40 px band along the top.
+    .with_title_buttons(TitleButtons::new(16.0, 40.0))
+    .run(|| view! { Main() })
+```
+
+Make your title bar the same height as the band, and leave room on the left for the buttons. macOS
+re-applies the placement after resizes and when leaving full screen. Other desktops ignore
+`with_title_buttons`.
+
+## `WindowOptions` methods
+
+| Method | Sets |
+|---|---|
+| `new`, `with_title` | title |
+| `with_size`, `with_min_size`, `with_max_size` | size and size limits, in CSS pixels |
+| `with_resizable` | whether the user can resize the window |
+| `with_decorations` | `Decorations::Full`, `None` or `NoTitleBar` |
+| `with_title_buttons` | where macOS places its window buttons with `NoTitleBar` |
+| `with_transparent` | whether the window can show what is behind it |
+| `with_position` | requested position on the desktop |
+| `with_maximized`, `with_fullscreen` | initial display state |
+| `with_level` | requested stacking level |
+| `with_icon` | window icon, where the desktop accepts one |
+| `with_theme` | light or dark preference for this window |
+| `with_stylesheet` | a style sheet for this window only |
+| `on_close_request` | a close callback for the window's whole life |
+
+## Window state signals
+
+| `WindowHandle` method | Value |
+|---|---|
+| `size()` | content size in CSS pixels |
+| `scale()` | device pixels per CSS pixel |
+| `focused()` | whether the window has keyboard focus |
+| `occluded()` | whether the desktop reports the whole window as hidden |
+| `maximized()` | whether the window is maximized |
+| `fullscreen()` | the current `FullscreenMode`, if any |
+
+## Window commands
+
+| `WindowHandle` method | Effect |
+|---|---|
+| `set_title` | Changes the title. |
+| `request_size`, `set_min_size`, `set_max_size` | Requests a size or size limits, in CSS pixels. |
+| `set_position`, `position` | Moves the window, or reads where it is. |
+| `set_resizable`, `set_decorations` | Changes resizability or the desktop frame. |
+| `set_maximized`, `toggle_maximized`, `minimize`, `set_fullscreen` | Changes the display state. |
+| `title_bar_double_click` | Does what a double click on a title bar does on this desktop. |
+| `set_visible` | Hides or shows the window. A hidden window keeps its document, so showing it again costs one frame. |
+| `set_level` | Requests a stacking level. |
+| `set_icon`, `set_theme`, `set_cursor` | Changes the icon, colour scheme or cursor. |
+| `focus`, `request_attention` | Asks for keyboard focus (the desktop may refuse), or asks the desktop to flag the window. |
+| `begin_move_drag`, `begin_resize_drag` | Hands a move or resize gesture to the desktop. |
+| `close` | Closes the window without running close callbacks. |
+
+## `Windows` methods
+
+| `use_windows()` method | Result |
+|---|---|
+| `open(options, view)` | a handle for the requested window |
+| `all()` | a snapshot of the open windows |
+| `watch()` | a signal containing the open windows |
+| `capabilities()` | what the desktop can do with windows |
+| `quit()` | asks the application to exit |
+
+## Next
+
+<Cards>
+  <Card
+    title="Overlays and portals"
+    href="/docs/building/overlays-and-portals"
+    description="Draw menus, popovers and dialogs above the rest of a window."
+  />
+  <Card
+    title="Shipping an application"
+    href="/docs/building/shipping"
+    description="Release builds, the application identity, the macOS menu, and per-platform notes."
+  />
+</Cards>

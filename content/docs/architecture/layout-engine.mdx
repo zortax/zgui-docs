@@ -1,256 +1,148 @@
 ---
 title: The layout engine
-description: How a styled document becomes boxes, how Taffy is driven, and how fragments, hit regions and paint order are produced without rebuilding them.
+description: How zgui-layout builds and patches the box tree, drives the retained Cephal engine incrementally and in parallel, and produces fragments, paint order and the hit index.
 ---
 
-This page is about `zgui-layout`: the crate that turns computed styles into boxes, sizes and
-positions them, and produces the geometry every stage after it reads. It assumes
-[the guide](/docs/learn/layout) and the [architecture overview](/docs/architecture/overview).
+`zgui-layout` turns computed styles into boxes, sizes and positions them with the Cephal layout
+engine, and produces **fragments**: the geometry that painting, hit testing and accessibility read.
+It runs in two steps of [the frame](/docs/architecture/the-frame), after the
+[restyle](/docs/architecture/style-engine) and before paint:
 
-## Three levels
+| Step | Work |
+|---|---|
+| `f.boxes` | Patch the box tree for the elements whose boxes changed. |
+| `f.layout` | Measure and arrange boxes, then compose fragments, collect damage and update the hit index. |
 
-An element, a box and a fragment are three different things, and CSS forces the distinction.
+The sections follow that order: the box tree and how it is patched, the layout pass and its caches,
+then fragments and what is derived from them. The user-facing model is in
+[Layout](/docs/learn/layout).
 
-| Level | Lives in | Named by | Relationship |
+## Elements, boxes and fragments
+
+CSS separates three levels, and the crate keeps them separate.
+
+| Level | Crate and module | Key | Relationship |
 |---|---|---|---|
-| Element | `zgui-dom` | `NodeKey` | what an author wrote |
-| Box | `zgui-layout`, module `boxtree` | `BoxKey` | one element generates none, one, or several |
-| Fragment | `zgui-layout`, module `fragment` | `FragKey` | one box produces one piece per line, column or page |
+| Element | `zgui-dom` | `NodeKey` | what the author wrote |
+| Box | `zgui-layout::boxtree` | `BoxKey` | one element generates zero, one or several boxes |
+| Fragment | `zgui-layout::fragment` | `FragKey` | one box produces one fragment per line, column or page |
 
-`BoxKey` is re-exported from `zgui-dom` rather than declared here (`crates/zgui-layout/src/lib.rs`),
-because the document records which boxes each element generated. There is one box identity in the
-workspace, not two.
+`BoxKey` is declared in `zgui-dom` (`zgui_dom::side::BoxKey`) and re-exported here, because the
+document records which boxes each element generated. There is one box identity in the workspace.
 
-The rule that follows is the crate's whole reason for existing: **every stage after layout reads
-fragments and never the layout algorithms' own results.** Painting, hit testing and accessible
-geometry all read the fragment tree. That is what lets the layout algorithm underneath be replaced
-without touching any of them.
+Every stage after layout reads **fragments**, never the layout engine's own results. Painting, hit
+testing and accessible geometry all read the fragment tree, so none of them depends on the layout
+engine's types.
 
 ## The box tree
 
-One box is a `BoxNode` (`crates/zgui-layout/src/node/box_node.rs`). The fields that decide behaviour:
+A box is a `BoxNode` (`crates/zgui-layout/src/node/box_node.rs`):
 
-| Field | Type | What it decides |
+| Field | Type | Meaning |
 |---|---|---|
 | `source` | `Option<NodeKey>` | the element it came from; `None` for an anonymous box |
-| `pseudo` | `Option<PseudoKind>` | whether it realises `::before` or `::after` |
-| `children` | `Vec<BoxKey>` | **layout order** |
-| `paint_children` | `Vec<BoxKey>` | **document order** |
-| `fc` | `FormattingContext` | the rules it lays its own children out by |
-| `parent_fc` | `FormattingContext` | the rules the box above lays *it* out by |
-| `style` | `ComputedStyle` | a clone of the cascade result, shared with the element |
-| `kind` | `BoxKind` | element, anonymous wrapper, text run or marker |
-| `block_level` | `bool` | how it takes part in the context around it |
-| `text` | `Option<Box<str>>` | the characters a run lays out |
-| `painted` | `PaintedContent` | whether the fragment paints an ordinary box, vector, replaced content, or custom content |
+| `pseudo` | `Option<PseudoKind>` | set when it realises `::before` or `::after` |
+| `parent` | `Option<BoxKey>` | the layout parent |
+| `children` | `Vec<BoxKey>` | children in **layout order** |
+| `paint_children` | `Vec<BoxKey>` | children in **document order** |
+| `fc` | `FormattingContext` | how it lays out its own children |
+| `parent_fc` | `FormattingContext` | how its parent lays it out |
+| `style` | `ComputedStyle` | the cascade result, shared with the element |
+| `kind` | `BoxKind` | `Element`, `AnonymousBlock`, `AnonymousInlineRoot`, `TextRun` or `Marker` |
+| `block_level` | `bool` | whether it participates as block-level |
+| `text` | `Option<Box<str>>` | the characters of a text run |
+| `painted` | `PaintedContent` | `Box`, `Vector`, `Replaced` or `Custom` |
 
-Replaced-content metadata and custom-element registry references are rare. They live in separate,
-sparse columns with 64-box pages. An ordinary box pays only for the `painted` discriminator. It
-does not reserve space for a replaced identifier, natural dimensions, or custom revisions.
+Rare per-box data (replaced-content metadata, custom-element references) lives in sparse
+side columns paged in blocks of 64 boxes, so an ordinary box pays only for the `painted` tag.
 
-The two child lists are different lists with different orders, and both are needed. The layout list
-has `order` applied, `display: contents` flattened, and out-of-flow boxes moved onto the box that
-positions them. The paint list is document order, which is what painting, hit testing and accessible
-geometry need. Conflating them corrupts one of the two.
+The two child lists differ:
 
-`FormattingContext` has nine values: `None`, `Block`, `Flex`, `Grid`, `Inline`, `Replaced`,
-`Atomic`, `Table`, `MultiColumn`. `Table` and `MultiColumn` are laid out as block containers today
-(`crates/zgui-layout/src/tree/partial.rs`), which keeps their children on the page rather than at
-zero. Only `Block`, `Flex` and `Grid` answer `FormattingContext::is_container`; the other three reach
-the leaf path, where a size comes from a measurement instead of from an algorithm.
+- **`children`** (layout order) has `order` applied, `display: contents` flattened, and
+  out-of-flow boxes moved onto the box that positions them.
+- **`paint_children`** keeps document order, for accessible geometry and anything else that
+  follows the document.
 
-### How many boxes an element generates
+`FormattingContext` has ten values. How Cephal sees each one:
 
-Every case is settled once, while the tree is built, never while it is walked — the walk runs inside
-the layout algorithms' innermost loops (`crates/zgui-layout/src/boxtree/mod.rs`).
+| Value | Cephal treatment |
+|---|---|
+| `Block`, `Table`, `MultiColumn` | block layout (tables and multi-column are laid out as blocks) |
+| `Flex`, `Grid` | the flex and grid algorithms |
+| `Atomic` | the algorithm of its inner display (flex, grid or flow root) |
+| `Inline`, `Replaced`, `Custom` | leaves; zgui supplies the size |
+| `None` | not laid out |
+
+### Boxes generated per element
+
+The builder settles every case while it builds the tree, so the layout walk never has to filter
+(`crates/zgui-layout/src/boxtree/`).
 
 | Case | Boxes |
 |---|---|
 | `display: none` | none |
-| `display: contents` | none; the children splice into the parent's list |
-| an ordinary element | one |
-| an element with `::before` and `::after` | three, plus one text run per generated string |
-| a list item | one, plus a marker box |
-| a text node | one text run; an empty one generates none |
+| `display: contents` | none; its children are spliced into the parent's list (`boxtree/contents.rs`) |
+| ordinary element | one |
+| element with `::before` and `::after` | three, plus one text run per generated string |
+| list item | one, plus a marker box |
+| text node | one text run; an empty text node generates none |
 
-`classify` (`crates/zgui-layout/src/boxtree/classify.rs`) reads `display` and `position` once and
-answers five questions: participation, formatting context, whether the box is out of flow, whether
-it establishes a containing block, and whether it generates a mark.
+`classify` (`boxtree/classify.rs`) reads `display` and `position` once and returns a
+`Classification`: participation, formatting context, whether the box is out of flow, whether it is
+positioned, and whether it is a list item.
 
 ### Anonymous boxes
 
-An **anonymous box** is a box CSS requires that no element names. `BoxKind::is_anonymous` names four:
-`AnonymousInlineRoot`, `TextRun`, `Marker` and `AnonymousBlock`. The builder produces the first
-three; `AnonymousBlock` — the wrapper around the block-level children of a container that also has
-inline-level ones — is declared and not yet constructed.
+`BoxKind::is_anonymous` covers `AnonymousBlock`, `AnonymousInlineRoot`, `TextRun` and `Marker`.
+The builder creates the last three. `AnonymousBlock` (the wrapper for block-level children mixed
+with inline-level ones) is declared but not yet constructed.
 
-The one a document is full of is `AnonymousInlineRoot`. A block container whose children are
-inline-level does not lay them out itself. Each maximal run of inline-level, in-flow children is
-wrapped in one anonymous box, and that box establishes the inline formatting context the run is
-broken into lines in (`crates/zgui-layout/src/boxtree/anonymous.rs`). Without the wrapper the run is
-handed to an algorithm that puts every child on a line of its own, which is what a paragraph must
-never do.
+`AnonymousInlineRoot` is the common one. `wrap_inline_runs` (`boxtree/anonymous.rs`) wraps each
+maximal run of in-flow inline-level children of a block container in one anonymous box, which
+establishes the inline formatting context that breaks the run into lines.
 
-```rust
-pub fn wrap_inline_runs(
-    store: &mut LayoutStore,
-    parent_style: &ComputedStyle,
-    children: &[Placed],
-) -> Vec<BoxKey>
-```
+- A container whose children are all block-level is returned unchanged and allocates nothing.
+- An out-of-flow child ends the current run. It keeps its place in paint order but is left out of
+  the layout list.
+- A box that already establishes an inline formatting context is not wrapped again.
 
-Three properties of the wrapper are load-bearing.
+The wrapper's style is `zgui_css::inherited_style(parent)`: the parent's inherited properties, and
+initial values for everything else. Using the parent's full style would paint its border,
+background and padding twice. Inherited values are shared, not copied, because text brush slots are
+keyed by the identity of the cascade result a colour came from (see
+[`MeasureContent`](#measurecontent)).
 
-- A container whose children are **all** block-level is returned unchanged and allocates nothing.
-- An out-of-flow child **flushes** the run in progress: it keeps its place in paint order and is
-  kept out of the layout list.
-- A box that already establishes an inline formatting context holds its children directly. Wrapping
-  it again would nest a context inside itself.
+### Container rules
 
-The wrapper's style is `inherited_style(parent)` — inherited properties from the parent, everything
-else at its initial value. It is deliberately **not** the parent's style: a wrapper that inherited
-borders, background or padding would paint them a second time. What it inherits it *shares* rather
-than copies, and that matters beyond memory. A run's glyphs claim a brush slot against the identity
-of the cascade result the colour came from, so a wrapper holding an equal copy would take every
-string in the document out of reach of the colour written for it.
+`Builder::link` (`boxtree/build.rs`) applies three container rules when it links children:
 
-### Blockification, `order` and out-of-flow re-parenting
+- **Blockification.** Children of a flex or grid container become block-level. A text run that
+  becomes a flex item stays `FormattingContext::Inline`, so its characters still get line layout.
+- **`order`.** Applied once, as a stable sort of the layout child list (`boxtree/order.rs`). The
+  paint list stays in document order. A list already in order is not sorted.
+- **Out-of-flow re-parenting.** Cephal positions an absolutely positioned child against its direct
+  parent; CSS uses the nearest positioned ancestor. So an out-of-flow box is removed from the
+  layout list of the box it was written in and appended to the layout list of its containing block
+  (`boxtree/absolute.rs`). When no ancestor is positioned, the containing block is the **root box**,
+  which acts as the initial containing block. This holds for full builds and for incremental
+  splices. Re-parenting runs once after the whole tree is built, because a containing block's child
+  list is not final until its subtree is.
 
-Three more decisions belong to the container and are made when its children are linked
-(`Builder::link` in `crates/zgui-layout/src/boxtree/build.rs`).
+`establishes_containing_block` consults only `position`. Transforms, filters and `will-change`,
+which also create a containing block for fixed descendants in CSS, are not applied by the box tree.
 
-- **Blockification.** A flex or grid container's children are block-level whatever their own
-  `display` said, because there is no line for an inline-level box to sit in. A text run that becomes
-  a flex item is block-level and still text: it keeps `FormattingContext::Inline`, holding itself,
-  because turning it into a block container would leave its characters with nothing to lay them out.
-- **`order`.** No layout algorithm here implements it. It is applied once, by a stable sort of the
-  layout child list (`crates/zgui-layout/src/boxtree/order.rs`), leaving the paint list in document
-  order. A list already in order is not sorted at all.
-- **Out-of-flow re-parenting.** The layout algorithms resolve an absolutely positioned child against
-  its immediate parent; CSS resolves it against the nearest positioned ancestor. So an out-of-flow
-  box is kept out of the layout list of the box it was written inside and appended to the layout list
-  of the box that positions it (`crates/zgui-layout/src/boxtree/absolute.rs`). Its entry in the paint
-  list stays where it was written. Attachment runs once, after the whole tree is built, because a
-  containing block's child list is not final until its subtree is.
+## Updating the box tree
 
-## Taffy, and what each side owns
+Most frames change a few elements. Rebuilding the whole box tree gives every box a new key, which
+defeats fragment reuse, recorded paintings, hit-index entries and damage tracking: every fragment
+compares as changed and the damage grows to the whole window. So the `f.boxes` step patches the
+existing tree instead. Each full build is counted in `Counter::BoxTreeBuilds`. The first build
+counts too; after that, the counter should rarely move.
 
-Taffy is the layout algorithm library this crate drives. It implements flexbox, grid and block flow
-over a tree it does not own: the caller implements traits that answer "what is this node's style",
-"lay this child out", "what does your cache hold". zgui implements those traits for `LayoutTree` and
-supplies everything else.
+### Collecting owed rebuilds
 
-The feature set is pinned in the workspace manifest and asserted by the versions ledger.
-
-```toml
-taffy = { version = "0.12.2", default-features = false, features = [
-    "std", "flexbox", "grid", "block_layout", "float_layout",
-    "content_size", "calc", "detailed_layout_info",
-] }
-```
-
-| Feature | Why it is set this way |
-|---|---|
-| `default-features = false` | `taffy_tree`, taffy's own tree storage, is unwanted: the box tree is this crate's |
-| `std` | not optional in practice — taffy 0.12.2's `detailed_layout_info` names `Box` through the std prelude |
-| `flexbox`, `grid`, `block_layout` | the three formatting contexts with algorithms of their own |
-| `float_layout` | losing it silently deletes floats |
-| `content_size` | losing it silently zeroes every intrinsic size |
-| `calc` | `calc()` handles are resolved through `resolve_calc_value` |
-| `detailed_layout_info` | grid track and line information the crate reads back |
-
-The division of labour:
-
-| Taffy owns | zgui owns |
-|---|---|
-| flexbox, grid and block algorithms | the box tree, its identities and its two child lists |
-| the per-node cache protocol | the exact full-layout and size caches, and persistent intrinsic answers |
-| the layout input and output types | `StyleRef`, a borrow that answers taffy's style questions |
-| track sizing, item placement, margin collapse | inline, replaced and atomic-inline leaves |
-| | device-pixel snapping, fragments, hit index, stacking order |
-
-**No layout-engine style is ever built.** The algorithms read styles through traits, and what
-implements those traits is `StyleRef` (`crates/zgui-layout/src/style/`) — a small borrow of one box's
-computed style. Lowering a computed style into a second struct, per box, per frame, would cost more
-than the layout it feeds.
-
-The traits zgui implements on `LayoutTree<'a, C>` are `LayoutPartialTree`, `LayoutFlexboxContainer`,
-`LayoutGridContainer`, `LayoutBlockContainer` and `CacheTree`. `compute_block_child_layout` is
-overridden rather than left to its default, which drops the block context: floats and margin
-collapsing degrade silently across nested blocks without it, with no error and no sign in any result.
-
-The entry points:
-
-```rust
-pub fn layout_root(&mut self, viewport: taffy::Size<f32>) -> bool          // ungated
-pub fn relayout_root(&mut self, viewport: taffy::Size<f32>) -> gate::Relayout
-pub fn layout_viewport(&mut self, width: f32, height: f32) -> bool
-```
-
-`layout_root` first measures content-keyword boxes that do not hold an intrinsic answer. It finds
-them through a maintained roster. A document with no content keywords does not require a tree walk.
-It then calls `taffy::compute_root_layout`.
-
-The pass repeats when `scroll_region::auto::revise` changes a scrollbar gutter, up to
-`scroll_region::auto::MAX_PASSES`, which is 2. This operation also uses a roster. It examines only
-boxes with undecided `overflow: auto`; a document with none does not enter the fixpoint. The layout
-pass does no rounding. Rounding and fragment composition both need the cumulative absolute origin,
-so one later walk performs both operations.
-
-### Parallel batches
-
-One `LayoutPool` belongs to the application and is shared by its windows. It has at most eight
-workers. Windows still enter layout one at a time; the pool divides only independent child
-subtrees inside that pass.
-
-A batch runs in parallel only when it has at least eight cold child roots and its planned subtrees
-contain at least 256 boxes. Cache-hot batches stay serial. Nested worker batches also stay serial,
-and installing a custom layout source disables this path because the custom seam has no `Sync`
-contract.
-
-Before the workers start, the executor divides the layout store into disjoint mutable views. Each
-worker updates its own subtree in place and owns a forked text measurer. Results are reassembled in
-request order. There is no copied tree and no commit phase.
-
-`MeasureContent::fork_measurer(owned)` and `absorb_measurer(worker)` are the public extension seam.
-Their default keeps a batch serial. A custom measurer that opts in returns a `Send`
-`WorkerMeasure`, gives it ownership of the named paragraph results, and absorbs its results after
-the batch. A fork must return the same measurements as its producer.
-
-<Callout type="info">
-Container queries are the other fixpoint. The styles inside a container depend on its resolved size,
-and its size depends on those styles, so there is no ordering that resolves it in one pass.
-`crates/zgui-layout/src/container_query/` iterates to a fixed point with its own
-`MAX_PASSES` of 3; a document that has not settled by then is one whose queries contradict each
-other, and stopping with the third answer is better than not stopping.
-</Callout>
-
-## Incremental patching
-
-Laying a document out is the largest thing a frame does, and almost every frame asks for one without
-needing one. The first defence is the gate (`crates/zgui-layout/src/tree/gate.rs`):
-
-```rust
-pub enum Relayout { NoRoot, Held, Ran }
-
-pub fn stands(store: &LayoutStore, viewport: Size<f32>) -> bool {
-    let Some(root) = store.root() else { return false };
-    store.laid_out_for(viewport) && !is_dirty(store, root)
-}
-```
-
-Two and only two things stop a held result standing: something underneath changed, or the viewport
-moved. `mark_dirty` propagates to the root by construction, so a clean root means nothing is owed.
-A held pass bumps `Counter::LayoutsHeld`; a pass that ran bumps `Counter::LayoutReachedRoot`.
-
-The composing half is **not** skipped with it, and must not be. A frame that laid nothing out can
-still owe a repaint, and the damage for it is collected by the fragment pass.
-
-### Which elements owe a box tree, not whether any does
-
-An obligation propagates to the root, so the root's own word says only *whether* something owes a
-rebuild and never *what*. Reading the root rebuilds the document for one element's change. So the
-box-tree stage asks for the list (`crates/zgui-layout/src/boxtree/build.rs`):
+The `REBUILD_BOX` and `CHILDREN` marks propagate to the root, so the root can only say *whether* a
+rebuild is owed. The box-tree stage collects *which* elements owe one (`boxtree/build.rs`):
 
 ```rust
 pub const REBUILDS: Dirty = Dirty::REBUILD_BOX.union(Dirty::CHILDREN);
@@ -263,94 +155,152 @@ pub struct Owed {
 pub fn retire(document: &mut Document, root: NodeIndex) -> Owed
 ```
 
-The two lists are separate because they are answered *about different elements*. An element whose own
-style decides different boxes says so about itself; how those boxes are wrapped, ordered and
-blockified is the container's decision. An element whose child list changed says so as the container.
-Folding them together loses which is which.
+The two lists stay separate because they are serviced at different elements. An element whose own
+boxes changed is serviced by rebuilding its **container**, since wrapping, ordering and
+blockification are the container's decisions. An element whose child list changed already is the
+container.
 
-The frame then tries three things in order, and only the third rebuilds
-(`crates/zgui-runtime/src/window/frame.rs`, `build_boxes`):
+### Splice, rewrite text, or rebuild
 
-<Steps>
+`build_boxes` in `crates/zgui-runtime/src/window/frame.rs` tries these in order:
 
-<Step>
+1. **Splice.** `patch::rebuild(store, document, &owed) -> Option<Rebuilt>` rebuilds the boxes of
+   each target container and puts them where the old ones were. For a container that gained or
+   lost children, it first tries to build only the children that changed and keep the rest.
+2. **Rewrite text.** `patch::retext(store, document, root) -> Retext` writes new characters into
+   the text runs that already exist and returns `Retext::Patched(n)` or `Retext::Rebuild`. It runs
+   even after a splice, because the same frame may have changed a label elsewhere.
+3. **Re-measure custom elements.** `patch::custom::relayout` marks custom elements that asked to be
+   measured again.
+4. **Rebuild.** `boxtree::build(store, document)` replaces every box. It runs only when there is no
+   root yet, a splice is refused, or `retext` returns `Rebuild`.
 
-**Splice.** `patch::rebuild(store, document, &owed) -> Option<Rebuilt>` makes each named element's
-boxes again and puts them where the old ones were. A container that gained or lost a child is asked
-the narrower question first: build the children that moved, keep the ones that did not.
+### When a splice is refused
 
-</Step>
+Target selection (`boxtree/patch/subtree/target.rs`):
 
-<Step>
+- Containers nested inside other targets are dropped; rebuilding the outer one covers them.
+- More than 64 outermost containers (`MOST`) means the change is not local: a full build is cheaper.
+- A `display: contents` container has no box of its own to replace, so the nearest ancestor that
+  generates a box is rebuilt in its place. A container inside a `display: none` subtree owes
+  nothing and is skipped.
+- A change whose container is not an element with a box (the root element, for example) is refused.
 
-**Rewrite text.** `patch::retext(store, document, root) -> Retext` puts a text node's new characters
-into the box that already lays them out, and returns `Retext::Patched(n)` or `Retext::Rebuild`.
+Each splice must also be **confined** (`boxtree/patch/subtree/confine.rs`): the boxes in the old
+subtree are exactly the boxes its own elements generate, and nothing outside it is laid out from
+inside it. Then `takes_the_same_part` compares the new root box with the old one:
 
-</Step>
+| Check | Why |
+|---|---|
+| Same list | An out-of-flow box must hang under the same containing block; an in-flow box under the box of its element's parent. |
+| Same participation | A box that switches between block-level and inline-level changes how its siblings are wrapped, and the siblings are not being rebuilt. |
+| Same kind | A changed formatting context or box kind changes how the container's other children were sized. |
 
-<Step>
+The new subtree is built first and discarded if it fails these checks; predicting the result would
+duplicate the builder's rules.
 
-**Rebuild.** `boxtree::build(store, document)` replaces every box. Reached only when the splice
-reports a change it cannot confine or the rewrite reports one it cannot express.
-
-</Step>
-
-</Steps>
-
-Rebuilding is the fallback because a box's name is what fragment reuse, geometry diffing, the
-per-fragment paint record and damage scissoring are all keyed on. A frame that rebuilds is a frame in
-which none of the four can hit: every box is new, every fragment compares as changed, and the damage
-collapses to the root's ink, which is the whole window.
-
-### What a splice refuses, and why refusing is the point
-
-A subtree may be spliced only when it is **confined**: the boxes it holds are exactly the boxes its
-own elements generate, nothing outside it is laid out from inside it, and the box that goes in takes
-part in its container the same way the box that came out did
-(`crates/zgui-layout/src/boxtree/patch/subtree/`). Each is proved rather than assumed.
-
-`takes_the_same_part` asks three questions, and each names a way the container's arrangement would
-change under a box that is not being rebuilt with it:
-
-- **Is it in the same list?** Out-of-flow boxes hang under their containing block; in-flow boxes hang
-  under the box their element's parent generated.
-- **Is it the same kind of participant?** A box that is block-level where the old one was
-  inline-level changes how its *siblings* are wrapped, and the siblings carry no mark.
-- **Is it the same kind of box?** A formatting context or box kind that moved is a container laying
-  its children out by different rules, which the boxes above it were sized against.
-
-The new subtree is built and then thrown away rather than predicted. What a box becomes is decided by
-the builder over the whole subtree; a prediction computed at the splice site would be a second
-implementation of those rules, agreeing with the first only until one of them changed.
-
-The largest case declined today is a box whose *layout* parent and *paint* parent are two different
-boxes — an out-of-flow box positioned further up than the element it was written inside. Repairing
-two lists reached two different ways, with only one of them reachable from the box being replaced, is
-a rebuild instead.
+The largest case still refused is a box whose layout parent and paint parent differ, such as an
+out-of-flow box positioned against an ancestor further up. Both lists cannot be repaired from the
+replaced box, so it falls back to a full build.
 
 ### Rewriting text in place
 
-A text run's characters are copied into its box when the box is built, and nothing else in a frame
-copies them again. Before `retext` existed, one changed character rebuilt the tree, which renamed
-every box, which made every fragment compare as changed, which grew the damage to the root's ink. One
-keystroke repainted the window.
+A text run's characters are copied into its box when the box is built. `retext`
+(`boxtree/patch/text.rs`) updates them without a rebuild. A rewrite must:
 
-A rewrite owes three things (`crates/zgui-layout/src/boxtree/patch/text.rs`):
+1. **Drop the flattened inline content** held for every ancestor. The cached flattened form is
+   validated against the sequence of boxes, and a box rewritten in place is the same box, so a stale
+   form would pass that check and draw the old text.
+2. **Mark the box dirty** so its layout and its ancestors' layouts are recomputed.
+3. **Refuse changes it cannot express.** Text appearing in an empty text node or disappearing
+   entirely changes which boxes exist, so `retext` returns `Rebuild`.
 
-1. **The flattened form of the containing inline formatting context has to go.** It is checked
-   against the sequence of boxes it was flattened from, and a box rewritten in place is the same box
-   in the same position — so the check passes and the *old* characters are shaped and drawn. The walk
-   climbs to the root dropping it, because which box establishes the context holding these characters
-   has no single answer and each step is one pointer write.
-2. **The layout of the box and every ancestor has to be thrown away.** A string of a different width
-   is a different measurement.
-3. **A change it cannot express has to be refused.** Text appearing where there was none, text
-   disappearing entirely, or a font change: each changes which boxes exist.
+An element whose font changed (face, size, spacing, `text-transform`) keeps its boxes. `retext`
+collects these elements and passes them to `text::reshape::scope`, which drops the flattened forms,
+resolved lines, baselines and cached sizes computed from the old shaping.
 
-`Dirty::RESHAPE` is deliberately *not* retired here. The fragment pass reads it to decide that a line
-holding different glyphs must be painted again where it stands.
+`Dirty::RESHAPE` is not retired here. The fragment pass reads it to repaint a line whose glyphs
+changed without its rectangle moving.
 
-### The dirty region, exactly
+## Layout with Cephal
+
+[Cephal](https://crates.io/crates/cephal) is a retained, incremental CSS layout engine (block,
+flexbox, grid, floats, margin collapse, absolute positioning) published on crates.io. zgui uses it
+against its own box tree. The root `Cargo.toml` enables only the three algorithms the box tree
+dispatches to:
+
+```toml title="Cargo.toml"
+cephal = { version = "0.1.0", default-features = false, features = [
+    "block",
+    "flex",
+    "grid",
+] }
+```
+
+Cephal can own a tree itself (`cephal::Tree`), but zgui uses the host-tree mode: `LayoutTree<'a, C>`
+implements Cephal's `LayoutTree`, `CacheAccess` and `schedule::Incremental` traits
+(`crates/zgui-layout/src/tree/engine.rs`) and drives `cephal::compute` directly.
+
+| Cephal owns | zgui owns |
+|---|---|
+| the block, flex and grid algorithms, floats, margin collapse, absolute positioning | the box tree, box identities and both child lists |
+| the deepest-first scheduler and the per-node `NodeCache` | the persistent `LayoutStore` and invalidation marks |
+| `LayoutInput`, `LayoutOutput` and the engine `Style` | lowering computed CSS to an engine `Style` |
+| | inline layout, replaced content and custom elements |
+| | device-pixel snapping, fragments, the hit index and paint order |
+
+**Style lowering.** Each cascade result is lowered once per device scale into a `LayoutStyle`
+(`style/lowered.rs`). Cascade results whose layout-relevant inputs are equal share one lowering, so
+a paint-only change reuses it (`Counter::StylesLoweredFromCache`). The store interns the resulting
+Cephal `Style` per box variant, and Cephal borrows it.
+
+### The layout pass
+
+```rust
+impl<'a, C: MeasureContent> LayoutTree<'a, C> {
+    pub fn new(store: &'a mut LayoutStore, content: &'a mut C, device: DeviceStyle) -> Self;
+    pub fn with_custom(self, custom: &'a dyn CustomLayoutSource) -> Self;
+    pub fn with_parallel(self, pool: &'a LayoutPool) -> Self;
+
+    pub fn layout_root(&mut self, viewport: cephal::Size<f32>) -> bool;   // always runs
+    pub fn relayout_root(&mut self, viewport: cephal::Size<f32>) -> gate::Relayout;
+    pub fn layout_viewport(&mut self, width: f32, height: f32) -> bool;
+}
+```
+
+The runtime calls `relayout_root` from `lay_out` in `crates/zgui-runtime/src/window/frame.rs`, with
+the surface size in **device pixels**. All absolute lengths in lowered styles are already in device
+pixels.
+
+`relayout_root` first asks `gate::stands` (`tree/gate.rs`). The previous result stands when the
+viewport is unchanged, the scheduler queue is empty and the root is not dirty. It then returns
+`Relayout::Held` and bumps `Counter::LayoutsHeld`. Otherwise `layout_root` runs, bumps
+`Counter::LayoutReachedRoot`, and `relayout_root` returns `Relayout::Ran`:
+
+1. **Intrinsic pre-pass.** Measures boxes sized with `min-content`, `max-content` or `fit-content`
+   that hold no intrinsic answer yet. The boxes come from a maintained roster, deepest first, so a
+   document without content keywords pays no walk.
+2. **Scheduler.** Cephal's `Scheduler::run` recomputes the queued boxes (see
+   [Incremental relayout](#incremental-relayout)).
+3. **Root layout.** `cephal::compute::compute_root_layout` lays out from the root. Cached answers
+   make untouched subtrees cost one lookup.
+4. **Scrollbar gutters.** If `scroll_region::auto::revise` changes an `overflow: auto` gutter, the
+   pass repeats, up to `scroll_region::auto::MAX_PASSES` (2) times. Only boxes with an undecided
+   `auto` overflow are checked, also from a roster.
+
+The pass does not round. Rounding and fragment composition both need each box's cumulative absolute
+origin, so the [fragment pass](#the-fragment-pass) does both in one walk.
+
+<Callout type="info">
+Container queries need a second fixed point: styles inside a container depend on its size, and its
+size depends on those styles. `container_query::run` iterates until the sizes settle, up to
+`container_query::MAX_PASSES` (3). A document that has not settled by then has contradictory
+queries, and the third answer is kept.
+</Callout>
+
+### Incremental relayout
+
+Cephal's scheduler is **deepest-first and stops at unchanged answers** (`cephal::schedule`):
 
 ```rust
 pub fn mark_dirty(store: &mut LayoutStore, box_: BoxKey) -> u32
@@ -358,257 +308,323 @@ pub fn is_dirty(store: &LayoutStore, box_: BoxKey) -> bool
 pub fn mark_all_dirty(store: &mut LayoutStore) -> u32
 ```
 
-`mark_dirty` throws away one box's held answers and climbs, stopping at the first already-invalid
-ancestor. That early stop makes marking `n` boxes cost `O(n + depth)` rather than `O(n × depth)`.
+- `mark_dirty` (`tree/dirty.rs`) clears the box's cached answers and queues the box and its parent
+  with the scheduler. It also sets a `CHAIN` bit on every ancestor, so walks that start at the root
+  can still find the change. The chain bit is cleared after the pass.
+- The scheduler pops queued boxes deepest first. For each box it re-asks every question the box's
+  cache held, with the same inputs, and compares the new answers with the old ones. If the parent
+  could observe a difference, the parent is queued. If not, propagation stops there.
+- If the parent is already dirty, the child's cache is simply cleared: the parent will re-run anyway.
+- A box with nothing cached (never laid out, hidden, or sized only through its parent, like a text
+  run) always queues its parent, because only the parent can tell whether it changed.
+- Answers computed inside a shared block formatting context depend on siblings (margin collapsing,
+  floats). They are not replayed in isolation; the parent recomputes them.
 
-A box that has *never* been laid out is not an already-invalid one, and the walk does not stop at it:
-whole classes of box are never asked for a size of their own — a run of text is sized by the line box
-above it — and a change to one of those has to reach the box that *was* asked.
+`mark_all_dirty` is used when the scale factor changes. Every length is in device pixels, so
+every answer is stale. It clears every cache, intrinsic answer, baseline and resolved inline line,
+forgets the viewport the results were computed for, and counts the boxes in
+`Counter::BoxesMarkedAllDirty`.
 
-`mark_all_dirty` is what a scale-factor change forces. Every length handed to the algorithms is in
-device pixels, so no subtree escapes. It drops the per-box cache, including intrinsic answers, and
-also drops baselines and resolved inline lines. It forgets the viewport that produced the results.
-Leaving any of them behind gives a document that half rescales.
+## Measurement caches
 
-## The measurement cache
+Each box has a Cephal `NodeCache` (`cephal-0.1.0/src/tree/cache/mod.rs`):
 
-Each box keeps two exact caches:
+| Slot | Capacity | Used for |
+|---|---:|---|
+| final layout | 1 | the `PerformLayout` answer |
+| size probes | 3 inline + 8 spilled = 11 | `ComputeSize` answers |
 
-| Cache | Capacity | Key | Holds |
-|---|---:|---|---|
-| `FullLayout` | 1 | the dimensions, parent size, and requested axis | one `LayoutOutput` |
-| `Measured` | 16 | the complete size-only `LayoutInput` | a `Size<f32>` |
+- **One final slot.** Performing layout writes positions into descendants. Keeping an older full
+  answer could return the right outer size while the subtree is still placed for another question.
+- **Eleven size slots.** Grid track sizing asks one item several min- and max-content questions.
+  The 8 spill entries are allocated only when needed. When all are full, the least recently used
+  entry is evicted.
+- **Exact keys.** `CacheKey` packs known dimensions, available space, parent size, requested axis,
+  sizing mode, margin-collapse state and block-context identity. Floats are compared by their bits,
+  so `NaN`, `+0` and `-0` stay distinct.
+- **Normalised questions.** Before lookup, `cephal::compute::normalize` drops the parent size on an
+  axis the style never resolves against, and replaces the available space with a definite known
+  size. Equivalent questions then share one entry.
+- **Complete answers.** A hit returns a whole `LayoutOutput`: size, overflow and baselines.
 
-A full-layout cache has one slot because performing layout writes geometry into descendants. An
-older full answer could return the correct outer size while leaving the subtree placed for another
-question. A different full-layout question therefore replaces the held answer.
+`BoxLayout::forget_layout` clears both cache levels, the intrinsic answers and the atomic-inline
+memo together. Clearing one without the others would let a pre-invalidation answer be served.
+`Counter::SizesHeld` and `Counter::SizesMeasured` count size-probe hits and misses.
 
-The size-only cache is wider because grid track sizing asks one item several min-content and
-max-content questions with different area estimates. Its fixed-size ring holds sixteen complete
-questions. When it is full, the oldest answer makes way.
+### Intrinsic sizes
 
-`Probe` carries six things, compared **by bits and never by value**: the constraint on each axis, the
-containing block, the axis asked about, the sizing mode, and whether the box's vertical margins were
-allowed to collapse. A float comparison would make two `NaN`s unequal, so a degenerate constraint
-would miss for ever, and would make positive and negative zero equal, which they are not as an
-available space. The four constraint cases carry their own discriminant rather than being packed into
-one number, because packing makes a definite space of exactly infinity indistinguishable from the
-min-content keyword.
+Boxes that use `fit-content`, `min-content` or `max-content` keep their min- and max-content answer
+per axis on the box (`BoxLayout::intrinsic`). An intrinsic probe has no known dimensions, no parent
+size and a fixed min/max-content constraint, so it does not depend on the containing block and
+stays valid across frames and viewport changes. A settled document takes no intrinsic measurements.
 
-The collapsible flag is carried even though every size-only question is currently asked with it
-unset. A field left out because nothing varies it is a claim about the *caller* rather than about the
-question, and the day something varies it the memo answers one question with another's size — with no
-miss, no assertion and no symptom beyond a box of the wrong height.
-
-Three rules keep the two caches consistent:
-
-- **Only a size-only question uses the wider cache.** A full layout stays in its single slot.
-- **Both caches are emptied by the same call.** `BoxLayout::forget_layout` clears them together, and
-  nothing may empty one without the other. An answer kept in one while the other was emptied is a
-  measurement from before the invalidation, served in preference to taking it again.
-- **A size-only hit is completed.** The slot holds only a size. `cache_get` restores the box's last
-  reported baseline so the hit has the same result as the computation it replaces.
-
-A miss costs a full nested layout of the box's subtree. A size hit costs one comparison per held
-entry and bumps `Counter::SizesHeld`; a computed answer bumps
-`Counter::SizesMeasured`. The ring is bounded because a window being dragged asks a new question of
-every box on every frame, and the answers to the old ones stay right for ever without being asked
-again.
-
-### Persistent intrinsic answers
-
-The intrinsic cache holds the min-content and max-content answer for each axis of a box that uses
-`fit-content`, `min-content`, or `max-content`. An intrinsic probe has no known dimensions, no
-parent size, and a fixed min-content or max-content constraint. Its result does not depend on the
-containing block. The box can therefore keep the result across frames and viewport changes.
-
-The intrinsic pre-pass measures only missing answers. It processes the content-keyword roster from
-the deepest box to the shallowest box, because an outer intrinsic box depends on the result of an
-inner one. A settled document takes no intrinsic measurements on another layout pass.
-
-`BoxLayout::forget_layout` clears both exact caches and the intrinsic answers when content, style,
-device scale, or a gutter decision changes the answer. Immediately after an intrinsic probe, the
-pre-pass clears only the two exact caches. Those probes ran while the keyword was treated as
-`auto`; they must not answer the main layout. The new intrinsic answer remains valid.
-
-`AtomicMemo`, `TextStyles`, and `CalcArena` remain on `LayoutTree`. They contain state for one pass.
+The pre-pass clears only the two cache levels immediately after a probe (`forget_cached_sizes`).
+Those entries were measured while the keyword was treated as `auto` and must not answer the real
+layout. Any other invalidation (content, style, scale, gutter) clears the intrinsic answer too.
 
 ## `MeasureContent`
 
-Three formatting contexts reach the leaf path: a run of text, replaced content the engine does not
-lay out, and an atomic inline. The third is answered inside the crate, because it is a nested layout
-of boxes it owns. The other two are answered by whoever drives the pass — which is what keeps the
-shaping engine and the image decoder out of the layout engine's dependencies, and what makes a layout
-test runnable with no fonts on disk.
+Text, replaced content and custom elements are leaves to Cephal. Atomic inlines are laid out inside
+the crate. The rest is answered by the measurer the caller passes in, which keeps the shaping
+engine and image decoding out of `zgui-layout` and lets layout tests run without fonts
+(`crates/zgui-layout/src/measure.rs`):
 
 ```rust
-pub trait MeasureContent {
+pub trait MeasureContent: ShapedClusters {
     fn measure(&mut self, request: MeasureRequest<'_>) -> Measured;
     fn shape(&mut self, content: &ParagraphContent<'_>) -> ShapedSummary;
+    fn shape_keyed(&mut self, key: ParagraphKey, content: &ParagraphContent<'_>) -> ShapedSummary; // defaulted
     fn break_lines(&mut self, key: ParagraphKey, request: &BreakRequest<'_>) -> BrokenParagraph;
     fn strut(&mut self, style: &TextStyle) -> StrutMetrics;
     fn paint_slot(&mut self, paint: &TextPaint) -> Brush;
+    fn fork_measurer(&mut self, owned: &[ParagraphKey]) -> Option<Box<dyn WorkerMeasure>>; // defaulted
+    fn absorb_measurer(&mut self, worker: Box<dyn WorkerMeasure>);                         // defaulted
 }
 ```
 
-**Text is two questions and not one.** Turning characters into glyphs is expensive; deciding where
-the lines fall in a given width is cheap. A layout algorithm asks a paragraph how big it is at many
-candidate widths while it resolves the flex or grid around it, so those probes have to cost the cheap
-half. `shape` is asked once per distinct content and `break_lines` once per width. A measurer that
-fused them would turn every width probe back into a full pass.
+**Shaping and line breaking are separate calls.** Shaping is expensive; breaking at a given width
+is cheap. Flex and grid ask a paragraph for its size at many widths, so `shape` runs once per
+distinct content and `break_lines` once per width. `ShapedSummary` carries the paragraph key and
+its `ContentWidths`, which answer inline-axis intrinsic probes without breaking lines at all. The
+[text engine](/docs/architecture/text-engine) describes what happens behind these calls.
 
-`ShapedSummary` carries the paragraph key and its `ContentWidths`. The widths are the point: they are
-a property of the glyphs alone, so an inline-axis intrinsic probe is answered from the summary and
-costs no line breaking at all.
+**`ShapedClusters` is a required supertrait** with no default. `text-overflow` needs cluster
+boundaries to place the ellipsis, and a wrapper that silently inherited an empty answer would cut
+every label at its start.
 
-The request and the answer:
+A `MeasureRequest` carries the box, its style, the dimensions layout has already fixed (`known`),
+the available space with the box's own insets removed, the content's `natural` size if known, the
+device `scale`, and `final_pass` (whether the answer is kept or is one of several probes).
+`Measured` carries `size`, `first_baseline` and `last_baseline`. Both baselines are needed because
+an `inline-block` aligns on its last line box.
 
-| `MeasureRequest` field | Meaning |
+`paint_slot` claims a brush slot keyed by the **identity of the cascade result** that the colour
+came from, not by the colour. The slot survives a theme change that rewrites its colour, and two
+runs that happen to compute the same colour are not recoloured together.
+
+| Implementation | What it measures |
 |---|---|
-| `box_` | the box being sized |
-| `style` | its computed style |
-| `known` | dimensions layout has already fixed, which are authoritative |
-| `available` | space on each axis, with the box's own insets already taken off |
-| `scale` | device pixels per CSS pixel |
-| `final_pass` | whether the answer will be kept, or is one of several probes |
+| `NoContent` | Every box is empty. A test control that forks trivially, so text-free tests exercise parallel batches. |
+| `NaturalSize` | Replaced content at `natural × scale`. |
+| `Paragraphs<S, R = NaturalSize>` | A shaper, the paragraph cache and the brush table, delegating replaced content to `R` (`text/paragraphs.rs`). |
+| `Box<dyn TextEngine>` | The runtime's measurer (`crates/zgui-runtime/src/text.rs`). |
 
-`Measured` carries `size`, `first_baseline` and `last_baseline`. The two baselines are separate
-because CSS aligns an `inline-block` in normal flow on its *last* line box, and a first-line answer
-puts a multi-line one on the wrong line.
+## Parallel layout
 
-Two implementations ship in this crate. `NoContent` reports every box as empty and every paragraph as
-having no lines; it is the control in a test that has to distinguish "the content decided this" from
-"the box did". `Paragraphs<S, R>` (`crates/zgui-layout/src/text/paragraphs.rs`) holds a shaper, the
-paragraph cache and the brush table, and delegates replaced content to a second measurer, because
-knowing how big a picture is has nothing to do with knowing how wide a word is. The runtime wraps its
-own text engine in a third (`crates/zgui-runtime/src/text.rs`).
+An application owns one `LayoutPool` (`tree/parallel.rs`), shared by its windows. Windows still lay
+out one at a time on the frame thread; the pool splits independent child subtrees inside one pass.
 
-`paint_slot` claims a brush slot against the **identity of the cascade result** the colour came from,
-never against the colour. The slot has to survive a theme change that rewrites what is in it, and two
-runs that merely computed to the same colour must not be re-coloured together.
+| Setting | Effect |
+|---|---|
+| `zgui::app().with_layout_threads(n)` | requested pool width |
+| `ZGUI_LAYOUT_THREADS=n` | overrides the requested width |
+| width `0` or `1` | no pool |
+| more than 8 | clamped to 8 (`MAX_LAYOUT_THREADS`) |
+| `ZGUI_LAYOUT_BATCHES=0` | keeps the pool but runs every batch serially, for A/B runs |
+
+Cephal hands the host each batch of independent child requests; `run_batch`
+(`tree/executor.rs`) decides how to run it:
+
+- It distributes only when the batch has at least 8 **cold** nodes (`MIN_COLD_NODES`; nodes the
+  cache cannot answer) and the planned subtrees hold at least 256 boxes (`MIN_BATCH_BOXES`). Steady
+  frames are mostly cache hits, so they stay serial.
+- Batches nested inside a worker run serially on that worker.
+- A subtree that contains a custom element is **pinned to the frame thread**, because the custom
+  layout source has no `Sync` bound. The other subtrees in the batch still go to workers. A store
+  with no custom boxes skips this check.
+- Before the workers start, the executor splits the store into disjoint mutable views. Each worker
+  writes its subtree's results in place. Nothing is copied in or committed out; results are
+  reassembled in request order. Distributed batches are counted in
+  `Counter::LayoutBatchesDistributed`.
+
+Each worker needs its own text measurer. `MeasureContent::fork_measurer(owned)` returns a `Send`
+`WorkerMeasure` that takes ownership of the shaped paragraphs the worker will break, and
+`absorb_measurer(worker)` takes the results back after the batch. The default `fork_measurer`
+returns `None`, which keeps that measurer's batches serial. A fork must return exactly the
+measurements its producer would.
+
+A paragraph can be probed on one worker and kept by the final pass on another measurer. The inline
+layout then re-shapes it on the measurer that breaks it, which is a cache lookup when that measurer
+already holds it (`inline/measure.rs`).
+
+Shaping itself happens inside the serial layout recursion. When a pool exists, the runtime first
+shapes the dirty plain-text paragraphs before layout asks for them, spreading the work across the
+pool when there are enough misses; see
+[Pre-shaping on workers](/docs/architecture/text-engine#pre-shaping-on-workers).
 
 ## Fragments
 
-A **fragment** is one painted piece of one box, in absolute device pixels. A box produces one per
-line for inline content, one per column, one per page. Everything downstream reads fragments.
+A fragment is one painted piece of one box, in device pixels. Inline content produces one per
+line.
 
 | Group | Fields | Notes |
 |---|---|---|
 | Identity | `key`, `box_`, `node`, `parent` | `node` is `None` for an anonymous box |
-| Geometry | `border_box`, `padding_box`, `content_box`, `border`, `padding` | in the stacking context's space, before this fragment's own transform |
-| Ink | `ink`, `local_ink`, `subtree_ink` | what it paints, in device space, its own space, and unioned over its subtree |
-| Space | `clip`, `clip_transform`, `transform`, `transform_hash` | interned identifiers from `zgui-scene` |
-| Order | `stacking`, `scroll` | which context it is painted in, which region it moves with |
-| Content | `kind`, `flags` | what it draws, and what stages branch on |
-| Folds | `subtree_disjoint`, `subtree_rigid` | answered over the subtree, on the unwind |
+| Geometry | `border_box`, `padding_box`, `content_box`, `border`, `padding` | in local space (see [Units and snapping](#units-and-snapping)) |
+| Ink | `ink`, `local_ink`, `subtree_ink` | painted extent in device space, in local space, and unioned over the subtree |
+| Space | `clip`, `clip_transform`, `transform`, `transform_hash` | interned ids from `zgui-scene`, plus a matrix fingerprint |
+| Order | `stacking`, `scroll`, `subtree_order` | stacking context, scroll frame, and the subtree's range of hit-order keys |
+| Content | `kind`, `content_hash`, `flags` | what it draws |
+| Folds | `subtree_disjoint`, `subtree_rigid` | computed over the subtree on the way back up |
 
 `FragmentKind` is `Box`, `Line { paragraph, line }`, `TextRun { paragraph, run }`,
-`Replaced { content }`, `Vector`, or `Scrollbar { axis, part }`.
+`Replaced { content }`, `Vector`, `Custom` or `Scrollbar { axis, part }`.
 
-`FragmentFlags` is six bits: `CLIPS_CHILDREN`, `IS_STACKING_CONTEXT`, `HAS_TRANSFORM`, `IS_STICKY`,
-`HAS_READ_EXTENT`, `HAS_BLENDING_DESCENDANT`.
+`FragmentFlags` has seven bits: `CLIPS_CHILDREN`, `IS_STACKING_CONTEXT`, `HAS_TRANSFORM`,
+`IS_STICKY`, `HAS_READ_EXTENT`, `HAS_BLENDING_DESCENDANT` and `PAINTS_NOTHING` (no background,
+border, outline or shadow).
 
-Four of these fields are subtle enough to be worth stating outright.
+Fields that need care:
 
-- **`ink` under-reported is stale pixels.** It is the union of everything the fragment *paints*,
-  including shadow spread, outline offset and filter bleed, and it is what damage is computed from.
-  It is deliberately not what a fragment *reads*: a blurred fragment samples pixels outside every
-  rectangle it writes, and that extent is carried in a separate registry so that the many fragments
-  which read nothing do not inflate damage.
-- **`local_ink` is the same union in the fragment's own space,** and it is what the hit index is keyed
-  by. An entry filed under a device rectangle stops being true the moment its coordinate system
-  moves, and nothing walks a fragment whose matrix changed under it.
-- **`subtree_ink` lets a paint pass skip a clean subtree in one test** instead of descending it to
-  find that nothing in it intersects the damage.
-- **`transform_hash` is a fingerprint of the matrix.** A coordinate system's name is structural and
-  does not move when the matrix under it does, so without the fingerprint a movement whose device ink
-  lands where the last one did — a square rotated through a right angle — compares identical and is
-  never redrawn.
+- **`ink`** is everything the fragment writes, including shadow spread, outline offset and filter
+  bleed. Damage is computed from it, so under-reporting leaves stale pixels. Pixels a fragment only
+  *reads* (a blur's sampling radius) are tracked in a separate registry, flagged by
+  `HAS_READ_EXTENT`, so they do not inflate damage for everything else.
+- **`local_ink`** is the same extent in the fragment's own space. The hit index uses it, so entries
+  stay valid when only the matrix above them moves.
+- **`subtree_ink`** lets painting skip a whole clean subtree with one rectangle test.
+- **`transform_hash`** fingerprints the matrix. A space's id stays the same when its matrix
+  changes, so without the hash a 90° rotation of a square would compare as unchanged.
+- **`content_hash`** is zero except for lines. It captures what a line draws beyond its rectangle,
+  such as a `text-overflow` cut and its marker.
 
-`FragmentKind::same_piece` decides whether two kinds name the same piece, which is a different
-question from equality. A paragraph is interned by the shaping of its characters, so typing one
-character issues a new `ParagraphId`; a line matched on equality would be destroyed and remade on
-every keystroke, unregistering its hit entry, discarding its paint record and forcing the painting
-order to be derived again for the whole document. Reusing a name across a change of paragraph owes
-the fragment a repaint, and keeping the two apart is the point.
+`FragmentKind::same_piece` decides whether two kinds name the same piece. Lines and runs match by
+index and ignore the paragraph id, because typing a character interns a new `ParagraphId`. Matching
+on equality would recreate every line on every keystroke and lose its hit entry and paint record.
+A reused line whose paragraph changed is still repainted.
 
 ### The fragment pass
 
-One walk writes the fragment tree, and it does five things at once because all five need the same
-descent and the same unwind: compose and snap each box's absolute position, compare the result
-against the fragment that was there, absorb what changed into the damage, fold the subtree answers on
-the unwind, and keep the hit index in step one entry at a time.
+`fragment::diff::rebuild` is one walk that composes and snaps absolute positions, compares each
+fragment with the previous frame (`Change::Identical`, `TranslatedOnly` or `Changed`), collects
+damage into a `DamageSet`, folds subtree values on the way back up, and updates the hit index. It
+enters boxes carrying any bit of `ENTERS` (`RELAYOUT`, `REPOSITION`, `REFRAGMENT`, `RESTACK`,
+`SCROLL`, `REPAINT`, `REHIT`, `RESHAPE`) and returns `RigidMoves`. The runtime runs it even when
+layout was held, because a colour change still needs damage. `rebuild_in` is the same walk with
+caller-owned scratch buffers.
 
-```rust
-pub const ENTERS: Dirty = Dirty::RELAYOUT
-    .union(Dirty::REPOSITION).union(Dirty::REFRAGMENT).union(Dirty::RESTACK)
-    .union(Dirty::SCROLL).union(Dirty::REPAINT).union(Dirty::REHIT).union(Dirty::RESHAPE);
+Each child gets one of three treatments:
 
-pub enum Change { Identical, TranslatedOnly, Changed }
-
-pub fn rebuild(
-    store: &mut LayoutStore,
-    hit: &mut HitIndex,
-    tables: &mut Tables<'_>,
-    dirty: &mut impl FrameDirty,
-    root: BoxKey,
-    damage: &mut DamageSet,
-)
-```
-
-Each child gets one of three answers:
-
-| Answer | When | What it costs |
+| Treatment | When | Cost |
 |---|---|---|
-| `cached` | the parent settled and the child is clean | reads the child's folded answer |
-| `translate` | the child is clean and its whole subtree is rigid | one offset per piece, plus the damage |
-| `visit` | anything else | a full compose and compare |
+| keep | the parent did not move, the child carries no marks, and its layout result equals the one its fragments were composed from | read its folded values |
+| translate | the child is clean and its subtree is rigid | one offset per fragment, plus damage |
+| visit | anything else | full compose and compare |
 
-`can_skip` is not the marks alone, and the difference is a wrong frame rather than a slow one. A box
-is marked when *its own* content changes, not when a sibling's does — and a sibling that grew moves
-everything the flow places after it. So the layout result is consulted as well:
-`state.unrounded == state.composed`, which asks whether the engine's answer for this box is the one
-its standing fragments were composed from.
+The layout comparison (`state.unrounded == state.composed`) is required because marks are set on
+the element that changed, not on siblings that moved because of it.
 
-`can_translate` adds one claim: the subtree is **rigid**. Three styles break rigidity and each is
-recorded rather than looked for later — a sticky box, whose shift is measured against a scrollport it
-does not travel with; a `position: fixed` box, which takes none of the scroll offsets above it; and a
-transformed box, whose matrix is composed against a border box that moved. A clip is not on the list,
-because a clipping box's rectangle moves with the box.
+A subtree is **rigid** when every fragment in it moves by the same vector as its root. Sticky boxes,
+`position: fixed` boxes and transformed boxes break rigidity and are recorded in `subtree_rigid`.
+Clips do not, because a clip moves with its box. `RigidMoves`, the pass's return value, reports
+whether the frame was a single rigid move and by how much, which lets the renderer shift existing
+pixels instead of repainting a scrolled region.
 
-The folds are on the **unwind**, not on an ancestor walk. The walk descends only what changed, so a
-fold that reads each child's cached answer is correct for a subtree the walk never entered. A walk
-upwards from each blending fragment would never run at all for a fragment that was not visited. The
-difference is visible only in the frame where something under an untouched blurred panel animates.
+Damage rules:
+
+- A box with `PAINTS_NOTHING` owes no damage when it is born, retired, repainted or repositioned;
+  its children damage themselves. This stops paintless containers (a virtual list's pane, for
+  example) from damaging the whole scrollport.
+- A plain box that only changed size damages only the strips along the edges that moved, when its
+  painting near other edges is unchanged.
+- Born fragments are damaged whole; retired fragments are damaged where they were.
+
+`FrameDirty` is how the pass reads and writes marks. `Everything` answers `Dirty::all()` and is used
+for a first build. `DocumentMarks<'a>` reads the document. `ENTERS` is retired after the walk,
+because the walk reads each node's marks twice.
 
 <Callout type="warn">
-An anonymous box has no marks of its own, and asking the document about no element gets
-`Dirty::all()`. Nearly a fifth of a real document's boxes are anonymous, and the subtree answer is
-consulted before a clean child is left alone — so each of them would make its whole subtree
-unskippable, which is what makes a fragment pass proportional to the document on a frame that changed
-one element. `Owed::of` (`crates/zgui-layout/src/fragment/diff/dirty.rs`) asks about it under the
-element it was **generated for**, and folds that element's subtree answer into the box's *own*
-answer, because an anonymous inline root draws the lines its descendants' glyphs sit in.
+Anonymous boxes have no element, and asking the document about no element returns
+`Dirty::all()`. Roughly a fifth of a real document's boxes are anonymous, so this would make the
+pass visit most of the tree on every frame. `Owed::of` (`fragment/diff/dirty.rs`) reads an
+anonymous box's marks from the element it was generated for, and adds that element's subtree marks
+to the box's own, because an anonymous inline root draws the lines its descendants' glyphs sit in.
 </Callout>
 
-`FrameDirty` is the seam through which the pass reads and writes invalidation. Two implementations:
-`Everything`, which answers `Dirty::all()` and is what a first build genuinely wants, and
-`DocumentMarks<'a>`, which reads the document's own marks. `ENTERS` is retired **after** the walk,
-not during it, because the walk reads a node's marks twice — once to decide whether its subtree
-settled, and again to decide what a fragment that did not move nonetheless owes.
+### Units and snapping
 
-## Hit regions and the hit index
+`zgui-geom` tags geometry with its coordinate space (`Css`, `Device`, `Layout`) using zero-sized
+markers, so mixing spaces is a compile error. Inside the engine, arithmetic is `f32` device pixels.
+`Au` (1/60 CSS pixel as an `i32`) is used where the cascade passes lengths across, such as
+container-query sizes; `zgui_css::engine::geometry::from_au` and `to_au` convert it exactly.
 
-**Hit testing** is answering "which fragments are under this point". A **hit entry** is the record
-that answers it for one fragment. The index lives beside the fragments and not with the input system
-that queries it: its bulk build reads the layout store, the pass that writes its entries is this
-crate's, and hit order *is* painting order, which is decided here.
+Snapping happens in the fragment walk (`round/snap.rs`): **round each cumulative absolute edge, and
+take each size as the difference of two rounded edges.** Rounding sizes independently would let a
+column of boxes drift by several pixels and leave one-pixel gaps between neighbours.
+
+A fragment's rectangles are typed `Device`, but `border_box`, `padding_box`, `content_box` and
+`local_ink` are in **local** space (absolute layout coordinates, no transforms applied), while
+`ink` is in device space. `Fragment::transform` names the matrix between them.
+
+## Stacking contexts and paint order
+
+A stacking context is painted as a unit. Within each one, children are painted in the passes of
+`PaintLevel`, whose variant order is the CSS painting order:
+
+```rust
+pub enum PaintLevel {
+    NegativeStacking, Block, Float, Inline, Positioned, PositiveStacking,
+}
+```
+
+`establishes` (`fragment/stacking.rs`) returns true for the root box; a positioned box with a
+`z-index`; `position: fixed` or `sticky`; a flex or grid item with a `z-index`; `opacity` below 1;
+any `mix-blend-mode` other than normal; `isolation: isolate`; any `filter`, `backdrop-filter` or
+`clip-path`; and any transform property.
+
+- **Stable ids.** `id_of(key)` is derived from the box key, so a context keeps its id for the box's
+  lifetime, and a partial walk leaves other contexts' ids alone.
+- **Walks the layout list.** That list contains anonymous boxes and holds each out-of-flow box under
+  its containing block, which is where CSS paints it. At each box, children are stably sorted by
+  `(level, z_index)`, so ties keep layout order (after `order`). `children_in_paint_order` borrows
+  the list unchanged when it is already sorted, which is almost always.
+- **Membership, not sequence.** Fragments store `stacking` and `IS_STACKING_CONTEXT`; the sequence
+  is derived by `paint_order` when needed.
+
+Hit entries carry the paint-order key instead of computing their own, so hit testing always agrees
+with what is on screen.
+
+## Positioning, clipping and overflow
+
+**Fixed positioning.** `anchored::ignores_scroll` returns true for `position: fixed`, so neither the
+box nor its subtree takes any accumulated scroll offset.
+
+**Clipping** (`fragment/clip.rs`). A clip is a chain: a rounded card inside two nested scrollports
+is three tests.
+
+- `overflow: visible` on both axes adds no link. Every other value clips, including `auto` with no
+  visible scrollbar.
+- The link is the **padding box**, with inner corner radii (outer radius minus border width, floored
+  at a square corner).
+- The link uses the box's corner shape (`--zgui-corner-shape`, read by `fragment/corner.rs`), so
+  content inside a squircle is clipped to the squircle.
+- A box is never clipped by its own clip. A scrollport's shadow belongs to the scrollport.
+- A link is named by its owning box, so a resize rewrites the rectangle in place and everything that
+  refers to the chain keeps referring to it.
+
+**Overflow** (`scroll_region/`). Layout owns the scroll *region*; the scroll *offset* is applied by
+the fragment pass and never re-enters layout. `region_of(store, box)` and
+`region_of_element(store, element)` return a `ScrollRegion`: the `scrollport` rectangle, the
+`content` size, and `scrolls_x` / `scrolls_y`, which say whether the user may scroll each axis
+(overflow `auto` or `scroll`).
+
+`overflow: auto` always counts as a scroll container; only the scrollbar's visibility depends on the
+content. Which axes an `auto` box decided to scroll is kept between frames, so the next layout
+starts from the previous answer and a gutter does not flicker while content is edited. Scrollbar
+fragments are appended after line fragments, so editing text in a scrollport does not renumber the
+scrollbar's fragment slots.
+
+## The hit index
+
+The hit index answers "which fragments are under this point". It lives in `zgui-layout` because it
+is built from the layout store, updated by the fragment pass, and ordered by paint order, which is
+decided here.
 
 ```rust
 pub struct HitEntry {
     pub frag: FragKey,
     pub node: Option<NodeKey>,
-    pub order: DrawOrder,
+    pub order: HitOrder,                 // u64 key in painting order
     pub clip: ClipId,
     pub clip_space: Option<SpatialId>,
     pub space: Option<SpatialId>,
@@ -619,269 +635,78 @@ pub struct HitEntry {
 }
 ```
 
-Every rectangle here is in the coordinate system `space` names, and **not one of them is in device
-pixels**. That is the whole difference between an entry that has to be rewritten when its box is
-animated and one that does not: a matrix is a property of the space, so an entry that never mentions
-the device stays true for as long as the box occupies the same rectangle of its own space, however
-that space is moving.
+- Every rectangle is in the coordinate space that `space` names, not in device pixels. An entry
+  stays valid while its box's matrix animates.
+- `envelope` (bounds plus shadows and outlines) is the index key, so a subtree whose ink covers the
+  point is never dismissed early.
+- `clip_space` is separate from `space` because a clip belongs to the ancestor that imposed it.
 
-`envelope` is the key rather than `bounds`, because a shadow or an outline is drawn outside the
-border box and a hierarchy keyed by anything smaller would dismiss a subtree that does cover the
-point. `clip_space` is held apart from `space` because a clip belongs to whichever ancestor imposed
-it and was measured before this fragment moved; testing the chain in the fragment's own space would
-let a translated box answer over the part of its ancestor's scrollport it was translated out of.
+A query maps the point into each coordinate space once, tests coverage, rounded corners, the clip
+chain and `pointer-events`, and sorts the hits by order key, topmost first. It returns fragment
+keys; resolving them to elements for dispatch happens in the runtime. `is_consistent()` checks that
+the forest and the entry table agree.
 
-### The forest
+### One R-tree per coordinate space
 
-`HitIndex` holds a `SlotVec<FragKey, HitEntry>` and a **forest**: one bounding-volume hierarchy per
-coordinate system. A bounding-volume hierarchy is a tree whose interior nodes hold the bounding
-rectangle of everything below them, so a subtree whose rectangle misses the point is dismissed
-without being descended. One tree per space, because a rectangle is only a rectangle in the space it
-was measured in.
+`HitIndex` holds one entry per fragment and a **forest**: one dynamic R-tree per coordinate space
+(`fragment/hit/rtree/`, `MAX_ENTRIES = 8`, `MIN_ENTRIES = 3`). Entries record their leaf and nodes
+record their parent, so removal costs the tree depth and allocates nothing.
 
-The trees are dynamic, not bulk-built (`crates/zgui-layout/src/fragment/hit/rtree/`), with
-`MAX_ENTRIES = 8` and `MIN_ENTRIES = 3`. Every entry records its leaf, and every node knows its
-parent, so taking an entry out costs the depth of the tree and allocates nothing.
-
-A move is usually not a move. A leaf's envelope covers up to eight neighbouring rectangles, so:
+Moving an entry is usually cheap:
 
 | Placement | Condition | Cost |
 |---|---|---|
-| `InPlace` | the new rectangle still lies inside its own leaf's envelope | one write, no envelope touched |
-| `Stretched` | it left the envelope but still meets it | its leaf, and the envelopes above |
-| `Reinserted` | it went somewhere else entirely | a search for a new home |
+| `InPlace` | the new rectangle is inside its leaf's envelope | one write |
+| `Stretched` | it left the envelope but still overlaps it | its leaf plus the envelopes above |
+| `Reinserted` | it moved somewhere else | a search for a new leaf |
 
-The first two are what a scrolled document does to this structure between two frames.
+### Updating entries
 
-### Carried and settled
-
-There are three ways to write one entry and one call that closes a run of them. The difference
-between the three is the whole incremental story.
-
-```rust
-pub fn update(&mut self, frag: FragKey, entry: HitEntry)     // shape may have changed; counts as churn
-pub fn translate(&mut self, frag: FragKey, entry: HitEntry)  // position only; never churn
-pub fn carry(&mut self, frag: FragKey, entry: HitEntry)      // part of a run; defers the hierarchy
-pub fn settle(&mut self)                                     // ends a run, in one pass
-```
-
-`translate` is not counted as churn because every entry of a scrolled container or a transformed
-subtree moves by the same vector, keeps its extent, and keeps its relationship to its neighbours.
-Counting them would make the two commonest whole-subtree movements there are rebuild the whole index
-every few frames, which is the exact cost the incremental path exists to avoid. `update` counts only
-when the hierarchy actually moved the entry between nodes, which most writes do not.
-
-`carry` writes the entry immediately and defers the hierarchy repair. Answering a run one entry at a
-time asks each entry to fit inside a leaf drawn around where its neighbours used to be, which
-stretches that leaf across the gap. `settle` ends the run in one pass, and until it is called the
-hierarchy answers for the rectangles the run had *before* it. The fragment pass calls it on the line
-that ends the walk, and **nothing may query the index in between**.
-
-The index is rebuilt wholesale for exactly two reasons, and they are the only two: painting order
-itself moved — a fragment that did not exist before has no place in the order and no incremental
-update can invent one — or so much has been updated one entry at a time that the hierarchy is no
-longer a good one. That second test is `churn > len() / CHURN_FRACTION`, with `CHURN_FRACTION = 4`.
-
-A query maps the point into each space once rather than mapping every candidate rectangle out of one,
-then tests coverage, rounded corners, the clip chain and `pointer-events`, and sorts by `DrawOrder`
-reversed with the fragment name as tie-break. The answer is fragment names, not elements: turning
-them into the ancestor chain that dispatch walks is a question about elements, which this crate does
-not answer.
-
-`is_consistent()` compares the forest's length against the entry count. The two are written together
-and can only disagree through a bug — an entry moved without its old rectangle being taken out
-answers hits it should not — and that is silent everywhere except here.
-
-## Stacking contexts and paint order
-
-A **stacking context** is a group that composites as a unit: a box that establishes one is painted
-atomically, wherever the context sits in its parent's sequence. Painting order is a forest of them,
-and inside each one the contents are painted in the passes `PaintLevel` enumerates. The order of the
-variants *is* the painting order, so a sort by this value is a sort into CSS painting order and
-nothing else has to know the sequence.
-
-```rust
-pub enum PaintLevel {
-    NegativeStacking, Block, Float, Inline, Positioned, PositiveStacking,
-}
-
-pub fn establishes(store: &LayoutStore, key: BoxKey) -> bool
-pub fn level(store: &LayoutStore, key: BoxKey) -> PaintLevel
-pub fn z_index(store: &LayoutStore, key: BoxKey) -> i32
-pub fn id_of(key: BoxKey) -> StackingContextId
-pub fn paint_order(store: &LayoutStore, root: BoxKey) -> Vec<BoxKey>
-```
-
-`establishes` reads the root box, `position` with a `z-index`, `fixed`, `sticky`, a `z-index` on a
-flex or grid item, `opacity` below one, a `mix-blend-mode`, `isolation: isolate`, any `filter` or
-`backdrop-filter`, any `clip-path`, and any of the four transform properties. The guide
-[lists the same set](/docs/learn/layout) from the author's side.
-
-Three mechanisms make this cheap.
-
-- **A context is named by the box that establishes it.** `id_of(key)` is derived from the box's own
-  index rather than issued by a counter, so it is the same identifier every frame for as long as the
-  box lives. That is what lets a walk over part of the document leave the rest of the fragment tree's
-  context identifiers alone.
-- **The order walk descends the layout child list.** That is the list that reaches every box exactly
-  once: an anonymous wrapper is in it and in no document order, and an out-of-flow box is in the list
-  of the box that positions it, which is where it is painted. At each box the children are sorted by
-  `(level, z_index, position)`; the sort is stable, so the tie-break is the order they are laid out
-  in, which `order` has already moved — exactly as it moves painting.
-- **The fragment tree encodes membership, not sequence.** Each fragment carries
-  `stacking: Option<StackingContextId>` and `flags` containing `IS_STACKING_CONTEXT`. The sequence
-  itself is derived by `paint_order` when it is needed, and a fragment that has no place in it yet is
-  what sets the pass's `restacked` flag and forces a bulk rebuild of the hit index.
-
-Hit order and paint order cannot be allowed to diverge, so the hit entry *carries* `DrawOrder` rather
-than assigning one. An index that invented its own would answer differently from what is on the
-screen.
-
-## Positioned boxes, clipping and overflow
-
-**Positioning.** `establishes_containing_block(positioned, fc)` consults `position` only. A
-transform, a filter or `will-change` also establishes a containing block for a fixed descendant, and
-each of those is a property of painting rather than of the box tree, so the box tree does not act on
-them. `position: fixed` is the one case a scroll must not move: `anchored::ignores_scroll` answers
-`true` for it, and neither the box nor anything inside it takes any part of the accumulated shift. A
-shift applied to one of those carries it off the screen at exactly the rate the page scrolls, while
-every measurement taken inside the process still agrees with itself.
-
-**Clipping.** A clip is a chain, not a rectangle: a rounded card inside a scrollport inside another
-scrollport is three tests, and every one has to be applied. A box that clips adds one link to the
-chain it was drawn under, and a descendant carries the whole ancestry
-(`crates/zgui-layout/src/fragment/clip.rs`).
-
-- `overflow: visible` adds no link at all, which is the overwhelming majority of boxes.
-- The link is the **padding** box, because a scrollport's content is clipped inside the border.
-- The link takes the box's corner radii, resolved concentrically: an inner radius is the outer one
-  less the border width, so the two curves stay the same distance apart all the way round. A radius
-  smaller than the border collapses to a square corner.
-- A box's own border box is never clipped by itself. A shadow spreading outside a scrollport belongs
-  to the scrollport, not to its contents.
-
-**Overflow.** Layout owns the *region* — which boxes scroll, how large their content is, where the
-scrollport is, what gutter is reserved. It does not own the *offset*: how far a region has been
-scrolled changes many times a second and must never re-enter layout, so it is supplied to the
-fragment pass from outside and composed in there.
-
-```rust
-pub struct ScrollRegion {
-    pub scrollport: Rect<DevicePx, Device>,
-    pub content: Size<DevicePx, Device>,
-}
-
-pub fn is_scroll_container(style: &ComputedStyle) -> bool
-pub fn region_of(store: &LayoutStore, key: BoxKey) -> Option<ScrollRegion>
-```
-
-`auto` counts as a scroll container. Whether it *shows* a bar depends on the content, but the clip
-and the scroll frame it establishes do not appear and disappear with the content. Which axes an
-`auto` box decided to scroll is kept between frames on `BoxLayout::auto_scroll`, so the next layout
-starts from the previous answer rather than from "reserves nothing" — which is what stops a gutter
-flickering while its content is edited. Scrollbar fragments are appended **after** the line
-fragments, so editing text inside a scrollport does not renumber the slots the bars occupy.
-
-## Coordinate spaces
-
-`zgui-geom` tags geometry with the space it was measured in, using a zero-sized marker that costs
-nothing at run time and makes mixing spaces a compile error. There are three spaces and three
-scalars.
-
-| Space | Scalar | Origin and grid | Who speaks it |
-|---|---|---|---|
-| `Css` | `CssPx` | viewport top-left, x right, y down; device-independent | styles, results reported to application code |
-| `Device` | `DevicePx` | the output surface's pixel grid | everything handed to the renderer |
-| `Layout` | `Au` | exactly 1/60 of a CSS pixel, as a signed integer | length arithmetic that must not accumulate error |
-
-`Au` exists because layout adds, subtracts and distributes lengths constantly, and in binary floating
-point the result depends on the order the additions happened in — which shows up as a column one
-pixel wider than its neighbour for no visible reason. Sixty is divisible by 2, 3, 4, 5, 6, 10, 12,
-15, 20 and 30, so halves, thirds and fifths of a pixel are all exactly representable.
-
-What converts between them:
-
-| Conversion | How |
+| Method | Use |
 |---|---|
-| `Css` to `Device` | multiply by a `Scale<Css, Device>`, which names both endpoints |
-| `Css` to `Device`, on the grid | `snap_bounds` (nearest edge), `cover_bounds` (a superset), `snap_stroke`, `snap_edges` |
-| `CssPx` to `Au` and back | `CssPx::to_au`, `Au::to_css_px`; exact within about ±69 905 CSS pixels |
-| the style engine's `Au` to this one | `zgui_css::engine::geometry::from_au` / `to_au`, exact in both directions |
+| `update(frag, entry)` | An entry whose shape may have changed. Counts as churn only when the entry was `Reinserted`. |
+| `refresh(frag, entry)` | `update`, skipped when the entry is unchanged. |
+| `translate(frag, entry)` | A scroll or transform that moves a whole group by one vector. Never counts as churn, because neighbour relationships are unchanged. |
+| `carry(frag, entry)` | Writes the entry immediately and defers the tree repair. `settle()` then repairs the tree once for the whole run. |
 
-Three snapping rules, because three questions need different answers: `snap_bounds` rounds each edge
-to the nearest device pixel and is for geometry that is *drawn*; `cover_bounds` floors the near edges
-and ceils the far ones and is for geometry that *bounds* something — a clip, a damage rectangle, a
-scissor — where losing a fraction of a pixel means losing a pixel of content; and `snap_stroke`
-rounds a width but never to zero, because a hairline that disappears is more visible than one that is
-slightly too thick. All three break ties toward zero, so a shape and its mirror image are the same
-size.
+The fragment pass calls `settle` right after the walk, and nothing may query the index in between.
 
-Inside the layout engine itself the arithmetic is in **device pixels as `f32`**, because every
-absolute length in a style has already been multiplied by the scale by the time the tree reads it.
-The runtime therefore hands `relayout_root` the surface extent in device pixels, not the CSS extent
-(`crates/zgui-runtime/src/window/frame.rs`, `lay_out`). `Au` is used where the cascade hands lengths
-across, notably container-query sizes.
+The index is rebuilt in bulk (`Counter::HitIndexRebuilds`) only when:
 
-Snapping is not a pass of its own. The rule is **round the cumulative absolute edges, and derive each
-size as the difference between two rounded edges** (`crates/zgui-layout/src/round/snap.rs`). Rounding
-each box's own size instead lets a column of ten boxes drift by up to five pixels from the sum of its
-parts, and leaves one-pixel gaps between boxes that share an edge. The arithmetic runs inside the
-fragment walk, which already has the cumulative origin it needs.
+- painting order changed (`Dirty::RESTACK`), or a newborn fragment has to be placed among siblings
+  that paint in a different order than they lay out;
+- a newborn fragment found no free order key between its neighbours (see below); or
+- churn exceeds a quarter of the entries (`churn > len() / CHURN_FRACTION`, `CHURN_FRACTION = 4`).
 
-One consequence worth stating: the *type tag* on a fragment's rectangles is `Device` throughout, but
-`border_box`, `padding_box`, `content_box` and `local_ink` are in **local** space — absolute layout
-coordinates with no transform applied, neither the fragment's own nor any ancestor's — while `ink` is
-in **device** space, because damage is measured in real pixels. `Fragment::transform` names the matrix
-between the two.
+**Order keys.** A bulk build numbers entries in paint order with a stride of `ORDER_STRIDE`
+(2<sup>20</sup>) and records each subtree's key range in `Fragment::subtree_order`. A newborn
+fragment takes a key in the gap between its neighbours, so inserting content does not force a
+rebuild. When a gap is exhausted, the pass sets `renumber` and the index is rebuilt after the walk.
 
-## What it costs
+## Counters and checks
 
-Every figure below comes from the repository. The times are from `docs/performance.md`, which is
-generated by `cargo xtask perf` rather than typed in.
+The scroll benchmark in `docs/performance.md` holds `scroll.translation.relayouts` and
+`scroll.translation.hit_rebuilds` at zero. A scroll changes no size and no style, so any relayout
+or index rebuild there means a fast path broke. `docs/perf/glide-split.md` measures a scroll frame
+at about 109 ns per moved box: 73 ns for the rigid-move walk and 35.5 ns for `HitIndex::settle`.
 
-| Interaction | Measured | Band | Source |
-|---|---:|---:|---|
-| One class toggled on one element, 1 851 boxes | 11.34 µs | 15.12 | `kitchen.click` |
-| One keystroke: one edit, one paragraph, one box | 301.39 µs | 407.40 | `kitchen.keystroke` |
-| One scroll translation frame | 44.18 µs | 61.60 | `scroll.translation` |
-| …relayouts inside it | 0 | 0, a ceiling | `scroll.translation.relayouts` |
-| …hit-index rebuilds inside it | 0 | 0, a ceiling | `scroll.translation.hit_rebuilds` |
-| One window resize step | 7.36 ms | 10.25 | `kitchen.resize` |
+Counters this crate moves (compiled into release builds, because `zgui-runtime` enables
+`zgui-profile/counters`):
 
-The two count ceilings are the sharper claims. A scroll changes no computed style and no size, so a
-frame that relays anything out or rebuilds the index has lost a fast path, and that reads the same on
-a slow machine and a fast one.
+| Area | Counters |
+|---|---|
+| box tree | `BoxTreeBuilds`, `BoxesRebuilt`, `BoxesLive`, `BoxesMarkedAllDirty` |
+| styles | `StylesLowered`, `StylesLoweredFromCache` |
+| layout | `LayoutReachedRoot`, `LayoutsHeld`, `NodesRelaidOut`, `NodesChanged`, `SizesHeld`, `SizesMeasured`, `GuttersExamined`, `LayoutBatchesDistributed` |
+| text | `BoxesReshaped`, `ParagraphsEvicted`, `ParagraphsForgotten` |
+| fragments | `FragmentsDiffed`, `FragmentsRebuilt`, `FragmentsLive`, `NodesVisited`, `BoxesShifted` |
+| hit index | `HitEntriesUpdated`, `HitEntriesMovedInPlace`, `HitEntriesReinserted`, `HitIndexRebuilds` |
 
-Per-box slopes, from `docs/perf/glide-split.md`:
-
-| Part of a glide frame | Cost |
-|---|---:|
-| The rigid-move walk | 73.1 ns per moved box |
-| …of which the box tree being faulted back into cache | 39.3 ns |
-| `HitIndex::settle`, once after the walk | 35.5 ns per moved box |
-| The whole slope | 108.6 ns per moved box |
-
-The settle is the largest single attributable cost in a glide frame, larger than either duty inside
-the walk.
-
-The wall-clock budget for repeated measurement, from `crates/zgui-layout/tests/wall_clock.rs`: twenty
-widths asked of a two-hundred-line paragraph measure 0.79 ms to 0.85 ms by the fastest of fifteen
-rounds, against a budget of 1.8 ms. Before a paragraph's flattened form was kept beside its box the
-same loop measured 2.07 ms by the same method, which is why the budget stops where it does — set any
-higher, it could not fail on the regression it was written for.
-
-The counters this crate moves are `BoxesRebuilt`, `NodesRelaidOut`, `GuttersExamined`, `LayoutReachedRoot`,
-`LayoutsHeld`, `SizesHeld`, `SizesMeasured`, `FragmentsDiffed`, `FragmentsRebuilt`, `NodesVisited`,
-`HitEntriesUpdated`, `HitEntriesMovedInPlace`, `HitEntriesReinserted` and `HitIndexRebuilds`. They
-are compiled into the release build, because `zgui-runtime` depends on `zgui-profile` with the
-`counters` feature.
-
-<Callout type="idea">
-`ZGUI_INVARIANTS=1` turns on the level-agreement checks in
-`crates/zgui-layout/src/invariants/`. Every link between an element, its boxes and their fragments is
-stored twice, and two records of one fact drift. The symptom is a click that lands on nothing or a
-rectangle painted for something that no longer exists — never an error where the mistake was made.
-The checks run in every test of this crate, and outside tests they are opt-in.
+<Callout type="info">
+`ZGUI_INVARIANTS=1` enables the level-agreement checks in `crates/zgui-layout/src/invariants/`.
+Links between elements, boxes and fragments are stored on both sides and can drift apart. The
+symptom is a click that hits nothing or a fragment painted for content that is gone, far from the
+code that caused it. The checks always run in this crate's tests and are opt-in elsewhere.
 </Callout>
 
 ## Next
@@ -890,17 +715,17 @@ The checks run in every test of this crate, and outside tests they are opt-in.
   <Card
     title="The text engine"
     href="/docs/architecture/text-engine"
-    description="What answers the measurement seam: shaping, breaking, and the glyph raster path."
+    description="What answers the measurement calls: shaping, line breaking and glyph rasterisation."
   />
   <Card
     title="Paint and the scene"
     href="/docs/architecture/paint-and-scene"
-    description="The stacking-order walk over fragments, per-fragment recording, and culling against damage."
+    description="The paint-order walk over fragments, per-fragment recording, and culling against damage."
   />
   <Card
     title="Invalidation"
     href="/docs/architecture/invalidation"
-    description="The bits the fragment pass enters and retires, and how damage rectangles merge."
+    description="The marks the fragment pass enters and retires, and how damage rectangles merge."
   />
   <Card
     title="Caches"

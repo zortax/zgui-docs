@@ -1,26 +1,26 @@
 ---
 title: Children and slots
-description: Taking content from the caller — the Children and ChildrenFn prop types, and named slots for more than one region.
+description: Take content from the caller — Children, ChildrenFn, named slots, and children closures with let.
 ---
 
-A component that wraps or arranges content needs the caller to supply that content. Two prop types
-do this, and a third mechanism handles a component with more than one region to fill. This page
-assumes [Components](/docs/learn/components).
+A component that wraps or arranges content takes that content from its caller. Use `Children` for
+content built once, `ChildrenFn` for content built more than once, and slots when a component has
+several regions to fill.
 
-## `Children`
+## Accept children
 
-Declare a prop of type `Children` and the caller's block becomes its value.
+Declare a prop of type `Children`. The caller's children block becomes its value.
 
 ```rust
 use zgui::prelude::*;
 
-/// A bordered region with a heading above it.
+/// A bordered region with a heading.
 #[component]
 fn Panel(
-    /// What the panel is called.
+    /// The heading.
     #[prop(into)]
     title: String,
-    /// What it shows.
+    /// The content.
     children: Children,
 ) -> impl IntoView {
     view! {
@@ -41,21 +41,23 @@ view! {
 }
 ```
 
-`Children` holds an `FnOnce`. Call `into_view_once()` where the content belongs. You may call it
-once, which matches the ordinary case: put the children somewhere and never ask again.
+`Children` wraps an `FnOnce`, so you build it once, with `into_view_once()`, where the content
+belongs.
 
 | Method | What it does |
 |---|---|
 | `Children::new(f)` | wraps an `FnOnce() -> AnyView` |
-| `Children::from_view(v)` | wraps a view that is already built |
-| `into_view_once()` | consumes it and yields the view |
+| `Children::from_view(v)` | wraps an existing view |
+| `into_view_once()` | consumes it and returns the view |
 
-### Optional children
+### Make children optional
+
+Declare the prop as an optional `Option<Children>`:
 
 ```rust
 #[component]
 fn Separator(
-    /// What stands between the two things, when it is not the default.
+    /// What stands between two things, if not the default.
     #[prop(optional)]
     children: Option<Children>,
 ) -> impl IntoView {
@@ -71,18 +73,16 @@ view! { Separator() }        // renders "/"
 view! { Separator {"—"} }    // renders "—"
 ```
 
-## `ChildrenFn`
+## Build children more than once
 
-Use `ChildrenFn` when the content may be built **more than once**: it appears in two places, or it
-is taken away and shown again.
-
-The example below uses the view grammar's own `if`. It takes a closure and builds its body while the
-answer holds, then removes it again. [Control flow](/docs/learn/control-flow) covers it.
+Use `ChildrenFn` when the content may be built more than once: it appears in two places, or it is
+removed and shown again. This tooltip builds its bubble again each time it opens, using the view's
+[`if`](/docs/learn/control-flow):
 
 ```rust
 #[component]
 fn Tooltip(
-    /// The content of the bubble, which is rebuilt each time it opens.
+    /// The bubble's content.
     children: ChildrenFn,
 ) -> impl IntoView {
     let open = RwSignal::new(false);
@@ -103,19 +103,15 @@ fn Tooltip(
 | Method | What it does |
 |---|---|
 | `ChildrenFn::new(f)` | wraps an `Fn() -> AnyView` |
-| `view()` | builds the content; may be called any number of times |
+| `view()` | builds the content; can be called any number of times |
 
-`ChildrenFn` is `Clone`, and a `ChildrenFn` converts into a `Children`.
+`ChildrenFn` is `Clone` and converts into `Children`. Prefer `Children` when you need the content
+only once, because the type tells readers it is built once.
 
-<Callout type="warn">
-Reach for `ChildrenFn` only when you need it. `Children` says "built once" in the type, and a
-reader of the component signature can rely on that.
-</Callout>
+## Fill several regions with slots
 
-## Slots
-
-A component with more than one region cannot use a single children block for all of them. A **slot**
-is a named region, declared as a struct.
+A component with more than one region to fill can declare slots. A slot is a struct marked
+`#[slot]`:
 
 ```rust
 use zgui::prelude::*;
@@ -127,10 +123,10 @@ pub struct CardHeader {
     children: Children,
 }
 
-/// A card, with an optional heading.
+/// A card with an optional heading.
 #[component(slot_aware)]
 pub fn Card(
-    /// The heading, when there is one.
+    /// The heading, if any.
     #[prop(optional)]
     card_header: Option<CardHeader>,
     children: Children,
@@ -155,40 +151,28 @@ view! {
 }
 ```
 
-Three rules:
+Three rules connect a slot to its parent:
 
-1. **A slot child carries the `slot` attribute.** `CardHeader(slot) { … }`.
-2. **It fills the prop named after its type**, in snake case: `CardHeader` fills `card_header`. To
-   fill a differently named prop, write `CardHeader(slot = "header")`.
-3. **The parent needs `#[component(slot_aware)]`.** Without it, the compile error says so and names
-   the component.
+1. The slot child carries the `slot` attribute: `CardHeader(slot) { … }`.
+2. It fills the prop named after its type in snake case: `CardHeader` fills `card_header`. To fill a
+   prop with a different name, write `CardHeader(slot = "header")`.
+3. The parent component needs `#[component(slot_aware)]`. Without it, the compiler tells you to add
+   it.
 
-A slot's own fields are props and take the same `#[prop(...)]` attributes as a component's
-arguments. `#[slot]` itself takes no options, and the struct must have named fields.
+A slot's fields are props and take the same `#[prop(...)]` attributes as component arguments. The
+struct must have named fields. Slots can nest: a slot child of a slot fills that slot's prop.
 
-### What a slot may take
-
-A slot's attribute list accepts its own props, `class`, `let:` and `slot`. Nothing else:
-
-```text
-a slot takes props of its own, and nothing that belongs to an element
-
-note: a slot is not an element, so it has nowhere to put a listener, an attribute or a state
-help: put them on an element inside the slot's children
-```
-
-Slots nest: a slot child of a slot fills that slot's own prop.
+A slot accepts only its own props, `class`, `let:` and `slot`. Listeners, attributes and states
+belong on an element inside the slot's children, and the compiler points you there.
 
 <Callout type="info">
-Slots are rarely the right answer. Two `Children`-typed props, or two ordinary nested components,
-usually read better and compose better. Reach for a slot when the region genuinely belongs to the
-parent's structure and cannot be a component of its own.
+Two `Children` props, or two nested components, often read better than slots. Use a slot when the
+region is part of the parent's structure and does not make sense as a component of its own.
 </Callout>
 
-## Passing a builder instead
+## Pass a value to the children
 
-For a region whose content depends on something the parent computes, take a closure prop rather
-than children:
+When the content depends on a value the component supplies, take a closure as the `children` prop:
 
 ```rust
 #[component]
@@ -206,7 +190,7 @@ where
 }
 ```
 
-The caller writes the closure with `let:`, which names the argument the children block receives:
+The caller names the closure's argument with `let:`:
 
 ```rust
 view! {
@@ -216,7 +200,7 @@ view! {
 }
 ```
 
-This is the same mechanism `for` uses for its row binding.
+`for` binds its row name the same way.
 
 ## Next
 
@@ -224,11 +208,11 @@ This is the same mechanism `for` uses for its row binding.
   <Card
     title="Control flow"
     href="/docs/learn/control-flow"
-    description="for and if inside a view, and the components they lower to."
+    description="Show content conditionally and render keyed lists."
   />
   <Card
     title="Events"
     href="/docs/learn/events"
-    description="Listeners, the dispatch path, and what a handler receives."
+    description="Handle clicks, keys and pointer input."
   />
 </Cards>

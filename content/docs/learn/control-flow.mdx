@@ -1,14 +1,12 @@
 ---
 title: Control flow
-description: Conditionals and lists inside a view — the for and if keywords, the components they lower to, and why a key is required.
+description: Conditionals and keyed lists inside a view — if and for, keys, what is kept and rebuilt, Dynamic, and Portal.
 ---
 
-A view is built once, so `if` and `for` in ordinary Rust would run once too. The view grammar has
-its own `for` and `if`, which rebuild what they hold when what they read changes. This page assumes
-[Views](/docs/learn/views), [Signals](/docs/learn/signals) and
-[Components](/docs/learn/components).
+A view is built once, so an ordinary Rust `if` or `for` would also run only once. The view grammar
+has its own `if` and `for`, which update what they show when the signals they read change.
 
-## Conditionals
+## Show content conditionally
 
 ```rust
 view! {
@@ -22,36 +20,17 @@ view! {
 }
 ```
 
-The condition **must be written as a closure**. `move`, `|` or `||` has to be the first token, or
-it is a parse error on the condition itself:
+**The condition must be a closure.** A plain expression is a compile error:
 
 ```rust
-if open.get() { … }        // error: `if` takes a closure
+if open.get() { … }         // error: `if` takes a closure
 if move || open.get() { … } // correct
 ```
 
-<Callout type="info">
-The rule looks strict and is the point. A condition read once is a snapshot, and a branch built
-from a snapshot never changes again. Requiring the closure in the grammar means the non-reactive
-spelling cannot be written at all, instead of compiling and silently freezing.
-</Callout>
+This rule prevents a common reactive bug: a condition read once would never change again.
 
-### What it costs
-
-The condition is read inside one effect, and it is the **answer** that is compared, not the signals
-the answer was computed from.
-
-```rust
-if move || items.get().is_empty() { … } else { … }
-```
-
-Adding a row to a list that already had rows changes `items`, re-runs the condition, gets `false`
-again, and swaps nothing. The branch is rebuilt only when the boolean itself flips.
-
-Both branches are built afresh when they are shown. A branch that is not showing **holds no nodes,
-no signals and no timers**. It is not hidden with CSS; it does not exist.
-
-### `else` is optional
+`else` is optional. Without it, nothing renders while the condition is false. `else { }` means the
+same thing.
 
 ```rust
 if move || saving.get() {
@@ -59,25 +38,26 @@ if move || saving.get() {
 }
 ```
 
-With no `else`, the other branch renders nothing. Writing `else { }` means the same thing, and says
-so explicitly.
+### When a branch is rebuilt
 
-### What the grammar refuses
+The condition runs inside one effect, and zgui compares its result, not the signals it read:
 
-| You write | Why |
-|---|---|
-| `if open.get() { … }` | the condition must be a closure |
-| `if let Some(x) = y { … }` | pattern matching is not part of the view grammar |
-| `if a { … } else if b { … }` | write `else { if move \|\| b { … } else { … } }` |
-| `if move \|\| a { }` | an `if` needs a body |
-| `if move \|\| a (class = "x") { … }` | control flow takes no attributes |
+```rust
+if move || items.get().is_empty() { … } else { … }
+```
 
-`else if` is refused rather than desugared because each arm is its own conditional: an outer arm
-changing rebuilds the ones inside it, and the nesting says so.
+Adding a row to a list that already has rows runs the condition again. It returns `false` again, so
+nothing changes. The branch is swapped only when the result flips.
 
-For `if let`, compute the value outside the view, or use a braced child holding a `match`.
+- A hidden branch does not exist. It holds no nodes, signals or timers; it is not hidden with CSS.
+  A branch is built fresh each time it is shown.
+- A shown branch keeps its state while it stays shown. Signals, stored values and defaults created
+  by its components survive any number of condition re-runs that return the same result.
+- If the component containing the `if` runs again (for example, because it sits in a reactive hole
+  that re-ran), the shown branch is rebuilt in place without swapping nodes. The state it creates is
+  created again along with the component.
 
-## Lists
+## Render a list
 
 ```rust
 view! {
@@ -91,49 +71,45 @@ view! {
 }
 ```
 
-Three parts, in this order:
+A `for` has three parts:
 
-1. **The row name.** `item` is bound inside the block. Exactly one name — no tuple destructuring
-   and no `_`. Destructure inside the body if you need to.
-2. **The collection**, after `in`, written as a closure. This is the list's only reactive
-   dependency.
-3. **The key**, after a comma, as `key = <expression>`. It is required.
+1. The row name (`item`), bound inside the block. It must be a single name, not a pattern;
+   destructure inside the body if you need to.
+2. The collection, after `in`, written as a closure. It is the list's only reactive dependency.
+3. The key, after a comma, written as `key = <closure>`. It is required.
 
-### Why the key is required
+## Keys
 
-When the collection changes, the list compares the new keys with the old ones and works out what
-happened: which rows are new, which are gone, and which moved. A surviving key keeps its row and
-node identity. zgui moves that row instead of unmounting it, so element state such as its scroll
-position stays with the key.
+When the collection changes, the list compares the new keys with the old ones to find which rows are
+new, which are gone, and which moved. Rows are matched by key, not by position:
 
-The row builder still runs again for each surviving key. zgui first disposes the previous row run,
-then rebuilds the row in its existing place. This makes captured item data current even when the
-key did not change. Reactive state that must survive collection reconciliation should belong to
-the item or to a scope outside the row builder.
+- A new key builds a new row.
+- A removed key removes its row and disposes of everything the row created.
+- A key that is still present keeps its row, even if it moved. The row is moved, not rebuilt, so its
+  nodes, scroll position and signals stay with it.
 
-Without a key the list would have to fall back on position, and inserting one row at the top would
-rewrite every row below it.
+**Because a kept row is not rebuilt, plain data captured from the item is not updated** when the
+collection is rewritten with the same key. In the example above, `item.label` keeps its first value.
+Put anything that can change in a signal on the item, as shown in the next section. Every row is
+rebuilt only when the `for` itself is rebuilt, for example because its component ran again.
 
-The key needs `Eq + Hash + Clone`. Use whatever identifies a row for as long as it exists:
+The key type must implement `Eq + Hash + Clone`. Use whatever identifies a row for as long as it
+exists:
 
 ```rust
 key = |item: &Todo| item.id            // a stable id
 key = |name: &String| name.clone()     // the value itself, when it is the identity
-key = |n: &usize| *n
 ```
 
 <Callout type="warn">
-Do not key by index. An index is a position, not an identity, so keying by it gives you exactly the
-behaviour the key exists to avoid.
+Do not key by index: an index is a position, not an identity. Keys must also be unique within one
+collection; two rows with the same key cause a panic.
 </Callout>
 
-### Rows own their own state
+## Update a single row
 
-Each row gets its own scope. A signal created during a row build is disposed when the row is
-rebuilt or removed.
-
-This is why the common shape for a list is a collection of items where each item owns the signal
-for the part of it that changes:
+Each row has its own scope, which is disposed of when the row is removed. The usual pattern is a
+collection of items where each item holds signals for the parts that change:
 
 ```rust
 #[derive(Clone, Debug)]
@@ -156,12 +132,12 @@ view! {
 }
 ```
 
-Ticking one item writes that item's `done`. Only that row's class binding reads it, so only that
-row changes. The collection signal is untouched, so the list does not compare keys at all.
+Ticking an item writes only that item's `done` signal. Only that row's class binding reads it, so
+only that row changes, and the list does not compare keys at all.
 
-### `for` has no `else`
+## Show a placeholder for an empty list
 
-An empty list renders nothing. To show something instead, wrap it:
+`for` has no `else`. To show something when the list is empty, wrap the `for` in an `if`:
 
 ```rust
 if move || items.get().is_empty() {
@@ -173,85 +149,27 @@ if move || items.get().is_empty() {
 }
 ```
 
-## The components underneath
+## Nest control flow
 
-`for` and `if` are **sugar**. Each parses straight into a component call, and the two spellings
-produce the same code:
-
-| Keyword | Component |
-|---|---|
-| `for item in each, key = k { … }` | `For(each = each, key = k, let:item) { … }` |
-| `if when { … }` | `Show(when = when) { … }` |
-| `if when { … } else { … }` | `Show(when = when, fallback = move \|\| view! { … }) { … }` |
-
-Both spellings are supported and neither is deprecated. Reach for the component form when the head
-is not a closure literal — most often when a condition already lives in a variable:
+`if` and `for` are nodes, so they nest anywhere a node can: inside elements, components, and other
+control flow.
 
 ```rust
-let chosen = move || selection.get().is_some();
-
 view! {
-    Show(when = chosen) {
-        label {"picked"}
+    column {
+        for row in move || rows.get(), key = |r: &Row| r.id {
+            if move || row.visible.get() {
+                text {{row.label.clone()}}
+            }
+        }
     }
 }
 ```
 
-`when` takes `impl Fn() -> bool`, so the variable has to hold a closure. A `Signal<bool>` is not one:
-write `move || flag.get()`.
+## Switch between several views
 
-The keyword form cannot express that, because it requires a closure by token, and the error message
-says so and names the component spelling.
-
-<Callout type="info">
-A keyword resolves a name you did not write, so `for` needs `For` in scope and `if` needs `Show`.
-`use zgui::prelude::*;` has both. If you import by name and forget one, the error tells you which.
-</Callout>
-
-### `For` and `Show` props
-
-<TypeTable
-  type={{
-    each: {
-      description: 'Produces the collection. The only reactive dependency of the list.',
-      type: 'impl Fn() -> impl IntoIterator<Item = T>',
-      required: true,
-    },
-    key: {
-      description: 'Identifies a row for as long as it exists.',
-      type: 'impl Fn(&T) -> K, K: Eq + Hash + Clone',
-      required: true,
-    },
-    'let:name': {
-      description: 'Binds the row inside the children block.',
-      type: 'identifier',
-      required: true,
-    },
-  }}
-/>
-
-<TypeTable
-  type={{
-    when: {
-      description: 'The condition, read inside one effect. The answer is what is compared.',
-      type: 'impl Fn() -> bool',
-      required: true,
-    },
-    fallback: {
-      description: 'What is shown while the condition does not hold. Renders nothing by default.',
-      type: 'impl Fn() -> AnyView',
-      required: false,
-    },
-  }}
-/>
-
-`while`, `loop` and `match` are reserved: they may not name an element or a component, and writing
-one is an error that points at `for` and `if`.
-
-## A view chosen at run time
-
-`Dynamic` holds a closure producing a whole view, and swaps the subtree whenever the closure's
-dependencies change.
+`Dynamic` holds a closure that returns a whole view. It replaces the subtree when the closure's
+dependencies change:
 
 ```rust
 use zgui::view::{AnyView, Dynamic};
@@ -266,17 +184,16 @@ view! {
 }
 ```
 
-`Dynamic::new` takes an `FnMut() -> AnyView`. When the closure produces the same view type as last
-time, the subtree is rebuilt in place; a different type replaces it.
+`Dynamic::new` takes an `FnMut() -> AnyView`. If the closure returns the same view type as last
+time, the subtree is updated in place; a different type replaces it.
 
-Use it when the branches are not two but many, and their types differ. Prefer `if` when there are
-two: `if` compares one boolean, while `Dynamic` re-runs whenever anything its closure read changed.
+Use `Dynamic` for more than two branches of different types. For two branches, prefer `if`: it
+compares one boolean, while `Dynamic` re-runs whenever anything its closure read changes.
 
-## Rendering somewhere else
+## Render on an overlay layer
 
-`Portal` renders its children on an overlay band instead of where it is written. A dialog, a menu,
-a tooltip and a toast all have to escape whatever clipped, transformed or stacked ancestor they
-were written inside.
+`Portal` renders its children on an overlay layer instead of where it is written. Dialogs, menus,
+tooltips and toasts use it so that ancestors cannot clip, transform or stack them.
 
 ```rust
 use zgui::view::{OverlayLayer, Portal};
@@ -293,39 +210,105 @@ view! {
 }
 ```
 
-Four bands exist, in paint order:
+There are four layers, painted in this order:
 
 | Layer | For |
 |---|---|
-| `OverlayLayer::Content` | portalled content that belongs with the page: a sticky region, an inline surface |
-| `OverlayLayer::Popover` | popovers, menus, tooltips, dropdowns — the default |
-| `OverlayLayer::Modal` | dialogs, sheets and drawers, which take the interaction over |
-| `OverlayLayer::Toast` | toasts and notices, which sit above everything including a dialog |
+| `OverlayLayer::Content` | portalled content that belongs with the page |
+| `OverlayLayer::Popover` | popovers, menus, tooltips, dropdowns (the default) |
+| `OverlayLayer::Modal` | dialogs, sheets and drawers |
+| `OverlayLayer::Toast` | toasts and notices, above everything including dialogs |
 
-Naming the band, rather than relying on mount order, is what stops a toast raised before a dialog
-from painting beneath it.
+Because each layer has a fixed order, a toast shown before a dialog still paints above it. The
+portal leaves a marker where it was written, so its siblings keep their order.
 
-The portal keeps a marker at the position it was written, so its siblings keep their order and the
-portal can come and go without disturbing them.
+[Overlays and portals](/docs/building/overlays-and-portals) covers positioning, dismissal and
+focus.
 
-[Overlays and portals](/docs/building/overlays-and-portals) covers positioning, dismissal and focus.
+## `Show` and `For`
 
-## Nesting
+`if` and `for` are shorthand for the `Show` and `For` components. Both spellings produce the same
+code:
 
-Control flow is a node, so it nests wherever a node does — in an element, in a component, and in
-itself.
+| Keyword | Component |
+|---|---|
+| `for item in each, key = k { … }` | `For(each = each, key = k, let:item) { … }` |
+| `if when { … }` | `Show(when = when) { … }` |
+| `if when { … } else { … }` | `Show(when = when, fallback = move \|\| view! { … }) { … }` |
+
+Use the component form when the condition is already stored in a variable, because the keyword form
+needs a closure written in place:
 
 ```rust
+let chosen = move || selection.get().is_some();
+
 view! {
-    column {
-        for row in move || rows.get(), key = |r: &Row| r.id {
-            if move || row.visible.get() {
-                text {{row.label.clone()}}
-            }
-        }
+    Show(when = chosen) {
+        label {"picked"}
     }
 }
 ```
+
+`when` takes `impl Fn() -> bool`, so the variable must hold a closure. For a `Signal<bool>`, write
+`move || flag.get()`.
+
+The keywords expand to `For` and `Show`, so those names must be in scope. `use zgui::prelude::*;`
+includes both.
+
+`For` props:
+
+<TypeTable
+  type={{
+    each: {
+      description: 'Produces the collection. The list’s only reactive dependency.',
+      type: 'impl Fn() -> impl IntoIterator<Item = T>',
+      required: true,
+    },
+    key: {
+      description: 'Identifies a row for as long as it exists.',
+      type: 'impl Fn(&T) -> K, K: Eq + Hash + Clone',
+      required: true,
+    },
+    'let:name': {
+      description: 'Binds the row inside the children block.',
+      type: 'identifier',
+      required: true,
+    },
+  }}
+/>
+
+`Show` props:
+
+<TypeTable
+  type={{
+    when: {
+      description: 'The condition. Its result is compared, not the signals it reads.',
+      type: 'impl Fn() -> bool',
+      required: true,
+    },
+    fallback: {
+      description: 'Shown while the condition is false. Renders nothing by default.',
+      type: 'impl Fn() -> AnyView',
+      required: false,
+    },
+  }}
+/>
+
+## Unsupported syntax
+
+| You write | Write instead |
+|---|---|
+| `if open.get() { … }` | a closure: `if move \|\| open.get()` |
+| `if let Some(x) = y { … }` | compute the value outside the view, or use a braced child with a `match` |
+| `if a { … } else if b { … }` | a nested `if`: `else { if move \|\| b { … } else { … } }` |
+| `if move \|\| a { }` | an `if` with a body |
+| `if move \|\| a (class = "x") { … }` | attributes on an element inside the body |
+
+`else if` is not supported because each arm is its own conditional: when the outer result changes,
+the inner conditional is rebuilt, and nesting makes that visible.
+
+`while`, `loop` and `match` are reserved in views and produce an error that points to `for` and
+`if`.
 
 ## Next
 
@@ -333,7 +316,7 @@ view! {
   <Card
     title="Events"
     href="/docs/learn/events"
-    description="Listeners, the dispatch path, and what a handler receives."
+    description="Handle clicks, keys and pointer input."
   />
   <Card
     title="Styling"
